@@ -263,6 +263,15 @@ impl Host {
         matches!(self.kind, Kind::Local)
     }
 
+    /// The SSH connection behind a remote host; `None` for this machine.
+    /// Only the remote desktop bridge needs to know which it got.
+    pub fn ssh(&self) -> Option<&Connection> {
+        match &self.kind {
+            Kind::Remote(connection) => Some(connection),
+            Kind::Local => None,
+        }
+    }
+
     /// Opens a terminal on this host. `shell` is the command a *local* terminal
     /// runs, read from Settings by the caller so changing it reaches the next
     /// tab opened; a remote host ignores it and starts the account's own login

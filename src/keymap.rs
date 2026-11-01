@@ -30,6 +30,7 @@ use crate::workspace::{
     CloseTab, ConsumeWindow, CycleColumnWidth, DecreaseFontSize, Disconnect, ExpelWindow,
     FocusColumnLeft, FocusColumnRight, FocusWindowDown, FocusWindowUp, IncreaseFontSize,
     MoveColumnLeft, MoveColumnRight, MoveWindowDown, MoveWindowUp, NewTerminal, OpenConnections,
+    OpenRemoteDesktop,
     OpenSettings, ResetFontSize, StackTerminal, ToggleExplorer, ToggleOverview,
 };
 
@@ -82,6 +83,7 @@ pub const COMMANDS: &[Command] = &[
     command!("window.files", "File tree", "window", ["ctrl-shift-b"], ToggleExplorer),
     command!("window.command", "Command bar", "window", ["ctrl-shift-k"], OpenConnections),
     command!("session.disconnect", "Disconnect", "session", ["ctrl-shift-q"], Disconnect),
+    command!("session.remote", "Remote desktop", "session", ["ctrl-shift-m"], OpenRemoteDesktop),
     // `<` too: on Linux shift-, arrives as `<`, and without it Settings has
     // no working shortcut there.
     command!("session.settings", "Settings", "session", ["ctrl-shift-,", "ctrl-<", "ctrl-shift-<"], OpenSettings),

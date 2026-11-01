@@ -48,6 +48,7 @@ actions!(
         OpenSettings,
         ToggleExplorer,
         Disconnect,
+        OpenRemoteDesktop,
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
@@ -92,6 +93,9 @@ pub enum ConnectionState {
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    /// The remote desktop helper for this connection, while it runs. Dropped
+    /// with the connection (`set_connection`), which tells it to quit.
+    remote: Option<crate::remote::Session>,
     strip: Strip,
     /// The focused column's pane. The strip owns the focus as an index; this
     /// is the same column by another name, kept because nearly everything that
@@ -196,6 +200,7 @@ impl Workspace {
             strip: Strip::new(pane.clone()),
             active_pane: pane,
             connection: ConnectionState::Disconnected,
+            remote: None,
             pane_subscriptions: HashMap::from([(pane_id, subscription)]),
             connections: None,
             overview_entrance: crate::ui::motion::Entrance::new(),
@@ -411,8 +416,9 @@ impl Workspace {
     pub fn open_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home_open = false;
         if let Some(view) = &self.connections {
-            let handle = view.read(cx).focus_handle.clone();
-            window.focus(&handle);
+            // Already up -- after a disconnect it opens by itself -- so the
+            // caret goes back to its query line, not just to the bar.
+            view.update(cx, |bar, cx| bar.focus_query(window, cx));
             cx.notify();
             return;
         }
@@ -1069,6 +1075,8 @@ impl Workspace {
     /// it to the home directory, and it once ran on every popup open, which
     /// threw away wherever you had browsed to.
     fn set_connection(&mut self, state: ConnectionState, cx: &mut Context<Self>) {
+        // Whatever the new state, the helper belonged to the old connection.
+        self.remote = None;
         self.connection = state;
         self.sync_connections_view(cx);
         let connection = match &self.connection {
@@ -1086,6 +1094,31 @@ impl Workspace {
     ///
     /// Local mode offers no disconnect -- there is no session to hang up -- but
     /// this still works if something reaches it, and leaves an empty workspace.
+    /// True when the remote desktop can be offered: an SSH session (not this
+    /// machine) and the helper installed. A PulseTerm built alone never shows
+    /// it.
+    pub fn can_remote_desktop(&self) -> bool {
+        matches!(&self.connection, ConnectionState::Connected(host) if host.ssh().is_some())
+            && crate::remote::helper_path().is_some()
+    }
+
+    /// Opens the remote desktop helper for this host, or raises the one
+    /// already running. One helper per connection.
+    pub fn open_remote_desktop(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.remote.as_ref().filter(|s| s.is_alive()) {
+            session.raise();
+            return;
+        }
+        let ConnectionState::Connected(host) = &self.connection else { return };
+        let Some(connection) = host.ssh() else { return };
+        let theme = crate::remote::theme_handoff(cx.global::<crate::theme::Theme>());
+        match crate::remote::Session::launch(connection.clone(), theme) {
+            Ok(session) => self.remote = Some(session),
+            Err(e) => eprintln!("remote desktop: {e}"),
+        }
+        cx.notify();
+    }
+
     pub fn disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let ConnectionState::Connected(host) = &self.connection {
             host.disconnect();
@@ -2369,6 +2402,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &Disconnect, window, cx| {
                 this.disconnect(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenRemoteDesktop, _, cx| {
+                this.open_remote_desktop(cx);
             }))
             .on_action(cx.listener(|this, _: &IncreaseFontSize, _, cx| {
                 this.adjust_font_size(1., cx);

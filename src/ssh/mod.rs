@@ -5,6 +5,7 @@
 //! per pty for output, which the terminal views drive themselves.
 
 pub mod client;
+pub mod exec;
 pub mod known_hosts;
 pub mod pty;
 pub mod sftp;

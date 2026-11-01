@@ -9,6 +9,7 @@ mod keymap;
 mod local;
 mod plugins;
 mod pty;
+mod remote;
 mod runtime;
 mod session;
 mod ssh;
@@ -96,6 +97,11 @@ fn main() {
             // keystroke falls through to the terminal's own encoder.
             KeyBinding::new("tab", NoAction, Some("Terminal")),
             KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+            // Same in the command bar, where Tab switches a new host from
+            // password to private key (its own `on_key_down`). Without this,
+            // `Root`'s focus cycling took the key first and the caret jumped
+            // to the file tree's path box.
+            KeyBinding::new("tab", NoAction, Some("CommandBar")),
         ]);
         // Every app command on ctrl+shift, from `keymap::COMMANDS` and the
         // user's `keys.json` -- after the fixed bindings above, so that is

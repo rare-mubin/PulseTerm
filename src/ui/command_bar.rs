@@ -484,6 +484,15 @@ impl CommandBar {
     }
 }
 
+impl CommandBar {
+    /// Puts the caret in the query line. The bar's own focus handle is not
+    /// enough: typing and Enter are the input's, so a bar focused on its
+    /// container looks open and ignores every key.
+    pub fn focus_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query.update(cx, |state, cx| state.focus(window, cx));
+    }
+}
+
 impl Focusable for CommandBar {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -619,8 +628,10 @@ impl Render for CommandBar {
                     .on_action(cx.listener(|this, _: &CommandDown, _, cx| this.step(1, cx)))
                     .on_action(cx.listener(|this, _: &CommandForget, _, cx| this.forget(cx)))
                     // Tab offers the other way in to a host that is not saved.
-                    // Caught here rather than bound, because `Root` binds Tab
-                    // to focus cycling and a binding would be dispatched first.
+                    // A key handler, not a binding -- and it only ever sees
+                    // the key because `main.rs` cancels `Root`'s Tab binding
+                    // in the `CommandBar` context; a binding is dispatched
+                    // before any key handler.
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key != "tab" {
                             return;

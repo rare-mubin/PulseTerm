@@ -1,6 +1,7 @@
 # Remote desktop — design
 
-Status: **design, nothing built.** Toolkit and decisions settled (see below). Decided with the user (2026-11-02):
+Status: **phase 1 under way** (2026-11-02) -- see "Progress" at the end.
+Toolkit and decisions settled (see below). Decided with the user (2026-11-02):
 
 * **Hosts** are mostly Linux, Wayland or X11.
 * **Goal** is smooth video and gaming, not just admin access.
@@ -83,10 +84,14 @@ PulseTerm and the helper are two programs in one Cargo workspace:
   alone looks exactly like PulseTerm before this feature. Built later and
   dropped beside it, the icon appears on the next SSH session; no rebuild of
   PulseTerm.
-* **Shared design code:** the launcher wants PulseTerm's theme and `kit`
-  measurements. Phase 1 decides between copying the small parts it needs or
-  moving them into a third crate both depend on; that crate would need a
-  licence the GPL helper can use (MIT/Apache both are).
+* **Shared design code: none -- the theme is handed over.** PulseTerm passes
+  its *resolved* tokens (palette with the user's overrides, font, size) as
+  JSON in `--theme` (`remote::theme_handoff`); the helper's `theme.rs` reads
+  them and re-derives the `kit` measurements from the type the same way. So
+  the helper matches whatever palette is in use and links none of PulseTerm's
+  code. Without a handoff it falls back to Ink, and a font that is not
+  installed falls back down PulseTerm's preference list -- gpui silently
+  turns a missing family into a proportional one.
 
 ## 2. Components
 
@@ -142,6 +147,44 @@ over the SSH-forwarded web API. The user sees nothing to type.
 * Pairing needs the SSH connection, which every entry point already has (the
   icon is SSH-only), so nothing is lost by not remembering.
 * A copied data directory or a stolen laptop holds nothing that can connect.
+
+**As built (2026-11-02) -- supersedes the credential plan below where they
+differ.** `remote/src/sunshine.rs`:
+
+* Config in `~/.config/pulseterm/sunshine/`, and `XDG_CONFIG_HOME` pointed at
+  `~/.config/pulseterm` when it runs: Sunshine keeps files outside its config
+  (the portal's restore token, `apps.json`) in `$XDG_CONFIG_HOME/sunshine`,
+  which would otherwise be the user's own folder. **Even `sunshine --version`
+  creates `~/.config/sunshine`**, so the probe runs it against a temp dir.
+* Started with `-1` (no state loaded or kept -- every launch has no paired
+  clients, so there is nothing to unpair) and `-0` (PIN from stdin -- if that
+  works as it reads, pairing needs no web password at all; phase 2 tests it).
+* It runs under a wrapper on a **spawned channel** (`Connection::spawn`):
+  stdin is a FIFO fed by `cat` from the channel, and when `cat` sees EOF the
+  wrapper kills Sunshine. Verified: closing the Remote window stops it, and
+  so does `kill -9` on PulseTerm (sshd closes the dropped session's stdin).
+* The graphical session's environment comes from `systemctl --user
+  show-environment` (an SSH session has no `WAYLAND_DISPLAY`).
+* **Capture needs nobody at the host when Sunshine may use KMS.** The probe
+  checks `getcap` for `cap_sys_admin` on the binary (Fedora's package and the
+  .deb set it; a Flatpak cannot), and then the config pins `capture = kms`:
+  the screen is read from the driver, with no portal, no dialog and no
+  `WAYLAND_DISPLAY` -- verified over SSH from an empty config, ready in under
+  a second. Without it Sunshine picks for itself: wlroots screencopy (niri,
+  sway, Hyprland) and X11 never ask either; GNOME and KDE fall back to the
+  **screen-sharing portal, whose dialog appears once on the host's screen**
+  and Sunshine waits for it (the token is then remembered). The launcher's
+  *Capture* check says which route a host will take, and offers the
+  `setcap` command that switches it to KMS. The ready check waits up to 90 s
+  for the portal case.
+* **For a host with no keyboard or mouse at all**, KMS covers capture and
+  `uinput` covers input, but three things are still the host's business:
+  someone has to be logged in graphically (enable auto-login), a display has
+  to be active (a monitor or an HDMI dummy plug; KMS captures what the GPU
+  scans out), and NVIDIA needs `nvidia-drm.modeset=1` for KMS.
+* Base port 47989, or 48089 when the user's own Sunshine (or anything) holds
+  it. There is no "keep running": an instance started with `-1` forgets its
+  pairings anyway.
 
 **PulseTerm's own Sunshine instance.** Pairing goes through Sunshine's web
 admin API, which needs its admin username and password. Setting those with
@@ -301,3 +344,68 @@ Phase 1 needs an SSH-reachable Linux host with Sunshine; the development
 machine can be its own host (it runs `sshd`) if key-based SSH to `localhost`
 is set up. Phase 3 additionally needs the host's UDP ports reachable and a
 GPU encoder on it.
+
+## Progress
+
+**Built (phase 1, in part):**
+
+* `src/ssh/exec.rs` -- `Connection::exec` (one-shot command, output capped
+  at 1 MB) and `Connection::forward` (local listener → `direct-tcpip`; the
+  returned guard stops it within a second of being dropped).
+* `src/remote.rs` -- finding the helper (beside the exe, then `PATH`, cached
+  5 s), launching it, and the pipe: the helper writes JSON requests to its
+  stdout, PulseTerm answers on its stdin; `{"event":"raise"}` when the icon is
+  clicked again; EOF means PulseTerm let go. Protocol in that file's header.
+  The helper is dropped (so told to quit) on every connection change.
+* Nav bar `MonitorPlay` icon and `session.remote` command (`ctrl-shift-m`),
+  SSH sessions only and only with the helper installed.
+* `Connection::spawn` and the `spawn` / `write` / `kill` pipe ops: a
+  long-lived command whose stdin is the channel. Every one is closed when the
+  helper exits, and sshd closes them if the connection drops.
+* `remote/src/sunshine.rs` -- PulseTerm's own instance, see 2.4 "As built".
+  Connect starts it; the launcher's Sunshine section shows its state with a
+  start / stop button.
+* `remote/` -- the gpui launcher: host facts, the checklist with copyable
+  fix commands (commands only; advice stays in the text), stream settings
+  in `remote.json` per host, recheck, and a connect button that says the
+  stream is not built yet. `--local` probes this machine without PulseTerm.
+* Tests: probe parsing and checks, config clamping, theme handoff, request
+  parsing. Checked by running: `--local`, a fake PulseTerm driving the real
+  pipe (request answered, Paper theme applied, raise, clean exit on EOF), and
+  **end to end** (2026-11-02): PulseTerm connected over SSH to `localhost`,
+  the icon appeared, `ctrl-shift-m` opened the launcher with PulseTerm's
+  theme, the probe ran over the SSH connection and came back all green
+  (Sunshine 2026.914, wayland · niri, H.264 · HEVC, uinput), and disconnecting
+  closed the helper.
+
+**Phase 0 results** (2026-11-02, AMD Renoir iGPU, niri, throwaway spike):
+
+* **Video:** FFmpeg VAAPI decode of 1080p120 H.264 into an SDL3 window, vsync
+  off, steady **~291 fps** -- through the *copy* path (GPU frame downloaded to
+  NV12, ~2.9 ms, then uploaded to an SDL texture, ~0.3 ms). 2.4x the 120 fps
+  target before zero-copy. (An early run that dropped to 107 fps was the
+  spike's own clip looping, not the pipeline.) SDL3 must be told
+  `SDL_VIDEO_DRIVER=wayland` (or the hint): left alone it picked X11 through
+  XWayland.
+* **Pointer lock:** SDL3 relative mouse mode on native Wayland reported
+  active and delivered exact relative deltas (20 moves of (10,5) summed to
+  (200,100)). The compositor only locks once the pointer is inside the window.
+* Still untested: GNOME, KDE and X11 hosts for the pointer lock; 4K; the
+  zero-copy dmabuf → EGL path.
+
+**Not yet:**
+
+* The shifted-port case is written but untested (no second Sunshine here).
+* Live theme updates (the handoff is at launch only).
+* Linux CSD for the launcher: it asks for server-side decorations, which
+  niri and KDE give and GNOME does not.
+* Phase 2 (pairing) and phase 3 (the SDL3 stream window).
+
+**Fedora packages, and a trap.** The helper needs RPM Fusion's `ffmpeg` (the
+default `ffmpeg-free` has no H.264/HEVC decoder), `mesa-va-drivers-freeworld`
+(installs beside Fedora's in `/usr/lib64/dri-freeworld/`, replaces nothing),
+and `ffmpeg-devel libva-devel SDL3-devel mesa-libEGL-devel clang cmake
+openssl-devel opus-devel`. **Never `dnf swap mesa-va-drivers ...`** on Fedora
+44: `mesa-dri-drivers` provides `mesa-va-drivers`, so the swap removes the
+graphics driver and ~360 packages with it (niri, GDM, GTK4...). Plain
+`dnf install mesa-va-drivers-freeworld` is the right command.

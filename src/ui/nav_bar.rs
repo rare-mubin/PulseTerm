@@ -330,6 +330,15 @@ fn actions(
             }))
             .into_any_element(),
     ];
+    // SSH only, and only when the helper is installed: a PulseTerm built on
+    // its own looks exactly as it did before the feature existed.
+    if workspace.can_remote_desktop() {
+        out.push(
+            cell("nav-remote", Icon::MonitorPlay, fg_muted, "Remote desktop", "session.remote")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_remote_desktop(cx)))
+                .into_any_element(),
+        );
+    }
     if can_disconnect {
         out.push(
             cell("nav-disconnect", Icon::Unplug, danger, "Disconnect", "session.disconnect")

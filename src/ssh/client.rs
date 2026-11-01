@@ -68,6 +68,9 @@ impl ConnectParams {
 #[derive(Clone)]
 pub struct Connection {
     pub label: String,
+    /// The host as dialled, without user or port -- what the remote desktop
+    /// stream needs to reach the machine's UDP ports directly.
+    pub host: String,
     /// The file-browsing half of the same connection. Opened at connect time so
     /// the explorer never has to negotiate anything of its own.
     pub sftp: Sftp,
@@ -147,6 +150,7 @@ async fn connect_inner(params: ConnectParams) -> Result<Connection, String> {
 
     Ok(Connection {
         label: format!("{}@{}", params.username, host_id),
+        host: params.host.clone(),
         sftp: Sftp::new(sftp),
         handle: Arc::new(handle),
     })

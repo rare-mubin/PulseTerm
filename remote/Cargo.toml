@@ -11,6 +11,13 @@ description = "PulseTerm Remote: Sunshine/Moonlight remote desktop client launch
 name = "pulseterm-remote"
 path = "src/main.rs"
 
-# Empty on purpose until the spikes settle the stack (SDL3, FFmpeg,
-# moonlight-common-c). Profiles live in the workspace root's Cargo.toml.
+# The launcher only, so far. SDL3, FFmpeg and moonlight-common-c join with the
+# stream window (phase 3). Profiles live in the workspace root's Cargo.toml.
 [dependencies]
+# Same versions as PulseTerm's, so a workspace build shares the compiled
+# crates instead of building a second copy.
+gpui = "0.2.2"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6.0.0"

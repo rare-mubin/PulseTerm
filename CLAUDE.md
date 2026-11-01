@@ -708,6 +708,9 @@ is -- type, see what matches, press enter.
   so the secret exists for exactly as long as it takes to hand it to `russh` --
   the same rule as `store::SavedAuth` and `session.json`, applied to memory
   rather than to disk.
+* **Reopening the bar focuses its query line** (`CommandBar::focus_query`),
+  not the bar: a bar focused on its container looks open and ignores typing
+  and Enter. It opens by itself after a disconnect, which is where this bit.
 * The three things that made the *original* modal unusable are fixed and must
   stay fixed: it takes focus on its **first render** (a focus request in the
   constructor is dropped, because the window has no live focus tree yet, and
@@ -1340,7 +1343,9 @@ docs:
 * **`Root` binds `tab` / `shift-tab` to focus cycling**, and gpui dispatches a
   matched binding *before* an element's own key handler, stopping once handled —
   which would take Tab away from the shell. `main.rs` binds both to `NoAction` in
-  the `Terminal` context. Bindings made with `KeyBinding::new` carry no `meta`,
+  the `Terminal` context, and `tab` in `CommandBar` too, where Tab switches a new
+  host from password to private key (without it the caret jumped to the file
+  tree's path box and the key path was typed there). Bindings made with `KeyBinding::new` carry no `meta`,
   which gpui's matcher treats as user-defined, so the deeper `NoAction` cancels
   `Root`'s binding and the key falls through to the terminal's encoder.
 * **gpui-component fetches its own icons through our asset source**, in
@@ -1401,12 +1406,15 @@ bytes become one texture.
   `site.png` must not make every file inside it look like an image. There's a
   test for exactly that.
 
-## Remote desktop (planned)
+## Remote desktop (in progress)
 
 `REMOTE_DESKTOP.md` is the design: Sunshine on the host, controlled over the
 existing SSH connection, streaming over Moonlight's UDP ports into a separate
-PulseTerm Remote window opened from an SSH-only nav bar icon. Nothing is built
-yet. Decided: a separate GPL-3.0 helper (`pulseterm-remote`) with a gpui
+PulseTerm Remote window opened from an SSH-only nav bar icon. Phase 1 is
+partly built -- `REMOTE_DESKTOP.md` -> "Progress". PulseTerm's side is
+`src/remote.rs` (find, launch, serve the JSON pipe) and `src/ssh/exec.rs`
+(`Connection::exec`, `Connection::forward`); the helper has no SSH of its
+own and gets PulseTerm's theme as JSON at launch. Decided: a separate GPL-3.0 helper (`pulseterm-remote`) with a gpui
 launcher and an SDL3 stream window, FFmpeg decode, and re-pairing on every
 launch against PulseTerm's own Sunshine instance, so no pairing key is ever
 stored and the user's Sunshine config is never touched.
