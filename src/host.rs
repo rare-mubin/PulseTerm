@@ -276,7 +276,7 @@ impl Host {
     ) -> Result<Pty, String> {
         match &self.kind {
             Kind::Remote(connection) => ssh::pty::open(connection, cols, rows, program).await,
-            Kind::Local => crate::local::conpty::open(cols, rows, program, shell),
+            Kind::Local => crate::local::open_pty(cols, rows, program, shell),
         }
     }
 

@@ -2,9 +2,10 @@
 // split/tab tree around it, and a status line. `windows_subsystem` keeps a
 // console window from appearing behind the app in release builds -- in debug it
 // stays attached so panics and logging are visible.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod host;
+mod keymap;
 mod local;
 mod plugins;
 mod pty;
@@ -29,11 +30,8 @@ use ui::command_bar::{CommandDown, CommandForget, CommandUp, DismissCommandBar};
 use ui::editor::SaveFile;
 use ui::icon::Assets;
 use workspace::{
-    CancelClose, CloseTab, ContinueSession, DecreaseFontSize, Disconnect, HideHome,
-    ConsumeWindow, CycleColumnWidth, ExpelWindow, FocusColumnLeft, FocusColumnRight,
-    FocusWindowDown, FocusWindowUp, IncreaseFontSize, MoveColumnLeft, MoveColumnRight,
-    MoveWindowDown, MoveWindowUp, NewTerminal, OpenConnections, OpenSettings, ResetFontSize,
-    StackTerminal, ToggleExplorer, ToggleOverview, Workspace,
+    CancelClose, ContinueSession, FocusColumnLeft, FocusColumnRight, HideHome, ToggleOverview,
+    Workspace,
 };
 
 fn main() {
@@ -52,63 +50,26 @@ fn main() {
         cx.set_global(Profiles::load());
         // Builds the `Theme` global from the saved settings. Every later
         // settings change goes through the same function.
+        let started = std::time::Instant::now();
         theme::apply(cx);
+        // The one startup step LINUX.md flagged as a risk there (it resolves
+        // the font against the installed list). Debug builds only, on stderr.
+        #[cfg(debug_assertions)]
+        eprintln!("[startup] theme::apply {:.1?}", started.elapsed());
+        #[cfg(not(debug_assertions))]
+        let _ = started;
 
-        // App shortcuts sit on ctrl+shift, the one region of the keyboard a
-        // terminal has no encoding for -- see `terminal::keymap`. Anything on
-        // plain ctrl would be stolen from the remote shell.
+        // The bindings that are not the user's to change: keys scoped to one
+        // dialog or overlay, and Tab passing through to the shell. The app's
+        // commands -- all on ctrl+shift, the one region of the keyboard a
+        // terminal has no encoding for -- are `keymap::install`'s, below.
         cx.bind_keys([
-            KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-w", CloseTab, Some("Workspace")),
-            // The strip is the tab bar now, so the tab keys walk it. Columns
-            // left and right, windows up and down within a column: the
-            // directions the layout actually has.
-            KeyBinding::new("ctrl-shift-tab", FocusColumnLeft, Some("Workspace")),
-            KeyBinding::new("ctrl-tab", FocusColumnRight, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-left", FocusColumnLeft, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-right", FocusColumnRight, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-up", FocusWindowUp, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-down", FocusWindowDown, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-alt-left", MoveColumnLeft, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-alt-right", MoveColumnRight, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-alt-up", MoveWindowUp, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-alt-down", MoveWindowDown, Some("Workspace")),
-            // Out of the stack into a column of its own, and back in from the
-            // column next door -- niri's expel and consume. Not ctrl-shift-i
-            // for the second: gpui binds that to its own inspector in a debug
-            // build, and the inspector wins.
-            KeyBinding::new("ctrl-shift-o", ExpelWindow, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-u", ConsumeWindow, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-r", CycleColumnWidth, Some("Workspace")),
-            // The whole strip at once. Space, because it is the one key that
-            // means "show me everything" in every tiling window manager that
-            // has an overview, and ctrl+shift keeps it off the shell.
-            KeyBinding::new("ctrl-shift-space", ToggleOverview, Some("Workspace")),
             // Inside the overview only: the design's own keys, which are the
             // unqualified ones because nothing else has the keyboard there.
             KeyBinding::new("escape", ToggleOverview, Some("Overview")),
             KeyBinding::new("enter", ToggleOverview, Some("Overview")),
             KeyBinding::new("left", FocusColumnLeft, Some("Overview")),
             KeyBinding::new("right", FocusColumnRight, Some("Overview")),
-            KeyBinding::new("ctrl-shift-d", StackTerminal, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-k", OpenConnections, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-,", OpenSettings, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-q", Disconnect, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-b", ToggleExplorer, Some("Workspace")),
-            // The one deliberate exception to the ctrl+shift rule: zoom keys.
-            // Every app has them on plain ctrl and no shell binds them, so
-            // they're safe to take. Bound in the `Workspace` context, gpui
-            // dispatches them before the terminal's own key handler, so the
-            // remote side never sees them. `ctrl-shift-=` is the same key as
-            // `ctrl-+` on most layouts.
-            KeyBinding::new("ctrl-=", IncreaseFontSize, Some("Workspace")),
-            // Both spellings of the same physical key: on this layout shift-=
-            // arrives as `+`, not as a shifted `=`, so binding only the latter
-            // misses every `ctrl-+` press.
-            KeyBinding::new("ctrl-+", IncreaseFontSize, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-=", IncreaseFontSize, Some("Workspace")),
-            KeyBinding::new("ctrl--", DecreaseFontSize, Some("Workspace")),
-            KeyBinding::new("ctrl-0", ResetFontSize, Some("Workspace")),
             // Scoped to the popup so Escape is not taken from vim.
             KeyBinding::new("escape", DismissCommandBar, Some("CommandBar")),
             // Moving the selection is bound in the bar's own context, never
@@ -136,6 +97,10 @@ fn main() {
             KeyBinding::new("tab", NoAction, Some("Terminal")),
             KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
         ]);
+        // Every app command on ctrl+shift, from `keymap::COMMANDS` and the
+        // user's `keys.json` -- after the fixed bindings above, so that is
+        // the layer a rebinding is appended to (see `keymap`).
+        keymap::install(cx);
 
         let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
         // Opened in the saved background mode rather than switched after, so a
@@ -153,6 +118,16 @@ fn main() {
                     traffic_light_position: None,
                 }),
                 window_background,
+                // Linux reads `None` as server-side decorations, which puts the
+                // desktop's own titlebar above the navigation bar -- two
+                // captions. Client-side is how the bar gets to be the only one;
+                // the other backends ignore the request.
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(gpui::WindowDecorations::Client),
+                // The Wayland app id and X11 `WM_CLASS`: what the dock groups by
+                // and what the `.desktop` file's `StartupWMClass` must match. A
+                // no-op on the other backends.
+                app_id: Some("pulseterm".to_string()),
                 ..Default::default()
             },
             |window, cx| {

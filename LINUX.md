@@ -11,6 +11,176 @@ This file only covers what differs.
 
 ---
 
+## Status (2026-11-01, on a Fedora 44 box)
+
+The port has started. `cargo check` is clean on `x86_64-unknown-linux-gnu`;
+what follows is what is done, and what the machine said that this document had
+guessed differently.
+
+**Done**
+
+* §3.1 — `src/local/unix_pty.rs`, behind `local::open_pty`, which is now the
+  one entry point `host.rs` calls (ConPTY on Windows, this on Linux, an honest
+  error elsewhere). All four traps are handled as described, plus one more:
+  the hangup and the reap share a lock, and the child is waited for with
+  `WNOWAIT` first, so `killpg` can never reach a recycled pid.
+* §3.2 — shell discovery: `$SHELL`, then `/etc/shells`, then a short fallback,
+  deduplicated by canonical path (Fedora lists `/bin/bash` *and*
+  `/usr/bin/bash`, which are one file).
+* §3.3 — client-side decorations and `app_id` in `main.rs`. The caption's
+  Linux arm (`ui/window_controls.rs`) is **not** the one-liner this file
+  expected: starting the move on mouse-down hands the pointer to the
+  compositor and swallows the release, so a double-click is never seen. It
+  now follows Zed -- the press arms, the first drag starts the move, a
+  double-click zooms, right-click opens the compositor's window menu.
+  Resize edges are `src/ui/decorations.rs`: a 7px transparent margin via
+  `set_client_inset`, none on tiled edges, a hairline frame, no shadow and no
+  radius.
+* §3.4 — a Linux `PREFERRED` font list.
+* §3.5 — `libc` for Linux; `windows_subsystem` gated on Windows.
+  `embed-resource` was **left** unconditional: `build.rs` decides by
+  `CARGO_CFG_TARGET_OS` at run time, and gating the crate by host would break
+  cross-compiling to Windows from Linux.
+* §3.6 — the doc comments.
+
+**What the source said that this document had wrong**
+
+* **§3.4's startup risk is probably not one.** On Linux gpui's
+  `all_font_names()` iterates cosmic-text's in-memory font database, which
+  gpui filled during its own platform init -- before our callback runs. No
+  fontconfig scan happens in `theme::apply`. Debug builds print
+  `[startup] theme::apply …` on stderr so the number can be confirmed rather
+  than argued about.
+* **§3.8: blur is not a no-op everywhere.** gpui's Wayland backend binds KDE's
+  `org_kde_kwin_blur` when the compositor offers it, so "Blur behind" works on
+  Plasma. The switch stays.
+* **The ground moves on Linux.** A client-decorated Wayland surface is
+  transparent (gpui forces it, for the margin), so `Root` cannot paint the
+  window ground there -- it would fill the resize margin. On Linux
+  `apply_component_theme` clears `Root`'s background and `ui::decorations`
+  paints the ground inside the margin instead, once, and only when opaque.
+
+**Tested by driving the real app** (niri on Wayland, input injected with
+`ydotool`, checked with niri screenshots and `ps`/`/proc`):
+
+* It builds and links **without** the `-devel` packages in §4 -- gpui loads
+  those libraries at run time. A C compiler is all the build needed here.
+* Local terminal: a prompt; `tty` is a `/dev/pts`; the size matches the column
+  and follows a width change (56 → 75 columns); `TERM`/`COLORTERM` right; bash
+  is a session leader holding the foreground group; ctrl-c interrupts `sleep`
+  (exit 130); `vi` draws, and arrows work in it; `exit` marks the header
+  `-- exited` within a second; no zombies after closing; a local session
+  resumes at launch.
+* Caption: dragging the bar moves the window exactly as far as the pointer;
+  double-click maximises; the side bar's restore button restores; the close
+  button closes. Exactly one titlebar.
+* Resize margin: dragging it resizes; a press just inside the content does not.
+
+**Found by that testing, and fixed**
+
+* **Ignored signals leaked into the shell.** Started from `nohup` or a
+  script's `&`, PulseTerm itself ignores SIGHUP/SIGINT/SIGQUIT, and ignored
+  dispositions survive exec -- so ctrl-c did nothing to `sleep`, and closing a
+  tab left it running. `unix_pty::spawn` now resets every signal to its
+  default before exec (std only clears the mask). There is a test.
+* **The margin was measured against the wrong size.** On Wayland
+  `window_bounds()` is the window *less* the inset, so every zone was shifted
+  inward: the cursor hitbox missed the right and bottom margins, and a press in
+  the last 14px of the content started a resize. `decorations` now measures
+  with `viewport_size()`, the whole surface.
+
+**Open, needs a person or another compositor**
+
+* **niri marks a floating window's edges as tiled** if it was tiled first, so
+  gpui adds no margin and there is nothing to grab; niri's own Mod+drag still
+  resizes. After some maximise/restore sequences it reports free edges and the
+  margin works. This is niri's state, faithfully followed; check GNOME or KDE,
+  which do not tile normal windows, before changing anything here.
+* **The resize cursor in the margin** was not seen after the size fix, because
+  niri would not report free edges again in the same run. The seam's
+  `col-resize` cursor does show, so gpui's cursor path works on niri.
+* **The home screen's restore button did nothing** on a window that niri had
+  maximised from floating; the side bar's identical button had worked minutes
+  before. Both call `window_controls::toggle_maximize`. Unexplained.
+* The window has no title as far as niri can tell (`title: null`).
+* §3.7 (portal checks), §8 (packaging beyond the `.desktop` file in
+  `packaging/linux/`).
+* The Windows arm of every file touched here was edited without a Windows
+  compiler. The changes there are small (new no-op functions in
+  `window_controls`' Windows `platform`, cfg gates), but the first Windows
+  build after this should be watched.
+
+---
+
+## Windows: check this on the next Windows build
+
+Everything since the Linux port began was compiled and run **only on Linux**
+(Fedora, niri/Wayland). No Windows compiler exists on that machine, and the
+C parts of the build (tree-sitter grammars) need one even to type-check, so
+nothing below has been compiled for Windows. Most of it is shared code that
+behaves the same on both; the list says which parts are not.
+
+**Edited Windows-only code, unverified -- check these compile first**
+
+* `src/local/conpty.rs` -- `PtyProgram::ShellIn(path)` (the file tree's
+  "open in terminal"): `open` passes the path to `spawn(.., start_in)`, which
+  uses it as `CreateProcessW`'s working directory instead of home.
+* `src/ui/window_controls.rs`, Windows `platform` module -- four new no-op
+  functions (`caption_drag`, `caption_release`, `caption_click`,
+  `caption_menu`) so the shared wrappers resolve. The `WM_SYSCOMMAND` drag,
+  maximise and double-click logic is untouched.
+* `src/local/mod.rs` -- `conpty` is now a private module behind
+  `local::open_pty`, which `host.rs` calls; the Windows shell discovery is
+  unchanged, the Unix one is `cfg`'d out.
+* `src/main.rs` -- `windows_subsystem` is now gated on Windows as well as
+  release; `window_decorations` is set on Linux only; `app_id` is set
+  everywhere (a no-op off Linux).
+
+**Linux-only, fenced off -- should not affect Windows**
+
+`local::unix_pty`, `ui::decorations` (a pass-through off Linux), the
+`libc` dependency, `home::host_name` (Windows reads `COMPUTERNAME`), and
+`theme::apply_component_theme` clearing `Root`'s background (Linux only;
+Windows keeps painting the ground there as before).
+
+**Shared changes made on Linux -- check they look and behave the same**
+
+* Window headers: `02` / `02.2`, width share or `STACKED`, `FOCUS` tag, `x`
+  with a header-height hit area that does not start a drag; no hairline
+  under the header; no red line beside the focused column.
+* Columns: positioned by fraction; last column stretches to fill; none wider
+  than *Widest column* (default 90%) when there are several; lone column
+  full; seam bands 11px and occluding; the seam left of the focused column
+  resizes the focused column; stacked windows resize at their boundary;
+  windows drag by their header to stack or split.
+* File tree docked left (`^⇧B`), header at window-header height with
+  "open in terminal", `+`/`-` rows, new context menu.
+* Nav bar Lucide icons with shortcut tooltips; clock goes home; `IDLE` when
+  disconnected.
+* Home screen redesign (START / RESUME / TIME), dials centred.
+* Settings redesign (sections, segmented controls, steppers, own font list,
+  Appearance palette list with *System*), Keys page with rebinding saved to
+  `keys.json` in the data directory (`%APPDATA%/PulseTerm`).
+* Anything opened with no session starts a local one (ConPTY on Windows).
+* Keyboard focus is pulled back into the workspace whenever it escapes.
+
+**Checklist for the first Windows run**
+
+- [ ] `cargo check` and `cargo build --release` (needs `fxc.exe`, see CLAUDE.md).
+- [ ] `cargo test` -- 38 on Linux; the 6 `unix_pty` tests do not exist on
+      Windows, so expect 32.
+- [ ] Drag the nav bar: the window moves, Aero Snap works; double-click
+      maximises and restores; minimise / maximise / close buttons act.
+- [ ] Exactly one titlebar (ours); the system one stays hidden.
+- [ ] Local terminal opens (ConPTY); `exit` marks the header `-- exited`.
+- [ ] File tree -> terminal icon opens a shell in that folder (`cd` shows it).
+- [ ] Settings -> Appearance -> *System* follows the Windows light/dark mode.
+- [ ] Keys page: record a new chord, it works, restore defaults.
+- [ ] A translucent window (opacity below 100) still has one layer of ground
+      everywhere, and the font list stays opaque.
+
+---
+
 ## 0. Read this first
 
 Four rules that outrank anything convenient. Breaking one is worse than

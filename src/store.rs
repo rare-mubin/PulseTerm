@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ssh::{AuthMethod, ConnectParams};
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     let mut p = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push("PulseTerm");
     let _ = fs::create_dir_all(&p);
@@ -81,6 +81,21 @@ pub struct Profiles {
 impl Global for Profiles {}
 
 impl Profiles {
+    /// The host connected to most recently, as `user@host[:port]` -- what the
+    /// home screen's SSH entry says it would reach.
+    pub fn latest(cx: &gpui::App) -> Option<String> {
+        let profile = cx
+            .try_global::<Profiles>()?
+            .items
+            .iter()
+            .max_by_key(|profile| profile.last_used)?;
+        Some(if profile.port == 22 {
+            format!("{}@{}", profile.username, profile.host)
+        } else {
+            format!("{}@{}:{}", profile.username, profile.host, profile.port)
+        })
+    }
+
     pub fn load() -> Self {
         let mut this: Self = read_json("profiles.json");
         this.sort();
@@ -188,6 +203,13 @@ pub struct Settings {
     pub animation_ms: f32,
     /// `ease`, `linear` or `spring`. See `ui::motion::Curve`.
     pub animation_curve: String,
+    /// What a new column takes on the strip: `third`, `half`, `two_thirds` or
+    /// `full`. Settings -> Interface, as the design places it.
+    pub default_width: String,
+    /// The widest any column may be drawn while there is more than one, as a
+    /// percentage of the strip. Below 100 the neighbours always peek in at the
+    /// edge, so there is a seam to grab and somewhere to scroll to.
+    pub max_column_width: f32,
 }
 
 impl Global for Settings {}
@@ -226,6 +248,8 @@ impl Default for Settings {
             // 200ms and the app starts feeling like it is thinking.
             animation_ms: 160.,
             animation_curve: "ease".into(),
+            default_width: "half".into(),
+            max_column_width: 90.,
         }
     }
 }
@@ -260,6 +284,10 @@ impl Settings {
         self.animation_ms = self.animation_ms.clamp(40., 600.);
         if !matches!(self.animation_curve.as_str(), "ease" | "linear" | "spring") {
             self.animation_curve = "ease".into();
+        }
+        self.max_column_width = self.max_column_width.clamp(50., 100.);
+        if !matches!(self.default_width.as_str(), "third" | "half" | "two_thirds" | "full") {
+            self.default_width = "half".into();
         }
     }
 

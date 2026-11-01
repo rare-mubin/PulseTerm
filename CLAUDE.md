@@ -5,7 +5,10 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 ## What this is
 
 PulseTerm: a GPU-rendered SSH terminal for Windows, built on [gpui](https://gpui.rs)
-(Zed's UI framework). It talks to a stock `sshd` — terminal sessions are SSH PTY
+(Zed's UI framework). A Linux port is under way -- `LINUX.md` is its handover
+and status, and every Linux-specific arm is `cfg`'d beside the Windows one.
+**Everything since the port began was built on Linux only; `LINUX.md` ->
+"Windows: check this on the next Windows build" lists what to verify.** It talks to a stock `sshd` — terminal sessions are SSH PTY
 channels, so there is no remote-side agent, server, or install step. The UI is
 deliberately TUI-shaped: everything is monospace on a fixed cell grid, hairline
 borders instead of shadows and radii, and one navigation bar along an edge of
@@ -20,6 +23,11 @@ shortcuts.
 ## Commands
 
 - `cargo run` — build and launch. This is how the app is normally tested.
+- The repo is a Cargo workspace of two programs, but **plain `cargo` commands
+  build PulseTerm only** (`default-members`). The remote desktop helper in
+  `remote/` (GPL-3.0, see `REMOTE_DESKTOP.md`) builds only with
+  `cargo build -p pulseterm-remote` or `--workspace`; PulseTerm finds it at run
+  time and hides the remote icon without it. Never make PulseTerm depend on it.
 - `cargo check` — type-check. Do this after any `src/**.rs` change.
 - `cargo build --release` — optimised standalone `target/release/PulseTerm.exe`.
   Release is tuned for size (`[profile.release]`: strip, fat LTO, one codegen
@@ -88,7 +96,8 @@ needs a C toolchain that doesn't exist here.
   connection at connect time, so the explorer costs no extra handshake or
   authentication. Remote paths are POSIX no matter what this client runs on, so
   `join`/`parent` are hand-written; `std::path` would emit backslashes here.
-- `known_hosts.rs` — TOFU pinning in `%APPDATA%/PulseTerm/known_hosts.json`, not
+- `known_hosts.rs` — TOFU pinning in `known_hosts.json` in the platform data
+  directory (`%APPDATA%/PulseTerm`, `~/.local/share/PulseTerm` on Linux), not
   the real `~/.ssh/known_hosts`.
 
 ### `src/terminal/` — VT emulation and grid rendering
@@ -160,11 +169,85 @@ from its neighbours.
   remote-file editors later) an enum stays fully typed for a fraction of the
   plumbing. **Dispatch is confined to that one file** so trading up to a trait
   later is a local change.
+**Everything opens in a column of its own** -- Settings, editors, previews,
+the file tree, `^⇧T` -- through `Workspace::column_for_new_window`, which
+reuses the focused column only when it is empty (a fresh workspace has one,
+and opening beside it left a column of nothing on screen). Stacking is the
+deliberate gesture: `^⇧D` and a header's "+". Empty columns are collapsed
+*before* a new one is inserted -- the new one is empty too until it is filled,
+and collapsing afterwards removed it, leaving its window off the strip. A
+restored layout drops columns that come back empty, and opens a terminal if
+nothing at all came back.
+
+**With more than one column, none is wider than `Settings::max_column_width`**
+(default 90%, `Strip::max_share`, set by the workspace each frame): a column
+as wide as the window has its seam on the window's edge, where it cannot be
+grabbed, and hides that anything is beside it. A lone column still fills.
+
+**The strip never leaves the window part-empty** (`Strip::pixel_widths`):
+when the columns add up to less than the viewport, the last one stretches to
+the edge, and a lone column is that rule at its limit. The *last* column, not
+all of them proportionally, so dragging any other seam still puts that edge
+under the pointer. Derived, not stored: a stretched column keeps its own
+width and glides back to it when another column arrives.
+
+**Stacked windows resize at the boundary between them** (`Pane::resize_row`,
+a 7px `RowSeam` band like the column seams). Each window's share is a flex
+weight keyed by `ItemId`, so it follows the window through moves and closes;
+the drag is absolute against the two windows' combined span. Weights are not
+saved in the session file -- a restored stack comes back even.
+
+**Dragging a window** by its header (`pane::WindowDrag`): dropped on another
+window, the top or bottom half stacks it above or below in that column, and
+the left or right quarter opens a new column on that side (`DropZone`; the
+sides are the smaller target because a new column is the bigger change). The
+pane only reports the drop (`PaneEvent::DropWindow`); `Workspace::drop_window`
+re-parents the item with `take_item` / `insert_item`, so a shell survives the
+move. The hover indicator follows the drag-and-drop rules below:
+`on_drag_move` checks its own bounds, and `has_active_drag` going false clears
+it.
+
+**Window headers follow the design** (frame 02): `02`, or `02.2` for a
+stacked window, the title, an unsaved dot, then the column's width share
+(`1/3`, `1/2`, `FULL`, a percentage when dragged) on the first window or
+`STACKED` on the rest, a boxed `FOCUS` tag, and a small `×` -- the one button
+kept, so a window can be closed without knowing a shortcut; its click target
+is a square the header's full height. It stops its own mouse-down from
+reaching the header: the header is the window's drag handle, gpui starts a
+drag after 2px of movement, and a slightly wobbly press on the `×` used to
+pick the window up instead of closing it. A window whose content has a vertical
+divider (Settings' sidebar, `PaneItem::header_divider`) has it continued up
+through the header, so the line runs to the top of the window. The header has
+no ground of its own and no hairline under it: the window paints one ground
+behind header and content, so the header is simply the top of the window. The width label is pushed into each pane each
+frame by `Workspace::sync_width_labels`, because the drawn share changes with
+the viewport and no structural event announces it.
+
+**This machine is the default host** (`Workspace::ensure_session`): a new
+terminal, the file tree or Settings asked for with nothing connected starts a
+local session first (restoring last run's local layout if there is one),
+rather than opening onto a workspace with no host behind it.
+
+**Keyboard focus is kept inside the workspace.** Every app shortcut lives in
+the `Workspace` context, so focus that escapes it -- onto nothing, or onto a
+closed view -- kills them all. `render` puts it back on the active window
+whenever the window is active and the workspace does not contain it.
+
+**Closing a column's last window moves the keyboard on** (`close_active_tab`,
+the `Empty` handler): otherwise focus stays on a view that is no longer drawn
+and every key after it goes nowhere.
+
 - `mod.rs` — the `Workspace` root view. Panes never reach into each other: they
   emit `PaneEvent`s, and the workspace is the only thing that restructures the
   strip. Moving a window **re-parents the existing item** (`take_item` /
   `insert_item`); the terminal entity, and so the SSH channel behind it, is
   never recreated.
+
+**Columns are positioned as fractions of the strip**, not pixels
+(`Strip::render`'s `frac`). The pixel arithmetic can only use last frame's
+width, so during a window resize every frame drew one resize behind and the
+strip jittered against its edge; a fraction resolves against this frame's
+layout. Preset columns land exactly; only a dragged (pixel) column can lag.
 
 **The strip's numbers are final; only its drawing lags.** `scroll` and each
 `ColumnWidth` change the instant something asks them to, and beside each one
@@ -219,6 +302,9 @@ floor -- so the chrome keeps its *proportion* when the font size changes
 instead of its pixel size, and a 20px font does not leave a header with two
 pixels of air in it. A constant that was right at one font size is wrong at
 every other, which the home screen learned first.
+
+`head()` (16/12 of the body) and `display()` (4x) are the design's heading
+and numeral sizes, used by home and Settings only.
 
 `spaced()` and `label()` are the other half: **gpui has no letter spacing**, so
 the design's 0.18em tracking is spelled into the string, and `label()` is
@@ -308,6 +394,16 @@ then where you are, then the window itself.
   off. Each one is clickable and focuses that column. It is wrapped in
   `overflow_hidden` with a cap of 30% of the bar (40% vertical), because the
   strip is unbounded and the bar is not.
+* **The actions are Lucide icons in the app's own hand** -- one weight, one
+  size, muted ink, the accent only for the file tree while it is open:
+  `Search` (command bar), `FolderTree`, `SquareTerminal`, `Settings2`,
+  `Unplug` (disconnect, SSH only). The design's plain shapes were tried and
+  could not be read at a glance. Every one has a tooltip with its name and its
+  *current* shortcut (`keymap::describe`, so a rebinding shows). On a side the
+  clock is the `Clock` icon with the time as its tooltip.
+* **Read-out marks click like cells, not 3px rules**: each mark sits in a cell
+  the bar's full thickness across.
+* **The clock is a way home**, like the logo: clicking it shows home.
 * **The clock ticks on the minute, not on a timer.** `Workspace::tick_clock`
   sleeps exactly as long as is left of the current minute, so the digit changes
   when it should rather than up to a second late, and the window paints once a
@@ -352,6 +448,19 @@ teardown when it doesn't: the server would see a dropped socket rather than a
 goodbye. `close_anyway` awaits `disconnect_and_wait` instead, capped at two
 seconds by a `select` against a timer so an unresponsive server can't trap the
 app open, and the dialog says "disconnecting…" while that happens.
+
+**On Linux none of what follows applies**, and the trap is a different one.
+`main.rs` asks for client-side decorations (gpui's default there is a system
+titlebar *above* ours), `start_window_move` and a toggling `zoom_window` both
+work -- but starting the move on mouse-down hands the pointer to the
+compositor and the double-click is never seen. So the Linux arm of
+`window_controls` arms on the press, starts the move on the first drag, zooms
+on a double-click and opens the compositor's window menu on a right-click.
+The resize border, which client-side decorations take away, is
+`ui/decorations.rs`: a transparent `set_client_inset` margin, none on tiled
+edges. Because that margin must stay unpainted, **on Linux the window ground
+is painted by `decorations`, not `Root`** -- `apply_component_theme` clears
+`Root`'s there.
 
 **Two caption jobs gpui cannot do on Windows at all**, both failing silently —
 see `ui/window_controls.rs`:
@@ -399,93 +508,35 @@ not `WindowsAndMessaging` where the rest of these live.)
 
 ### Home screen (`ui/home.rs`)
 
-What the app opens on, and what the bar's house button brings back: three
-graduated dials standing on end, over on the left of the window, with the
-reading where they cross the middle.
+The design's launcher (Figma frame 06), and what the logo brings back. **The
+navigation bar stays** -- it is the window's caption and buttons, and its
+state word reads `IDLE` while nothing is connected -- and home is the body
+beside it: `START` on the left (three numbered ways in: SSH, this computer,
+settings, each with what it needs and what it would reach), `RESUME` on the
+right (target, columns and windows, "closed HH:MM", the strip drawn small,
+`SPACE CONTINUE`), then `TIME`: three graduated dials and a footer.
 
-```text
-    --  10   --  45   --  40
-    -        -        -
-    05    :  45    :  05
-    -        -        -
-    --  05   --  40   --  35
-```
-
-They are scales, not rows of dashes: a graduation per unit, long and numbered
-every fifth, short between. **Each slides at its own unit's rate** -- one
-graduation per second on the right, per minute in the middle, per hour on the
-left -- so the seconds dial visibly runs, the minutes dial creeps, and the hours
-dial is all but still. That is the clock, not decoration.
-
-`scale` is handed the live value, fraction and all: its whole part names each
-graduation and its fraction is how far the scale has slid, so one function does
-all three dials. Handing it a value already divided by its period
-(`seconds / 60.`) makes a dial that looks broken -- it was the first thing
-tried, and it moved a graduation a minute.
-
-Three details of the drawing:
-
-* **The geometry comes from `window.viewport_size()`**, not from constants, so
-  the dials and the type keep their proportions rather than their pixel sizes.
-  The date is centred under the reading in a box exactly as wide as it -- but
-  only while it fits; a longer line is left-aligned instead, because centring
-  it would hang it off both ends and the left end is the one that falls off
-  the screen.
-  Column centres are computed rather than laid out, because the graduations are
-  absolutely positioned and have to line up with digits that are not.
-* **The ways in are a column at every size**, right-aligned in the corner.
-  Abreast they were a line across the window that grew with the font and had
-  to be measured against the clock every time; stacked they are a corner, and
-  the corner is where the eye already is. Below ~900px wide the tracking comes
-  off and the type steps down, which is all `compact` decides now.
-* **Graduations are filtered, not clipped**: off-screen ones are dropped, and
-  so is any that would fall in the band the reading and the date occupy
-  (`Clear`). Text has no background to hide a mark behind, and there are two
-  such patches: the reading with its date, and the block in the corner. Both
-  are measured from the type -- monospace makes that a multiplication -- since
-  a constant that was right at one font size put a dial through the text at
-  another. They also fade with distance from the middle, but only so far,
-  because a hairline at a fifth opacity is a smudge, not a graduation.
-* **gpui has no letter spacing**, so the wide tracking is spelled into the
-  string (`spaced`). Display text only; nothing is ever parsed back out of one.
-
-(An earlier take on the same reference drew two huge dials off the left edge
-with rotated radial dashes. If that is ever wanted back: only `svg()` and
-`img()` can be rotated in gpui -- `Transformation` does not exist for `div` --
-and Lucide's `Minus` rotated to the radius is what a tick was made of.)
-
-**It takes the window rather than floating over it.** `Workspace::render`
-returns early while `home_open`, so the navigation bar and every pane simply
-stop being rendered -- that is what makes it
-somewhere to *be* rather than a panel to look past. A session behind it keeps
-running; nothing about a pty depends on being on screen.
-
-Two things survive the hiding, deliberately: an unpainted strip along the top
-that drags like a caption, and the three window buttons in the corner
-(`nav_bar::drag_region` and `nav_bar::window_controls`, made `pub(crate)`
-for this). A window that cannot be moved, minimised or closed is not minimal,
-it is stuck.
-
-* It is a free function against the workspace, like `nav_bar`: everything it
-  draws already lives on the workspace or in a global, so a view of its own
-  would only add a subscription to keep in sync.
-* **It animates, so it asks for a frame at a time.** `home::render` ends with
-  `request_animation_frame`, which is the whole loop: the seconds ring sweeps,
-  the minute tape slides, and the moment home stops being rendered nothing asks
-  again and the window goes back to painting only on change. (A one-second
-  timer came first and was right for a clock that only counted; it is wrong for
-  one that moves.)
-* Space is bound in a `Home` key context, never `Workspace`, for the same
-  reason Escape is scoped to the dialogs: bound wider it would be taken from
-  the shell. Home takes focus on render, checked first -- focusing
-  unconditionally would steal it back on every tick.
-* `continue_session` is honest about what it can do. A local session goes
-  straight back; a remote one cannot, because no password is stored, so it
-  comes up on that host with the form filled in. Escape returns to a running
-  session and does nothing when there is none, rather than dropping you on an
-  empty workspace.
-* Dismissing the command bar with nothing open returns to home, which is
-  where it was opened from.
+* **Each dial is one centre line** -- graduations, reading and unit label --
+  and the three are a block centred in the panel, sized so it fits.
+* **The dials slide at their own unit's rate** -- one graduation a second on
+  the right, a minute in the middle, an hour on the left. `scale` is handed
+  the live value, fraction and all; handing it `seconds / 60.` makes a dial
+  that moves a graduation a minute.
+* **They are laid out by arithmetic against their panel**, measured by a
+  `canvas` into `Workspace::home_dials`. Home repaints every frame
+  (`request_animation_frame` is the whole loop), so the measurement is never
+  visibly a frame old. Graduations are filtered out of the bands where type
+  is drawn (`Clear`), because text has no background to hide a mark behind.
+* `Workspace::resume` builds the RESUME block: the live strip when connected
+  (home is then a screen you step off with Escape), otherwise last run's
+  layout read out of the pending session without restoring it. "Closed" is
+  `session.json`'s modified time, captured by the read startup already does.
+* **Startup budget:** the SSH entry's host is `Profiles::latest` (already in
+  memory); the local entry's shell is the setting or `$SHELL`, and `user@host`
+  is environment variables plus `gethostname` -- no file is read and no shell
+  probed on the first frame.
+* Space and Escape are bound in the `Home` key context, never `Workspace`, so
+  they are not taken from a shell. Home takes focus on render, checked first.
 
 ### Icons
 
@@ -525,25 +576,39 @@ its window class. Replace the SVG and both update on the next build.
 
 ### File explorer (`ui/explorer.rs`)
 
-**The file tree is a window on the strip, not a side panel.** It used to be a
-fixed slab pinned between the rail and the columns, with a width of its own, a
-resize handle of its own and an open/closed flag of its own -- three mechanisms
-to say what a column already says. Now `^⇧B` opens (or closes) a column
-holding `ItemKind::Files`: it is resized at its seam like every other column,
-carried along the strip like every other column, stacked under a terminal if
-you want it there, and saved in the layout as `SavedItem::Files` rather than in
-three fields beside it. `Workspace::explorer_open` answers the question by
-scanning the strip, because the strip is now the only place the answer lives.
-It lands leftmost (`open_leftmost`, at `ColumnWidth::Third`), which is where a
-side panel used to be -- the habit was worth keeping even when the mechanism
-was not.
+**The file tree is docked beside the strip, not a window on it.** It was a
+column for a while -- resized at its seam, scrolled past, carried along,
+stackable -- and the user asked for it back as a panel: a tree is somewhere
+you start from, and one that scrolls off the side or ends up under a shell
+is one you have to go looking for. `^⇧B` toggles `Workspace::explorer_docked`;
+`render_explorer_dock` draws it left of the strip at `explorer_width`, with a
+hairline and a 7px grab band on its strip side (`ExplorerSeam`, measured
+absolutely from the panel's own left edge). It is never scrolled, moved or
+dropped into, and there is no `PaneItem::Files` any more. The session keeps it
+in `Session::explorer` (open, path, width); a file from the column era carries
+it as `SavedItem::Files` in the layout, which a restore reads as "docked, at
+this path" and skips when rebuilding columns.
 
-So it paints no ground and draws no border: the column body already painted
-one, and a second layer doubles a translucent window's opacity. Its own footer
+The dock paints the ground (`theme.bg`) and the explorer itself paints none,
+so a translucent window still has one layer there. Its own footer
 is the one thing it gained -- how many rows are here on the left, `LOCAL` or
 `SFTP` on the right. Both are things you want while looking at a tree and
 nowhere else, which is exactly why they are on the window rather than in the
 navigation bar.
+
+The context menu is drawn like every other list: a tracked header naming the
+target, word rows at `kit::row` height, the raised ground and 2px accent rule
+on hover, hairlines between groups, Delete in the danger colour; a click
+anywhere outside closes it (`on_mouse_down_out`).
+
+Drawn to frame 09: a `PATH` label and the path as a boxless input, `+`/`-`
+expanders as characters, no file or folder icons, and the selected row
+raised with a 2px accent rule. Its top row is exactly `kit::header` tall, so
+its line runs level with the window headers beside it. The terminal icon
+beside the path emits `ExplorerEvent::OpenTerminal`, and the workspace opens a
+terminal column running `PtyProgram::ShellIn(path)` -- the shell started in
+that directory: `current_dir` locally, ConPTY's working directory on Windows,
+and over SSH `cd '<path>' && exec "$SHELL" -l` with the path single-quoted.
 
 VS Code-shaped: an editable path bar over one flat scrolling list of rows
 indented by depth, not a nested widget tree. Directory listings are cached in a
@@ -776,14 +841,40 @@ reaches every open terminal and editor without the Settings page knowing any of
 them exist — the same trick as the font-size reflow, where terminals re-measure
 their cell from the theme in prepaint and resize their remote pty to match.
 
-The page is gpui-component's `setting::Settings` element — resizable section
-sidebar, search, grouped rows. Its fields are `(get, set)` closure pairs over
-`&App`; `settings_view.rs` wraps them as `switch` / `number` / `dropdown`
-helpers bound to one `Settings` field each. Controls that need their own entity
-(a `ColorPickerState` per colour, the font `SelectState`, the opacity
-`SliderState`) live on `SettingsView`. Pickers keep their own copy of the value,
-so a theme switch or reset calls `sync_pickers`; `ColorPickerState::set_value`
-does **not** emit, so that can't bounce back as a pile of overrides.
+**The page is drawn by `settings_view.rs`, to the design (frame 08)** -- not
+gpui-component's stock `setting::Settings` element, which it used to be. A
+section list (Interface, Appearance, Terminal, Tiling, Files, Editor, Keys)
+with the chosen one raised and accent-ruled, a heading with its count, and
+hairline rows of label, description and control. Nearly every control is a
+**segmented** choice (on/off is a two-word one) or a **stepper**; only the
+opacity slider and the colour pickers are gpui-component's. **The font list is
+ours** (`SettingsView::font_picker`): gpui-component's Select paints its
+dropdown with the theme's *window background*, which is transparent on Linux
+and on any translucent window, so the list came out see-through. Ours is an
+opaque `deferred(anchored(..))` list with a find line, each family drawn in
+itself, closed by a click outside or Escape. Neighbouring boxes never overlap -- each gives up the edge
+it shares rather than drawing over the next, or the chosen box's edge is
+painted over -- and the stepper's minus and plus sit in an invisible 8px
+margin that takes the click. Appearance lists the palettes as rows (chip
+strip, name, light/dark, accent rule on the chosen one), the colours as a
+compact grid with outlined swatches and hex, and wide content in `wide` rows.
+Rows stack when the *page* (tab less sidebar and padding) is under 640px. Each control writes through `Settings::update`. It opens as
+a FULL-width column, and below 640px the section list runs across the top.
+The theme is chosen in one place, Appearance's palette list, whose first entry
+is **System**: `theme = "system"` resolves to Paper or Ink in `theme::apply`
+from the desktop's appearance, and the workspace re-applies on a change; `default_width` is what
+a new column takes.
+
+**Keys are rebindable** (`src/keymap.rs`, frame 12): every ctrl+shift command
+is listed once with an id, group and defaults, and `keys.json` holds only the
+user's changes. **A change appends, never clears** -- `clear_key_bindings`
+would also wipe gpui-component's own -- by binding `NoAction` on the keys
+given up and then the new ones; gpui ranks a later binding above an earlier
+one in the same context. Recording uses `cx.intercept_keystrokes`, which runs
+before any binding resolves, so the chord being recorded does not also fire.
+A chord already held by another command swaps with it. `main.rs` keeps only
+the bindings that are not the user's to change (dialog Escape, overview keys,
+Tab through to the shell).
 
 The font list is measured, not looked up: Windows has no "monospace" flag to
 query, so `theme::monospace_fonts` keeps families whose `i` and `W` advance
@@ -918,9 +1009,23 @@ why `resize_column` touches exactly one entry. (The old split tree instead
 redistributed weight between the two members meeting at a divider; an even
 earlier version guessed a `PX_PER_FLEX` constant and drifted.)
 
-**One hairline per seam, and the whole seam grabs.** A column draws the line on
-its own right edge and nothing draws one on its left, so a seam is one hairline
-and never two; the focused column tints its own. The window's outer edges come
+**One hairline per seam, and the whole seam grabs.** The line is its own 1px
+element, drawn after every column -- not a column's right border, which it
+was until columns were placed by fraction: a right edge could then round onto
+the next column's first pixel, which painted its ground over the border, and
+the line between two windows came and went with the widths. Seams are always
+the plain hairline; focus is marked in the window header alone (its accent bar
+and FOCUS tag), not by a full-height red rule beside the column. There is no edge tick any more for "the
+strip continues past here": it was the same red as focus and read as a bug;
+the nav bar's read-out says what is off screen.
+
+**The grab band is 11px and `occlude`d** (column seams and the row seams in a
+stack alike): without `occlude` the window underneath was hovered too, took
+the mouse-down, and grabbed the focus while the seam started resizing.
+**The seam on the focused column's left resizes the focused column**
+(`Strip::resize_column`): its right edge stays put, its left edge follows the
+pointer, and the left neighbour gives or takes the difference -- the one case
+where a seam changes two widths, because a left edge cannot move otherwise. The window's outer edges come
 from the navigation bar. Over that line sits a 7px
 transparent band that is the entire hitbox — the neighbours are mouse-hungry (a
 terminal reports clicks to the remote program, an editor starts a selection), so
@@ -977,6 +1082,21 @@ reader ends a moment later, when the view drops the `Pty`, the pump drops the
 `wait_loop` takes before reporting is for the output the child wrote on its way
 out -- the handle signals the instant the process is gone, and the reader may
 still be a buffer behind.
+
+**On Linux the same seat is `local::unix_pty`**, behind the one entry point
+`local::open_pty`. Its read *does* end with the child -- the opposite of
+ConPTY -- but only once our own copy of the slave fd is dropped, which `spawn`
+does straight after the fork. The hangup is `killpg(pid, SIGHUP)` at the end of
+`pump` (the reader thread holds a master fd of its own, so closing ours is not
+the last close), and it shares a lock with the reap so it can never reach a
+recycled pid. **A hangup can be lost**: bash's line editor swaps signal
+handlers around every prompt, and a SIGHUP landing in that swap is delivered
+and dropped -- the shell stays alive, idle and orphaned (caught by a test that
+closes the tab right after output, about one run in seven). So a
+`pulseterm-pty-hangup` thread repeats the SIGHUP after 0.5 s and sends SIGKILL
+after 3 s, each step checking the reap under the same lock first. The `wait_loop` thread is still there: a background job can keep
+the slave open after the shell has gone. See `LINUX.md` for the rest of the
+port.
 
 **Which shell is a setting** (`Settings::local_shell`), and the dropdown lists
 only shells actually found on the machine -- offering one that isn't installed
@@ -1281,13 +1401,21 @@ bytes become one texture.
   `site.png` must not make every file inside it look like an image. There's a
   test for exactly that.
 
+## Remote desktop (planned)
+
+`REMOTE_DESKTOP.md` is the design: Sunshine on the host, controlled over the
+existing SSH connection, streaming over Moonlight's UDP ports into a separate
+PulseTerm Remote window opened from an SSH-only nav bar icon. Nothing is built
+yet. Decided: a separate GPL-3.0 helper (`pulseterm-remote`) with a gpui
+launcher and an SDL3 stream window, FFmpeg decode, and re-pairing on every
+launch against PulseTerm's own Sunshine instance, so no pairing key is ever
+stored and the user's Sunshine config is never touched.
+
 ## Not yet ported from RemoteTTY
 
 Drag-a-window-out-to-a-new-OS-window, and the TTY1-4 `conspy` console shortcuts
 (`PtyProgram::Command` is already wired for the last of these — only the UI to
 trigger it is missing).
 
-New with the strip, and not built either: **moving a window between columns
-with the mouse.** The keyboard has it — expel, consume, and carrying a column
-along the strip — and the plumbing a drag would need (`take_item` /
-`insert_item`, which never recreate the entity) is already what those use.
+Moving a window between columns with the mouse **is** built now: see
+"Dragging a window" under the workspace section.

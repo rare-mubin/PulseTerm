@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use self::item::{ItemId, ItemKind, PaneItem};
-use self::pane::{Pane, PaneEvent, PaneId};
+use self::pane::{DropZone, Pane, PaneEvent, PaneId};
 use self::strip::{ColumnWidth, Strip};
 use crate::session::{SavedItem, SavedMember, SavedTarget, Session};
 use crate::host::Host;
@@ -59,6 +59,18 @@ actions!(
 
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The docked file tree's starting width, the narrowest it can be dragged to,
+/// and the most of the window it may take -- past that there is no strip left
+/// to work in.
+const EXPLORER_WIDTH: f32 = 280.;
+const EXPLORER_MIN: f32 = 160.;
+const EXPLORER_MAX_SHARE: f32 = 0.6;
+
+/// The payload for dragging the file tree's edge. There is only one, so it
+/// carries nothing.
+#[derive(Clone)]
+struct ExplorerSeam;
+
 fn next_pane_id() -> PaneId {
     PaneId(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
 }
@@ -104,6 +116,14 @@ pub struct Workspace {
     /// The file explorer panel. Built once and kept, so its expanded folders and
     /// cached listings survive being hidden.
     explorer: Entity<ExplorerView>,
+    /// Whether the file tree is docked open beside the strip.
+    explorer_docked: bool,
+    /// Its width in pixels, set by dragging its edge.
+    explorer_width: f32,
+    /// Its laid-out bounds as of the last paint, for the edge drag to measure
+    /// against -- the cursor's distance from the panel's left edge is the
+    /// width, which keeps the drag absolute.
+    explorer_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Up when closing was asked for while a session is live.
     confirm_close: bool,
     /// Set once the answer is "close anyway", so the window's own close hook
@@ -136,6 +156,10 @@ pub struct Workspace {
     overview_open: bool,
     /// Home's focus, so space and escape reach the `Home` key context.
     home_focus: FocusHandle,
+    /// The home screen's dial panel as laid out last frame. The dials are
+    /// positioned by arithmetic against this box, and home repaints every
+    /// frame, so a frame-old measurement is never visible.
+    home_dials: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// Debounce for `session.json`: a write lands a moment after the last
     /// change rather than on every one. Holding the `Task` is what cancels the
     /// previous timer -- gpui drops a task when its handle goes.
@@ -177,6 +201,9 @@ impl Workspace {
             overview_entrance: crate::ui::motion::Entrance::new(),
             connections_subscription: None,
             explorer: cx.new(|cx| ExplorerView::new(window, cx)),
+            explorer_docked: false,
+            explorer_width: EXPLORER_WIDTH,
+            explorer_bounds: Default::default(),
             confirm_close: false,
             closing: false,
             close_focus: cx.focus_handle(),
@@ -188,6 +215,7 @@ impl Workspace {
             home_open: true,
             overview_open: false,
             home_focus: cx.focus_handle(),
+            home_dials: Default::default(),
             clock: Self::tick_clock(cx),
         };
 
@@ -199,6 +227,15 @@ impl Workspace {
                 .update(cx, |this, cx| this.request_close(window, cx))
                 .unwrap_or(true)
         });
+        // The desktop switched between light and dark. Only a `system` theme
+        // cares, but re-applying is cheap and keeps the check in one place
+        // (`theme::apply`).
+        cx.observe_window_appearance(window, |_, _, cx| {
+            if cx.global::<crate::store::Settings>().theme == "system" {
+                crate::theme::apply(cx);
+            }
+        })
+        .detach();
         // Double-clicking a file in the explorer opens it in an editor tab.
         // Detached rather than stored: the explorer lives exactly as long as
         // the workspace, so there is nothing to tear down separately.
@@ -216,6 +253,9 @@ impl Workspace {
                 }
                 crate::ui::explorer::ExplorerEvent::PreviewFile(path) => {
                     this.open_preview(path.clone(), window, cx)
+                }
+                crate::ui::explorer::ExplorerEvent::OpenTerminal(path) => {
+                    this.open_terminal_column_with(PtyProgram::ShellIn(path.clone()), window, cx)
                 }
             },
         )
@@ -440,53 +480,53 @@ impl Workspace {
         }
     }
 
-    /// Whether the file tree is open anywhere on the strip. The navigation
-    /// bar asks, to light its own button.
-    pub fn explorer_open(&self, cx: &App) -> bool {
-        self.strip.panes().iter().any(|pane| {
-            pane.read(cx)
-                .items()
-                .iter()
-                .any(|item| item.kind() == ItemKind::Files)
-        })
+    /// Whether the file tree is docked open. The navigation bar asks, to
+    /// light its own button.
+    pub fn explorer_open(&self, _cx: &App) -> bool {
+        self.explorer_docked
     }
 
-    /// Opens the file tree in a column of its own, or closes it again.
+    /// Docks the file tree open beside the strip, or closes it again.
     ///
-    /// A singleton like Settings, and for the same reason: two trees on one
-    /// host would be two caches of the same directories, disagreeing after
-    /// the first rename. Closing it keeps the entity -- what it costs to
-    /// reopen is then a repaint rather than a round trip per folder.
+    /// **A panel, not a window.** It was a column on the strip for a while --
+    /// resized at its seam, scrolled past, carried along like any other -- and
+    /// that is exactly what was wrong with it: a file tree is somewhere you
+    /// start from, and one that scrolls off the side or gets stacked under a
+    /// shell is one you have to go looking for. So it is pinned to the left of
+    /// the strip, outside it: never scrolled, never moved, never dropped into,
+    /// and resized from its own edge. Closing it keeps the entity, so
+    /// reopening is a repaint rather than a round trip per folder.
     pub fn toggle_explorer(&mut self, _: &ToggleExplorer, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_session(window, cx);
         self.home_open = false;
-        if self.explorer_open(cx) {
-            for pane in self.strip.panes() {
-                pane.update(cx, |pane, cx| {
-                    pane.close_items_of_kind(ItemKind::Files, window, cx)
-                });
-            }
-            self.collapse_empty_columns(cx);
+        self.explorer_docked = !self.explorer_docked;
+        if self.explorer_docked {
+            let handle = self.explorer.read(cx).focus_handle.clone();
+            window.focus(&handle);
+        } else {
             self.focus_active_item(window, cx);
-            cx.notify();
-            return;
         }
-        if self.activate_existing(ItemKind::Files, window, cx) {
-            return;
-        }
-        let item = PaneItem::Files(self.explorer.clone());
-        // Left of everything, not after the focus: the tree is where you
-        // start from, and a file manager that appears in the middle of the
-        // strip reads as a document rather than a place.
-        self.open_leftmost(item, window, cx);
+        cx.notify();
     }
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // From home with nothing running, Settings used to open onto a
+        // workspace with no host behind it -- terminals and the file tree then
+        // had nothing to run on. This machine is the default.
+        self.ensure_session(window, cx);
         self.home_open = false;
         if self.activate_existing(ItemKind::Settings, window, cx) {
             return;
         }
         let view = cx.new(|cx| SettingsView::new(window, cx));
         self.add_item(PaneItem::Settings(view), window, cx);
+        // A full-strip window, as the design has it (frames 04 and 08): a
+        // page of rows wants the width, and it is a place you visit rather
+        // than something you work beside. Only when it got a column of its
+        // own -- stacked into an empty one, it keeps that column's width.
+        if self.active_pane.read(cx).items().len() == 1 {
+            self.strip.set_focused_width(ColumnWidth::Full);
+        }
     }
 
     /// Whether the window may close now. `false` puts the confirmation up.
@@ -903,6 +943,56 @@ impl Workspace {
     /// gpui-component's theme, which is global, so a per-pane size would work
     /// for terminals and quietly do nothing for editors. `Settings::update`
     /// clamps to the 8-32px range the Settings page offers.
+    /// The docked file tree: a panel of its own width, a hairline on its strip
+    /// side, and a 7px grab band over that hairline -- the same seam the
+    /// columns have, because a press a pixel off a 1px line reads as "it won't
+    /// resize". The band is absolute, so it costs the layout nothing.
+    fn render_explorer_dock(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.global::<Theme>();
+        let border = theme.border;
+        let accent = theme.accent;
+        let bg = theme.bg;
+        let measured = self.explorer_bounds.clone();
+        div()
+            .relative()
+            .flex_none()
+            .h_full()
+            .w(gpui::px(self.explorer_width))
+            .bg(bg)
+            .border_r_1()
+            .border_color(border)
+            .child(
+                gpui::canvas(move |bounds, _, _| measured.set(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(div().size_full().overflow_hidden().child(self.explorer.clone()))
+            .child(
+                div()
+                    .id("explorer-seam")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(gpui::px(-4.))
+                    .w(gpui::px(7.))
+                    .cursor_col_resize()
+                    .hover(move |this| this.bg(accent.opacity(0.35)))
+                    .on_drag(ExplorerSeam, |_, _, _, cx| {
+                        cx.new(|_| crate::ui::resize::NoPreview)
+                    })
+                    .on_drag_move(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<ExplorerSeam>, window, cx| {
+                            let left = f32::from(this.explorer_bounds.get().origin.x);
+                            let most = f32::from(window.viewport_size().width) * EXPLORER_MAX_SHARE;
+                            this.explorer_width = (f32::from(event.event.position.x) - left)
+                                .clamp(EXPLORER_MIN, most.max(EXPLORER_MIN));
+                            cx.notify();
+                        },
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         crate::store::Settings::update(cx, |settings| settings.font_size += delta);
     }
@@ -912,10 +1002,45 @@ impl Workspace {
         crate::store::Settings::update(cx, |settings| settings.font_size = default);
     }
 
+    /// Opens an item in a column of its own -- Settings, an editor, a preview,
+    /// the file tree. Stacking into the focused column is the deliberate
+    /// gesture (`^⇧D`, a header's "+"), never the default: a new window
+    /// splitting the one you were reading in half is exactly what the strip
+    /// exists to avoid.
     fn add_item(&mut self, item: PaneItem, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_pane
-            .update(cx, |pane, cx| pane.add_item(item, true, window, cx));
+        let pane = self.column_for_new_window(window, cx);
+        pane.update(cx, |pane, cx| pane.add_item(item, true, window, cx));
         cx.notify();
+    }
+
+    /// Where a new window goes: the focused column if it is empty -- a fresh
+    /// workspace starts with one, and putting the first window beside it
+    /// would leave a column of nothing on screen -- and otherwise a new column
+    /// right of the focus, at the focused column's width. Focuses it either way.
+    fn column_for_new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        if self.active_pane.read(cx).is_empty() {
+            return self.active_pane.clone();
+        }
+        // Any other column left empty -- say, from a restored layout -- has no
+        // reason to stay now that there is a window to look at. Collapsed
+        // *before* the new one goes in: the new column is empty too until the
+        // caller fills it, and collapsing after would remove it, leaving the
+        // window in a column that is no longer on the strip.
+        self.collapse_empty_columns(cx);
+        let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
+        self.register_pane(&pane, window, cx);
+        // The setting, not the focused column's width: the design makes it a
+        // choice (Settings -> Interface -> Default column width).
+        let width = match cx.global::<crate::store::Settings>().default_width.as_str() {
+            "third" => ColumnWidth::Third,
+            "two_thirds" => ColumnWidth::TwoThirds,
+            "full" => ColumnWidth::Full,
+            _ => ColumnWidth::Half,
+        };
+        self.strip.insert_after_focus(pane.clone(), width);
+        self.active_pane = pane.clone();
+        self.renumber_columns(cx);
+        pane
     }
 
     /// Pushes the live connection state into the connections popup, which mirrors
@@ -992,6 +1117,10 @@ impl Workspace {
         let pane = self.active_pane.clone();
         pane.update(cx, |pane, cx| pane.close_active_item(window, cx));
         self.collapse_empty_columns(cx);
+        // The window that had the keyboard is gone. If it was its column's
+        // last, the column went with it, and focus would otherwise stay on a
+        // view that is no longer drawn -- every key after that goes nowhere.
+        self.focus_active_item(window, cx);
         cx.notify();
     }
 
@@ -1008,6 +1137,24 @@ impl Workspace {
     /// shows it (`02`, `02.2`), which is how columns of identical shells are
     /// told apart -- and a pane has no way of knowing where it sits, so the
     /// strip tells it after anything that inserts, removes or reorders.
+    /// Hands every column the width its headers print. Run each frame, from
+    /// the top of `render`, because the share drawn depends on the viewport --
+    /// a window resize, a seam drag or the fill-the-window stretch all change
+    /// it without any structural change to hook. Updates only what differs,
+    /// so a still frame costs a comparison per column and no repaint.
+    fn sync_width_labels(&mut self, cx: &mut Context<Self>) {
+        let shares = self.strip.readout();
+        for (pane, (share, _)) in self.strip.panes().into_iter().zip(shares) {
+            let label = SharedString::from(strip::width_label(share));
+            pane.update(cx, |pane, cx| {
+                if pane.width_label != label {
+                    pane.width_label = label;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
     fn renumber_columns(&mut self, cx: &mut Context<Self>) {
         for (pane, ordinal) in self.strip.ordinals() {
             pane.update(cx, |pane, cx| {
@@ -1123,6 +1270,78 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Lands a window dragged by its header: into `onto`'s column above or below
+    /// window `target`, or into a new column beside it. The keyboard has had
+    /// all of this for a while (expel, consume, carry); this is the mouse.
+    ///
+    /// The item is re-parented with `take_item` / `insert_item`, never rebuilt,
+    /// so a terminal keeps its shell and an editor its unsaved text. A column
+    /// the window leaves empty collapses itself through the `Empty` it emits.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_window(
+        &mut self,
+        from: Entity<Pane>,
+        item: ItemId,
+        onto: Entity<Pane>,
+        target: usize,
+        zone: DropZone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source_ix) = from.read(cx).index_of(item, cx) else {
+            return;
+        };
+        let alone = from.read(cx).items().len() == 1;
+        match zone {
+            DropZone::Above | DropZone::Below => {
+                let mut at = target + usize::from(zone == DropZone::Below);
+                if from == onto {
+                    // Taking it out shifts everything after it up by one.
+                    if source_ix < at {
+                        at -= 1;
+                    }
+                    if source_ix == at {
+                        return;
+                    }
+                }
+                let Some(taken) = from.update(cx, |pane, cx| pane.take_item(item, cx)) else {
+                    return;
+                };
+                onto.update(cx, |pane, cx| pane.insert_item(taken, at, true, window, cx));
+                self.focus_pane(onto);
+            }
+            DropZone::Left | DropZone::Right => {
+                // The only window of a column, dropped beside that same column,
+                // would leave and arrive in the same place.
+                if from == onto && alone {
+                    return;
+                }
+                let Some(column) = self.strip.index_of(&onto) else {
+                    return;
+                };
+                let width = self
+                    .strip
+                    .columns()
+                    .get(column)
+                    .map(|c| c.width)
+                    .unwrap_or(ColumnWidth::Half);
+                let Some(taken) = from.update(cx, |pane, cx| pane.take_item(item, cx)) else {
+                    return;
+                };
+                let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
+                self.register_pane(&pane, window, cx);
+                let at = column + usize::from(zone == DropZone::Right);
+                self.strip.insert_at(at, pane.clone(), width);
+                pane.update(cx, |pane, cx| pane.add_item(taken, true, window, cx));
+                self.active_pane = pane;
+            }
+        }
+        // `collapse_empty_columns` renumbers on its way out, which covers the
+        // column this may have added as well as any it emptied.
+        self.collapse_empty_columns(cx);
+        cx.notify();
+    }
+
     /// Moves the keyboard between the windows stacked in the focused column.
     /// All of them are on screen, so this chooses which one types, not which
     /// one you can see.
@@ -1158,6 +1377,9 @@ impl Workspace {
                 }
                 PaneEvent::Empty => {
                     this.collapse_empty_columns(cx);
+                    // Same reason as in `close_active_tab`: the emptied column
+                    // may have held the focus, and it is no longer drawn.
+                    this.focus_active_item(window, cx);
                     cx.notify();
                 }
                 // The "+" in a column's own header stacks another window in
@@ -1168,6 +1390,14 @@ impl Workspace {
                 }
                 PaneEvent::ConfirmClose { item } => {
                     this.confirm_tab_close(pane.clone(), *item, cx);
+                }
+                PaneEvent::DropWindow {
+                    from,
+                    item,
+                    target,
+                    zone,
+                } => {
+                    this.drop_window(from.clone(), *item, pane.clone(), *target, *zone, window, cx);
                 }
             },
         )
@@ -1207,6 +1437,8 @@ impl Workspace {
         // nothing else notices it changing. Its width is the column's now,
         // and that is already in the widths below.
         self.explorer.read(cx).root().hash(&mut hasher);
+        self.explorer_docked.hash(&mut hasher);
+        self.explorer_width.to_bits().hash(&mut hasher);
         self.strip.focus_index().hash(&mut hasher);
         // Ids and widths only. What a window *is* never changes after it is
         // built -- an editor keeps its path for life -- so an id standing in
@@ -1255,6 +1487,12 @@ impl Workspace {
             // behind: no layout, no resume, a clean start next time.
             layout: self.target.is_some().then(|| self.snapshot_strip(cx)),
             target: self.target.clone(),
+            explorer: self.target.is_some().then(|| crate::session::SavedExplorer {
+                open: self.explorer_docked,
+                path: self.explorer.read(cx).root().map(str::to_string),
+                width: Some(self.explorer_width),
+            }),
+            saved_at: None,
         }
     }
 
@@ -1301,9 +1539,6 @@ impl Workspace {
             PaneItem::Preview(view) => SavedItem::Preview {
                 path: view.read(cx).path.clone(),
             },
-            PaneItem::Files(view) => SavedItem::Files {
-                path: view.read(cx).root().map(str::to_string),
-            },
         }
     }
 
@@ -1330,7 +1565,15 @@ impl Workspace {
         // Queued before the host is published: `set_host` heads for the home
         // directory the instant it arrives, and the saved path has to already
         // be in place to be preferred over it.
-        let path = session.layout.as_ref().and_then(explorer_path);
+        // A file from before the tree was docked carries it as a window in the
+        // layout; that still means "docked, at this path".
+        let legacy = session.layout.as_ref().and_then(explorer_path);
+        let saved = session.explorer.clone().unwrap_or_default();
+        self.explorer_docked = saved.open || legacy.is_some();
+        if let Some(width) = saved.width {
+            self.explorer_width = width.max(EXPLORER_MIN);
+        }
+        let path = saved.path.or(legacy);
         self.explorer.update(cx, |explorer, _| explorer.restore(path));
         session.layout
     }
@@ -1361,10 +1604,21 @@ impl Workspace {
             let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
             self.register_pane(&pane, window, cx);
             for item in items {
+                // A legacy file-tree window: docked by `take_matching_session`.
+                if matches!(item, SavedItem::Files { .. }) {
+                    continue;
+                }
                 let item = self.build_item(item, host, window, cx);
                 // Not focused here: focus is placed once at the end, or every
                 // restored window would fight for it in turn.
                 pane.update(cx, |pane, cx| pane.add_item(item, false, window, cx));
+            }
+            // A column that comes back with nothing in it is a column of
+            // nothing on screen. (Terminals save nothing but do come back, as
+            // fresh shells; this is a column that was empty when saved.)
+            if pane.read(cx).is_empty() {
+                self.pane_subscriptions.remove(&pane.read(cx).id);
+                continue;
             }
             pane.update(cx, |pane, cx| pane.activate_item(active, window, cx));
             let width = widths
@@ -1387,6 +1641,12 @@ impl Workspace {
         self.strip = Strip::restored(columns);
         if let Some(first) = self.strip.focused() {
             self.active_pane = first;
+        }
+        // A layout with no windows at all restores to a bare strip, which is a
+        // connection with nothing to show for it. Give it what a fresh
+        // connect would have had.
+        if self.active_pane.read(cx).is_empty() {
+            self.open_terminal(PtyProgram::LoginShell, window, cx);
         }
         self.renumber_columns(cx);
         self.focus_active_item(window, cx);
@@ -1443,12 +1703,9 @@ impl Workspace {
             SavedItem::Preview { path } => PaneItem::Preview(
                 cx.new(|cx| crate::ui::preview::PreviewView::new(host.clone(), path, cx)),
             ),
-            // The one item that is not built here: the explorer is a
-            // singleton, kept for the life of the window so its expanded
-            // folders and cached listings survive being closed and reopened.
-            // The saved directory was queued before the host was published --
-            // see `take_matching_session`.
-            SavedItem::Files { .. } => PaneItem::Files(self.explorer.clone()),
+            // Never built: the file tree is a docked panel now, and the
+            // restore loop skips these (see `take_matching_session`).
+            SavedItem::Files { .. } => unreachable!("the restore loop skips file-tree windows"),
         }
     }
 
@@ -1574,6 +1831,72 @@ impl Workspace {
         &self.home_focus
     }
 
+    pub fn home_dials(&self) -> std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>> {
+        self.home_dials.clone()
+    }
+
+    /// What the home screen's RESUME block says. The live session when there
+    /// is one -- home is then a screen you step off -- and otherwise last
+    /// run's layout, read out of the pending session without restoring it.
+    pub fn resume(&self, cx: &App) -> Option<crate::ui::home::Resume> {
+        use crate::ui::home::Resume;
+        if self.is_connected() {
+            let shares = self
+                .strip
+                .readout()
+                .into_iter()
+                .map(|(share, segment)| (share, segment == strip::Segment::Focus))
+                .collect();
+            let windows = self
+                .strip
+                .panes()
+                .iter()
+                .map(|pane| pane.read(cx).items().len())
+                .sum();
+            return Some(Resume {
+                target: self.saved_target()?,
+                columns: self.strip.len(),
+                windows,
+                shares,
+                closed: None,
+                live: true,
+            });
+        }
+        let session = self.pending_session.as_ref()?;
+        let target = session.target.clone()?;
+        let mut saved = Vec::new();
+        let mut widths = Vec::new();
+        if let Some(layout) = session.layout.clone() {
+            Self::flatten_member(layout, &mut saved, &mut widths);
+        }
+        // Columns that come back empty are dropped on restore, so they are not
+        // counted here either; nor is a legacy file-tree window, now docked.
+        let counted: Vec<usize> = saved
+            .iter()
+            .map(|(items, _)| {
+                items
+                    .iter()
+                    .filter(|item| !matches!(item, SavedItem::Files { .. }))
+                    .count()
+            })
+            .collect();
+        let columns = counted.iter().filter(|n| **n > 0).count().max(1);
+        let shares = counted
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(ix, _)| (widths.get(ix).copied().unwrap_or(0.5), ix == 0))
+            .collect();
+        Some(Resume {
+            target,
+            columns,
+            windows: counted.iter().sum::<usize>().max(1),
+            shares,
+            closed: session.saved_at,
+            live: false,
+        })
+    }
+
     pub fn is_connected(&self) -> bool {
         matches!(self.connection, ConnectionState::Connected(_))
     }
@@ -1616,6 +1939,21 @@ impl Workspace {
 
     /// `restore` is false for "open a new local terminal": the layout is
     /// deliberately not rebuilt, just a shell.
+    /// Starts a session on this machine if there is none -- nothing
+    /// connected and nothing on its way -- and reports whether it did. Local
+    /// is the default host: anything that needs one (a terminal, the file
+    /// tree, Settings opened from home) gets it rather than doing nothing.
+    fn ensure_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !matches!(
+            self.connection,
+            ConnectionState::Disconnected | ConnectionState::Failed(_)
+        ) {
+            return false;
+        }
+        self.start_local(true, window, cx);
+        true
+    }
+
     fn start_local(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.connection, ConnectionState::Connected(_)) {
             return;
@@ -1672,6 +2010,7 @@ impl Workspace {
         let label: SharedString = match &program {
             PtyProgram::LoginShell => connection.label.clone().into(),
             PtyProgram::Command(cmd) => cmd.clone().into(),
+            PtyProgram::ShellIn(_) => connection.label.clone().into(),
         };
 
         let terminal =
@@ -1689,31 +2028,29 @@ impl Workspace {
     /// focused column's width, so repeating it gives an even row rather than
     /// a ladder of sizes.
     pub fn open_terminal_column(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_terminal_column_with(PtyProgram::LoginShell, window, cx);
+    }
+
+    /// A terminal in a new column, running `program` -- the login shell, or
+    /// the shell started in a directory (the file tree's "open in terminal").
+    pub fn open_terminal_column_with(
+        &mut self,
+        program: PtyProgram,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // No session: starting the local one already opens a shell (or
+        // brings last run's local layout back), which is all a plain "new
+        // terminal" asked for.
+        if self.ensure_session(window, cx) && matches!(program, PtyProgram::LoginShell) {
+            return;
+        }
         if !self.is_connected() {
             return;
         }
-        let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
-        self.register_pane(&pane, window, cx);
-        let width = self.strip.focused_width().unwrap_or(ColumnWidth::Half);
-        self.strip.insert_after_focus(pane.clone(), width);
-        self.active_pane = pane;
+        self.column_for_new_window(window, cx);
         self.renumber_columns(cx);
-        self.open_terminal(PtyProgram::LoginShell, window, cx);
-        cx.notify();
-    }
-
-    /// Opens an item in a new column at the head of the strip.
-    fn open_leftmost(&mut self, item: PaneItem, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
-        self.register_pane(&pane, window, cx);
-        // A third, because a tree of names is the one thing here that is
-        // mostly margin at half the window -- and because the columns beside
-        // it are what you opened it to work on.
-        self.strip.insert_first(pane.clone(), ColumnWidth::Third);
-        self.active_pane = pane;
-        self.renumber_columns(cx);
-        self.add_item(item, window, cx);
-        self.focus_active_item(window, cx);
+        self.open_terminal(program, window, cx);
         cx.notify();
     }
 
@@ -1850,13 +2187,28 @@ impl Render for Workspace {
         // Before anything below renders a pane: this reads them, and reading a
         // leased entity aborts the process.
         self.track_layout_changes(cx);
+        // Every app shortcut is bound in the `Workspace` context, so they all
+        // die the moment keyboard focus is somewhere outside it -- on nothing,
+        // or on a view that was closed and is no longer drawn. Whatever got it
+        // there, the keyboard comes back to the active window. Home, the
+        // command bar and the dialogs keep focus of their own and are left
+        // alone; only a background window is not worth correcting.
+        if !self.home_open
+            && window.is_window_active()
+            && !self.focus_handle.contains_focused(window, cx)
+            && !self.focus_handle.is_focused(window)
+        {
+            self.focus_active_item(window, cx);
+        }
+        self.strip.max_share = cx.global::<crate::store::Settings>().max_column_width / 100.;
+        self.sync_width_labels(cx);
 
         // Home takes the window rather than floating over it: no title bar, no
         // rail, no status line, no panes. Actions still need somewhere to land,
         // so the `Workspace` context stays wrapped around the `Home` one that
         // `home::render` declares inside it.
         if self.home_open {
-            return div()
+            let home = div()
                 .key_context("Workspace")
                 .size_full()
                 .on_action(cx.listener(|this, _: &ContinueSession, window, cx| {
@@ -1878,8 +2230,33 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| {
                     this.reset_font_size(cx);
                 }))
-                .child(crate::ui::home::render(self, window, cx))
+                // The design keeps the navigation bar on home (frame 06): it
+                // is the window's caption and its buttons, and the state word
+                // says IDLE. Home is the body beside it.
+                .child({
+                    let theme = cx.global::<Theme>();
+                    let font = theme.font.clone();
+                    let edge = nav_bar::Edge::from_settings(cx);
+                    let bar = nav_bar::render(self, window, cx);
+                    let body = div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .font_family(font)
+                        .child(crate::ui::home::render(self, window, cx));
+                    let frame = div()
+                        .flex()
+                        .size_full()
+                        .when(edge.is_vertical(), |this| this.flex_row())
+                        .when(!edge.is_vertical(), |this| this.flex_col());
+                    match edge {
+                        nav_bar::Edge::Left | nav_bar::Edge::Top => frame.child(bar).child(body),
+                        nav_bar::Edge::Right | nav_bar::Edge::Bottom => frame.child(body).child(bar),
+                    }
+                })
                 .into_any_element();
+            return crate::ui::decorations::wrap(home, window, cx);
         }
 
         let theme = cx.global::<Theme>();
@@ -1917,7 +2294,7 @@ impl Render for Workspace {
             self.strip.render(window, cx)
         };
 
-        div()
+        let root = div()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
@@ -2004,8 +2381,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::toggle_explorer))
             .child({
-                // Nothing beside the strip any more: the file tree is a
-                // column in it, so the body is the strip and whatever floats
+                // The docked file tree, then the strip and whatever floats
                 // over it.
                 let body = div()
                     .flex()
@@ -2013,6 +2389,9 @@ impl Render for Workspace {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    .when(self.explorer_docked, |this| {
+                        this.child(self.render_explorer_dock(cx))
+                    })
                     .child(
                         div()
                             .relative()
@@ -2050,6 +2429,8 @@ impl Render for Workspace {
             )
             // Boxed because the home screen above returns a different element
             // entirely, and the two arms have to agree on a type.
-            .into_any_element()
+            .into_any_element();
+        // Linux's client-side frame and resize margin; a pass-through elsewhere.
+        crate::ui::decorations::wrap(root, window, cx)
     }
 }

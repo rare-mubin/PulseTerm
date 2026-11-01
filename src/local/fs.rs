@@ -4,8 +4,9 @@
 //! `Result<_, String>` errors, so `host::Files` can hand either to the explorer,
 //! the editor and the preview without any of them knowing which they have.
 //!
-//! Paths here are Windows paths -- backslashes, drive letters -- which is why
-//! `join` and `parent` are not the hand-written POSIX ones `sftp` needs.
+//! Paths here are this platform's own -- backslashes and drive letters on
+//! Windows, plain POSIX on Linux -- which is why `join` and `parent` go through
+//! `std::path` rather than the hand-written POSIX ones `sftp` needs.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

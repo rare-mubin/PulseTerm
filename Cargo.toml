@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "A GPU-accelerated SSH terminal with a TUI aesthetic and a Zed-style tab manager"
 
+# Two programs, one repository. `default-members` is what keeps them apart:
+# a plain `cargo build` / `run` / `check` / `test` touches PulseTerm only, and
+# the remote desktop helper (`remote/`, GPL-3.0, SDL3 + FFmpeg) is compiled
+# only when asked for with `-p pulseterm-remote` or `--workspace`. PulseTerm
+# finds the helper at run time and works without it. See REMOTE_DESKTOP.md.
+[workspace]
+members = [".", "remote"]
+default-members = ["."]
+
 [[bin]]
 name = "PulseTerm"
 path = "src/main.rs"
@@ -101,6 +110,12 @@ features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ]
+
+# Linux local terminals: the Unix pty in `local::unix_pty` (posix_openpt,
+# TIOCSWINSZ, setsid/TIOCSCTTY, killpg). Already in the tree via tokio and
+# gpui, so this adds nothing to the build.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 # `build.rs` rasterises assets/logo.svg into the exe's icon. This is the same

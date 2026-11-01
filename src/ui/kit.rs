@@ -8,11 +8,11 @@
 //! states as constants -- a hairline is one pixel, and there is no corner
 //! radius and no shadow anywhere, ever.
 //!
-//! The scale is two sizes and no more: `micro` for labels, and the theme's
-//! own `font_size` for everything else -- navigation, rows, controls and the
-//! terminal grid alike, because it is one family at one size on one grid.
-//! Anything that wants a third size wants a different design, which is why
-//! the heading size that was once here is gone: nothing had a heading.
+//! The scale is the token sheet's (frame 01): `micro` for labels, the
+//! theme's own `font_size` for everything else -- navigation, rows, controls
+//! and the terminal grid alike -- plus `head` and `display` for the two
+//! screens the design gives headings and big numerals: home and Settings.
+//! Everything is one family; only the size changes.
 
 use gpui::{px, Pixels};
 
@@ -40,6 +40,20 @@ pub fn row(theme: &Theme) -> Pixels {
 /// enough to sit off the grid without competing with it.
 pub fn micro(theme: &Theme) -> Pixels {
     (theme.font_size * 0.72).max(px(8.))
+}
+
+/// The section heading size -- `HEAD / 16` on the token sheet against a 12px
+/// terminal -- for the few places that name a section: the home screen's
+/// entries, the Settings page's title. Derived from the type like everything
+/// here, so it stays a third larger than the body at any font size.
+pub fn head(theme: &Theme) -> Pixels {
+    theme.font_size * (16. / 12.)
+}
+
+/// The display size -- `DISPLAY / 48` -- for numerals that are read across a
+/// room: the home screen's entry numbers. Four times the body.
+pub fn display(theme: &Theme) -> Pixels {
+    theme.font_size * 4.
 }
 
 /// Letter-spaced text for labels, because **gpui has no letter spacing** and

@@ -84,15 +84,19 @@ impl Drop for Console {
 /// Synchronous, unlike the SSH opener: there is no round trip to wait for, and
 /// everything that can fail does so before the first byte moves.
 pub fn open(cols: u32, rows: u32, program: PtyProgram, shell: String) -> Result<Pty, String> {
+    let start_in = match &program {
+        PtyProgram::ShellIn(path) => Some(path.clone()),
+        _ => None,
+    };
     let command = match program {
-        PtyProgram::LoginShell => shell,
+        PtyProgram::LoginShell | PtyProgram::ShellIn(_) => shell,
         // A command replaces the shell rather than being fed to it: quoting a
         // command line through an unknown shell is a guess, and the caller
         // already knows exactly what it wants run.
         PtyProgram::Command(command) => command,
     };
 
-    let console = spawn(cols.max(1) as i16, rows.max(1) as i16, &command)?;
+    let console = spawn(cols.max(1) as i16, rows.max(1) as i16, &command, start_in)?;
     let console = Arc::new(console);
 
     let (tx, rx) = mpsc::unbounded_channel::<PtyMsg>();
@@ -209,7 +213,7 @@ async fn pump(
     drop(events);
 }
 
-fn spawn(cols: i16, rows: i16, command: &str) -> Result<Console, String> {
+fn spawn(cols: i16, rows: i16, command: &str, start_in: Option<String>) -> Result<Console, String> {
     unsafe {
         let mut input_read = HANDLE::default();
         let mut input_write = HANDLE::default();
@@ -264,9 +268,11 @@ fn spawn(cols: i16, rows: i16, command: &str) -> Result<Console, String> {
         // `CreateProcessW` may write into the command line, so it gets a
         // writable copy of its own.
         let mut command_line: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
-        let working_dir = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let working_dir = start_in.unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
         let working_dir_w: Vec<u16> = working_dir
             .encode_utf16()
             .chain(std::iter::once(0))

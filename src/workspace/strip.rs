@@ -117,6 +117,24 @@ impl ColumnWidth {
 
 const MIN_COLUMN: f32 = 180.;
 
+/// A drawn share of the viewport as a window header prints it: the preset it
+/// is, when it is one, and a percentage when a dragged seam or the stretch
+/// that fills the window has made it something else.
+pub fn width_label(share: f32) -> String {
+    let near = |target: f32| (share - target).abs() < 0.02;
+    if share >= 0.99 {
+        crate::ui::kit::label("full")
+    } else if near(1. / 3.) {
+        "1/3".into()
+    } else if near(0.5) {
+        "1/2".into()
+    } else if near(2. / 3.) {
+        "2/3".into()
+    } else {
+        format!("{}%", (share * 100.).round() as u32)
+    }
+}
+
 /// How a column stands in the navigation bar's read-out: the only place the
 /// strip says how long it is and where you are on it.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -168,6 +186,9 @@ pub struct Strip {
     /// would leave the strip a frame behind the window edge the user is
     /// dragging -- so a change here snaps everything instead.
     last_viewport: f32,
+    /// The widest a column may be drawn beside others, as a share of the
+    /// viewport (`Settings::max_column_width`). Set by the workspace.
+    pub max_share: f32,
     /// The strip's laid-out bounds, recorded each frame by a `canvas`. Keeping
     /// the focus on screen needs the viewport's width, and nothing else in the
     /// layout pass can report it.
@@ -182,6 +203,7 @@ impl Strip {
             scroll: 0.,
             shown_scroll: Glide::new(0.),
             last_viewport: 0.,
+            max_share: 0.9,
             bounds: Rc::new(Cell::new(Bounds::default())),
         }
     }
@@ -199,6 +221,7 @@ impl Strip {
             scroll: 0.,
             shown_scroll: Glide::new(0.),
             last_viewport: 0.,
+            max_share: 0.9,
             bounds: Rc::new(Cell::new(Bounds::default())),
         }
     }
@@ -250,13 +273,6 @@ impl Strip {
         self.focus = at;
     }
 
-    /// Puts a new column at the head of the strip and focuses it. Only the
-    /// file tree uses this: it is where you start from, and a place belongs
-    /// at the beginning rather than wherever the focus happened to be.
-    pub fn insert_first(&mut self, pane: Entity<Pane>, width: ColumnWidth) {
-        self.columns.insert(0, Column::new(pane, width));
-        self.focus = 0;
-    }
 
     /// Drops a column. Returns false when it is the last one -- the workspace
     /// always keeps somewhere for the next window to land.
@@ -308,8 +324,63 @@ impl Strip {
         Some(column.width)
     }
 
+    pub fn set_focused_width(&mut self, width: ColumnWidth) {
+        let ix = self.focus_index();
+        if let Some(column) = self.columns.get_mut(ix) {
+            column.width = width;
+        }
+    }
+
     pub fn focused_width(&self) -> Option<ColumnWidth> {
         self.columns.get(self.focus_index()).map(|c| c.width)
+    }
+
+    /// Every column's *drawn* width in pixels. Each column's own width,
+    /// except that **the strip never leaves the window part-empty**: when the
+    /// columns add up to less than the viewport, the last one stretches to
+    /// meet the edge -- and a lone column is simply that rule at its limit.
+    /// Ground beside the last window is a strip with nothing to scroll to.
+    ///
+    /// The last column, not all of them proportionally: dragging any other
+    /// seam then does exactly what it did -- that column takes the width under
+    /// the pointer and the last one gives or takes the difference -- where a
+    /// proportional stretch would rescale the column being dragged and pull
+    /// its edge out from under the cursor.
+    ///
+    /// Derived, never stored. A stretched column keeps its own width, so when
+    /// another arrives it glides back to the size it had rather than staying
+    /// wide and shoving the newcomer off screen.
+    fn pixel_widths(&self, viewport: f32) -> Vec<f32> {
+        // With company, no column is drawn wider than the cap: a column as
+        // wide as the window has its seam on the window's edge, where it
+        // cannot be grabbed, and hides that there is anything beside it. The
+        // neighbours peek in instead. Alone, a column fills the window.
+        let cap = if self.columns.len() > 1 {
+            viewport * self.max_share
+        } else {
+            f32::INFINITY
+        };
+        let mut widths: Vec<f32> = self
+            .columns
+            .iter()
+            .map(|c| c.width.pixels(viewport).min(cap))
+            .collect();
+        let total: f32 = widths.iter().sum();
+        if let Some(last) = widths.last_mut() {
+            if total < viewport {
+                *last += viewport - total;
+            }
+        }
+        widths
+    }
+
+    /// Puts a new column at `ix` (clamped) and focuses it. For a window dropped
+    /// beside a column with the mouse, which can land anywhere on the strip,
+    /// not only right of the focus.
+    pub fn insert_at(&mut self, ix: usize, pane: Entity<Pane>, width: ColumnWidth) {
+        let ix = ix.min(self.columns.len());
+        self.columns.insert(ix, Column::new(pane, width));
+        self.focus = ix;
     }
 
 
@@ -321,6 +392,7 @@ impl Strip {
         let viewport = f32::from(self.bounds.get().size.width);
         let focus = self.focus_index();
         let mut x = 0.;
+        let drawn = self.pixel_widths(viewport.max(1.));
         self.columns
             .iter()
             .enumerate()
@@ -328,10 +400,13 @@ impl Strip {
                 // Before the first paint nothing has been laid out, so nothing
                 // is off screen either -- claiming otherwise would flash the
                 // whole read-out pale for a frame.
-                let width = if viewport > 0. {
-                    column.width.pixels(viewport)
+                let width = if viewport > 0. { drawn[ix] } else { 0. };
+                // The share actually drawn, stretch included, so the read-out
+                // shows a full bar when the strip fills the window.
+                let share = if viewport > 0. {
+                    width / viewport
                 } else {
-                    0.
+                    column.width.share()
                 };
                 // Measured against the final scroll, not the drawn one, so
                 // the read-out names where you are going while the strip is
@@ -347,7 +422,7 @@ impl Strip {
                 } else {
                     Segment::Offscreen
                 };
-                (column.width.share(), segment)
+                (share, segment)
             })
             .collect()
     }
@@ -369,11 +444,7 @@ impl Strip {
         if viewport <= 0. {
             return;
         }
-        let widths: Vec<f32> = self
-            .columns
-            .iter()
-            .map(|c| c.width.pixels(viewport))
-            .collect();
+        let widths = self.pixel_widths(viewport);
         let focus = self.focus_index();
         let left: f32 = widths.iter().take(focus).sum();
         let right = left + widths.get(focus).copied().unwrap_or(0.);
@@ -404,12 +475,25 @@ impl Strip {
         if viewport <= 0. {
             return;
         }
-        let left: f32 = self
-            .columns
-            .iter()
-            .take(ix)
-            .map(|c| c.width.pixels(viewport))
-            .sum();
+        let drawn = self.pixel_widths(viewport);
+        // The seam on the focused column's *left* resizes the focused column:
+        // that is the window you are working in, and dragging its edge should
+        // change it, not the neighbour. Its right edge stays where it is, its
+        // left edge follows the pointer, and the neighbour on the left gives
+        // or takes the difference -- the one place a seam changes two widths,
+        // because a left edge cannot move any other way.
+        if self.focus_index() == ix + 1 && ix + 1 < self.columns.len() {
+            let start: f32 = drawn.iter().take(ix).sum();
+            let origin = f32::from(bounds.origin.x) - self.shown_scroll.shown() + start;
+            let right = origin + drawn[ix] + drawn[ix + 1];
+            let cursor = f32::from(cursor_x).clamp(origin + MIN_COLUMN, right - MIN_COLUMN);
+            self.columns[ix].width = ColumnWidth::Fixed(cursor - origin);
+            self.columns[ix + 1].width = ColumnWidth::Fixed(right - cursor);
+            self.columns[ix].snap = true;
+            self.columns[ix + 1].snap = true;
+            return;
+        }
+        let left: f32 = drawn.iter().take(ix).sum();
         // The cursor is in window coordinates; the column's left edge is the
         // strip's own origin, less how far the strip has been scrolled, plus
         // everything to the left of it.
@@ -472,11 +556,12 @@ impl Strip {
         }
         let scroll = self.shown_scroll.sample(&motion);
 
+        let targets = self.pixel_widths(viewport);
         let widths: Vec<f32> = self
             .columns
             .iter_mut()
-            .map(|column| {
-                let target = column.width.pixels(viewport);
+            .zip(targets)
+            .map(|(column, target)| {
                 if resized || std::mem::take(&mut column.snap) {
                     column.shown.jump(target);
                 } else {
@@ -497,9 +582,16 @@ impl Strip {
             window.request_animation_frame();
         }
 
-        let focus = self.focus_index();
         let last = self.columns.len() - 1;
         let mut seams: Vec<(usize, f32)> = Vec::new();
+        // Positioned as *fractions* of the strip, not pixels. The pixels were
+        // worked out against last frame's width -- the only width there is
+        // until this frame lays out -- so while the window was being resized
+        // every frame drew the columns one resize behind, and the strip
+        // jittered against its own edge. A fraction lets layout resolve
+        // against this frame's width: preset columns land exactly, and only
+        // a dragged (pixel) column can be a frame out, by one step's worth.
+        let frac = move |pixels: f32| gpui::relative(pixels / viewport);
         let mut x = -scroll;
         for (ix, column) in self.columns.iter().enumerate() {
             let width = widths[ix];
@@ -509,17 +601,10 @@ impl Strip {
                 container = container.child(
                     div()
                         .absolute()
-                        .left(px(x))
+                        .left(frac(x))
                         .top_0()
                         .bottom_0()
-                        .w(px(width))
-                        // One hairline per seam, drawn by the column on its
-                        // right edge -- the same rule the dividers followed.
-                        // The focused column tints both of its own.
-                        .when(ix < last, |this| {
-                            this.border_r_1()
-                                .border_color(if ix == focus { accent } else { border })
-                        })
+                        .w(frac(width))
                         .child(column.pane.clone()),
                 );
                 if ix < last {
@@ -533,16 +618,41 @@ impl Strip {
         // for a 1px line, because the neighbours are mouse-hungry -- a
         // terminal reports clicks to the remote program -- and a press a pixel
         // off the seam reads as "the column won't resize".
+        // One hairline per seam, drawn after every column rather than as a
+        // column's own right border. Columns are placed by fraction, and a
+        // column's right edge can round onto the same device pixel as the
+        // next column's left -- which then painted its ground over the
+        // border, and the line between two windows came and went with the
+        // widths. Always the plain hairline: focus is already marked in the
+        // window header (its accent bar and FOCUS tag), and a full-height red
+        // rule beside the focused column was the same news twice, louder.
+        for &(_, seam) in &seams {
+            container = container.child(
+                div()
+                    .absolute()
+                    .left(frac(seam))
+                    .ml(px(-1.))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.))
+                    .bg(border),
+            );
+        }
         for (ix, seam) in seams {
             container = container.child(
                 div()
                     .id(("seam", ix))
                     .absolute()
-                    .left(px(seam - 3.))
+                    .left(frac(seam))
+                    .ml(px(-5.))
                     .top_0()
                     .bottom_0()
-                    .w(px(7.))
+                    .w(px(11.))
                     .cursor_col_resize()
+                    // A press here is the seam's alone: without this the
+                    // column underneath was hovered too, took the mouse-down
+                    // and grabbed the focus while the seam started resizing.
+                    .occlude()
                     .hover(|this| this.bg(accent.opacity(0.35)))
                     .on_drag(SeamDrag { ix }, |_, _, _, cx| cx.new(|_| NoPreview))
                     .on_drag_move(cx.listener(
@@ -554,32 +664,6 @@ impl Strip {
                             cx.notify();
                         },
                     )),
-            );
-        }
-
-        // A tick at the edge the strip continues past, so a column clipped off
-        // screen is visibly off screen rather than simply absent.
-        let total: f32 = widths.iter().sum();
-        if scroll > 0.5 {
-            container = container.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(accent.opacity(0.5)),
-            );
-        }
-        if total - scroll > viewport + 0.5 {
-            container = container.child(
-                div()
-                    .absolute()
-                    .right_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(accent.opacity(0.5)),
             );
         }
 
@@ -625,5 +709,14 @@ mod tests {
         assert_eq!(ColumnWidth::from_share(0.), ColumnWidth::Half);
         assert_eq!(ColumnWidth::from_share(f32::NAN), ColumnWidth::Half);
         assert_eq!(ColumnWidth::from_share(-3.), ColumnWidth::Half);
+    }
+
+    #[test]
+    fn header_width_labels() {
+        assert_eq!(width_label(1. / 3.), "1/3");
+        assert_eq!(width_label(0.5), "1/2");
+        assert_eq!(width_label(0.666), "2/3");
+        assert_eq!(width_label(1.0), crate::ui::kit::label("full"));
+        assert_eq!(width_label(0.42), "42%");
     }
 }

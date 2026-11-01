@@ -391,6 +391,17 @@ pub fn apply(cx: &mut App) {
         Some((requested, font, _)) if *requested == settings.font_family => font.clone(),
         _ => resolve_font(&settings.font_family, cx),
     };
+    // `system` follows the desktop: Paper in a light session, Ink in a dark
+    // one. Resolved here, on every apply, and the workspace re-applies when
+    // the desktop switches -- so nothing below ever sees the word.
+    let mut settings = settings;
+    if settings.theme == "system" {
+        settings.theme = match cx.window_appearance() {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => "paper",
+            _ => "ink",
+        }
+        .into();
+    }
     let theme = build(&settings, font);
     apply_component_theme(&theme, cx);
 
@@ -520,7 +531,14 @@ fn apply_component_theme(ours: &Theme, cx: &mut App) {
     theme.highlight_theme = Arc::new(highlight);
 
     let colors = &mut theme.colors;
-    colors.background = if translucent { clear } else { ours.bg };
+    // On Linux the ground moves inward, to `ui::decorations`: a
+    // client-decorated window has a transparent margin round it for the resize
+    // edges, and `Root` filling the whole surface would paint that too.
+    colors.background = if translucent || cfg!(target_os = "linux") {
+        clear
+    } else {
+        ours.bg
+    };
     colors.foreground = p.fg;
     colors.border = p.border;
     colors.input = p.border;
@@ -582,6 +600,7 @@ fn apply_component_theme(ours: &Theme, cx: &mut App) {
 
 /// The monospace fonts that are commonly installed, best first. Used when the
 /// settings don't name one, or name one that isn't installed any more.
+#[cfg(target_os = "windows")]
 const PREFERRED: &[&str] = &[
     "Cascadia Mono",
     "Cascadia Code",
@@ -590,6 +609,24 @@ const PREFERRED: &[&str] = &[
     "Consolas",
     "Lucida Console",
     "Courier New",
+];
+
+/// The same for Linux, where five of the Windows seven are never installed.
+/// Distro defaults follow the two a terminal user is likeliest to have added:
+/// Adwaita Mono (GNOME 48+), DejaVu, Liberation, Noto, Ubuntu. On Linux the
+/// list is read out of cosmic-text's in-memory font database, which gpui
+/// loaded before our first line ran -- so resolving here is an iteration, not
+/// a fontconfig scan, and stays off the startup budget.
+#[cfg(not(target_os = "windows"))]
+const PREFERRED: &[&str] = &[
+    "JetBrains Mono",
+    "Fira Code",
+    "Cascadia Mono",
+    "Adwaita Mono",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "Ubuntu Mono",
 ];
 
 /// Picks the family to render with.

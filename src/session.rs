@@ -1,4 +1,6 @@
-//! What the workspace looked like last time, in `%APPDATA%/PulseTerm/session.json`.
+//! What the workspace looked like last time, in `session.json` in the platform
+//! data directory (`%APPDATA%/PulseTerm` on Windows, `~/.local/share/PulseTerm`
+//! on Linux).
 //!
 //! Closing the app used to lose the arrangement as well as the connection:
 //! which files were open, how the panes were split, where the explorer was
@@ -114,11 +116,34 @@ pub struct Session {
     /// clean exit leave nothing to resume.
     pub target: Option<SavedTarget>,
     pub layout: Option<SavedMember>,
+    /// The docked file tree. `None` in a file from before it was docked --
+    /// those carried it as a `SavedItem::Files` window in the layout, which a
+    /// restore still reads as "docked, at this path".
+    pub explorer: Option<SavedExplorer>,
+    /// When the file was last written -- i.e. when the session it holds was
+    /// closed -- for the home screen's "closed 01:14". Not in the file: it is
+    /// the file's own modified time, read alongside it.
+    #[serde(skip)]
+    pub saved_at: Option<std::time::SystemTime>,
+}
+
+/// The file tree's place beside the strip: whether it was open, where it was
+/// looking, and how wide it was dragged.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(default)]
+pub struct SavedExplorer {
+    pub open: bool,
+    pub path: Option<String>,
+    pub width: Option<f32>,
 }
 
 impl Session {
     pub fn load() -> Self {
-        read_json(FILE)
+        let mut session: Self = read_json(FILE);
+        session.saved_at = std::fs::metadata(crate::store::data_dir().join(FILE))
+            .and_then(|meta| meta.modified())
+            .ok();
+        session
     }
 
     pub fn save(&self) {
@@ -162,9 +187,9 @@ mod tests {
                             SavedItem::Preview {
                                 path: "/srv/readme.md".into(),
                             },
-                            // The file tree is a window like any other since
-                            // the redesign, so it rides in the layout rather
-                            // than in fields of its own beside it.
+                            // How a file from when the tree was a window
+                            // carried it. Still has to load: a restore reads
+                            // it as "docked, at this path".
                             SavedItem::Files {
                                 path: Some("/srv".into()),
                             },
@@ -175,12 +200,19 @@ mod tests {
                 flexes: Vec::new(),
                 widths: vec![1. / 3., 2. / 3.],
             }),
+            explorer: Some(SavedExplorer {
+                open: true,
+                path: Some("/srv".into()),
+                width: Some(312.),
+            }),
+            saved_at: None,
         };
 
         let json = serde_json::to_string(&session).expect("serialises");
         let back: Session = serde_json::from_str(&json).expect("deserialises");
 
         assert_eq!(back.target, session.target);
+        assert_eq!(back.explorer, session.explorer);
         let Some(SavedMember::Axis {
             vertical,
             members,
@@ -262,5 +294,15 @@ mod tests {
             ..Session::default()
         };
         assert!(mine.matches(&target));
+    }
+
+    /// A file written before the tree was docked has no `explorer` field at
+    /// all, and must still load rather than fail the whole parse.
+    #[test]
+    fn a_file_without_the_docked_tree_still_loads() {
+        let json = r#"{"target":{"kind":"local"},"layout":{"kind":"pane","items":[{"kind":"terminal"}],"active":0}}"#;
+        let back: Session = serde_json::from_str(json).expect("deserialises");
+        assert!(back.explorer.is_none());
+        assert!(back.layout.is_some());
     }
 }

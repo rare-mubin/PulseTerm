@@ -1,45 +1,75 @@
-//! The home screen: three scrolling tapes, and the three ways into the app.
+//! The home screen -- the design's launcher (frame 06, "nothing open").
 //!
-//! It replaces the whole window rather than floating over it -- no title bar,
-//! no rail, no status line, no tabs. That is the point of it: the app opens on
-//! something calm, and every piece of chrome exists to serve a session that
-//! hasn't started yet.
+//! Two halves beside the navigation bar, which stays: it is the window's
+//! caption and its buttons, and its state word says IDLE.
 //!
-//! The shape is three graduated dials standing on end, over on the left of the
-//! window, with the reading where they cross the middle:
+//! * **Start**, on the left: the three ways in, each a numbered entry with a
+//!   heading, what it needs, and what it would reach -- your last SSH host,
+//!   your local shell. The numerals are display-sized because they are the
+//!   thing you aim at.
+//! * **Resume**, on the right: what space would bring back -- the target, how
+//!   many columns and windows, when it was closed, and the strip drawn small.
+//!   Then **time**: three graduated dials standing on end, the reading where
+//!   they cross the middle.
 //!
 //! ```text
 //!     --  10   --  45   --  40
-//!     -        -        -
 //!     -        -        -
 //!     05    :  45    :  05
 //!     -        -        -
 //!     --  05   --  40   --  35
 //! ```
 //!
-//! Each is a real scale rather than a row of dashes: long graduations every
-//! five with their number beside them, short ones between, sliding upward at
-//! the rate of the unit underneath. The seconds dial visibly runs, the minutes
-//! dial creeps, the hours dial is all but still, and the reading never moves.
+//! Each dial is a real scale: long graduations every five with their number,
+//! short ones between, sliding at the rate of its own unit -- one graduation a
+//! second on the right, a minute in the middle, an hour on the left. So the
+//! seconds dial visibly runs and the hours dial is all but still. `scale` is
+//! handed the live value, fraction and all; handing it `seconds / 60.` makes
+//! a dial that moves a graduation a minute, which was the first thing tried.
 //!
 //! **It animates, so it asks for a frame at a time.** `request_animation_frame`
 //! at the end of every render is the whole loop; the moment home closes nothing
-//! asks again, and the window goes back to painting only on change.
+//! asks again.
 //!
-//! A free function against the workspace, like `nav_bar`:
-//! everything it draws already lives on the workspace or in a global, so a view
-//! of its own would only add a subscription to keep in sync.
+//! The dials are positioned by arithmetic against their panel's laid-out size,
+//! measured by a `canvas` into `Workspace::home_dials`. Home repaints every
+//! frame, so the measurement is never more than a frame old -- and never
+//! visibly so.
+//!
+//! A free function against the workspace, like `nav_bar`: everything it
+//! draws already lives on the workspace or in a global.
+
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, FontWeight, Hsla, Pixels, SharedString, Window,
+    canvas, div, prelude::*, px, relative, AnyElement, ClickEvent, Context, FontWeight, Hsla,
+    Pixels, SharedString, Window,
 };
 
+use super::kit;
 use crate::session::SavedTarget;
+use crate::store::{Profiles, Settings};
 use crate::theme::Theme;
 use crate::workspace::Workspace;
 
-/// A patch of window the dials stay out of, because type is drawn over it and
-/// text has no background to hide a graduation behind.
+/// What the RESUME block reports. Built by `Workspace::resume`, from the live
+/// strip when a session is running and from last run's file otherwise.
+pub struct Resume {
+    pub target: SavedTarget,
+    pub columns: usize,
+    pub windows: usize,
+    /// Each column's share of the viewport, and whether it had the focus --
+    /// the strip, to be drawn small.
+    pub shares: Vec<(f32, bool)>,
+    /// When last run's session was closed; `None` for a live one.
+    pub closed: Option<SystemTime>,
+    /// A session is running behind this screen.
+    pub live: bool,
+}
+
+/// A patch of the dial panel the graduations stay out of, because type is
+/// drawn over it and text has no background to hide a graduation behind.
 #[derive(Clone, Copy, Default)]
 struct Clear {
     x: f32,
@@ -58,43 +88,43 @@ impl Clear {
     }
 }
 
-pub fn render(
-    workspace: &Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> impl IntoElement {
-    let (bg, fg, fg_subtle, accent, danger, font_size, line_height) = {
+/// The design's spacing: an 8px rhythm (frame 01's grid), in the multiples the
+/// launcher uses. Margins, not measurements -- the type sizes come from `kit`.
+const GUTTER: f32 = 48.;
+const STEP: f32 = 24.;
+
+#[derive(Clone, Copy)]
+struct Ink {
+    bg: Hsla,
+    raised: Hsla,
+    border: Hsla,
+    fg: Hsla,
+    fg_muted: Hsla,
+    fg_subtle: Hsla,
+    accent: Hsla,
+    micro: Pixels,
+    head: Pixels,
+    display: Pixels,
+    line: Pixels,
+}
+
+pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let ink = {
         let t = cx.global::<Theme>();
-        (
-            t.bg,
-            t.fg,
-            t.fg_subtle,
-            t.accent,
-            t.danger,
-            t.font_size,
-            t.line_height,
-        )
+        Ink {
+            bg: t.bg,
+            raised: t.raised,
+            border: t.border,
+            fg: t.fg,
+            fg_muted: t.fg_muted,
+            fg_subtle: t.fg_subtle,
+            accent: t.accent,
+            micro: kit::micro(t),
+            head: kit::head(t),
+            display: kit::display(t),
+            line: t.line_height,
+        }
     };
-
-    let now = chrono::Local::now();
-    let hour = now.format("%H").to_string();
-    let minute = now.format("%M").to_string();
-    let second = now.format("%S").to_string();
-    let day = now.format("%d %b %Y").to_string().to_uppercase();
-    let weekday = now.format("%A").to_string().to_uppercase();
-
-    // Sub-second, or the tapes would step sixty times a minute instead of
-    // moving. Each column slides by its own unit's share of the one below it.
-    let within_second = now.timestamp_subsec_millis() as f32 / 1000.;
-    let seconds: f32 = second.parse().unwrap_or(0.) + within_second;
-    let minutes: f32 = minute.parse().unwrap_or(0.) + seconds / 60.;
-    let hours: f32 = hour.parse().unwrap_or(0.) + minutes / 60.;
-
-    // Laid out against the real window, so the columns keep their proportions
-    // rather than their pixel sizes.
-    let viewport = window.viewport_size();
-    let (w, h) = (f32::from(viewport.width), f32::from(viewport.height));
-    let caption_height = line_height + px(4.);
 
     // Focus lives here while home is up, so space and escape reach the `Home`
     // key context. Checked first: focusing unconditionally would steal it back
@@ -102,175 +132,338 @@ pub fn render(
     if !workspace.home_focus().is_focused(window) {
         window.focus(workspace.home_focus());
     }
+    // The whole animation loop. Not while the window is in the background: a
+    // clock nobody is looking at is not worth a frame every 16 ms, and gpui
+    // repaints on activation anyway.
+    if window.is_window_active() {
+        window.request_animation_frame();
+    }
 
-    // Monospace makes width arithmetic a multiplication, which is the only
-    // reason any of this can be decided before laying anything out.
-    let cell_w = f32::from(font_size) * 0.62;
-    // The ways in are a column at every size (see `way_in`), so this is only
-    // about how much room the words themselves have: below it the tracking
-    // comes off and the type steps down.
-    let compact = w < 900.;
-    // Sized by *both* axes. Height alone made the type outgrow a short, narrow
-    // window -- the date ran off the left edge before anything else broke.
-    let digit_size = px((h * 0.11).min(w * 0.085).clamp(28., 120.));
-    let digit_px = f32::from(digit_size);
-    // Two monospace digits, near enough: the dials are positioned from this
-    // rather than measured, and their graduations line up with the numbers.
-    let cell = digit_px * 1.3;
-    let gap = digit_px * 0.85;
-    let span = cell * 3. + gap * 2.;
-    // Over on the left, not centred: the reading and the dials are one block,
-    // and the ways in have the other side of the window to themselves.
-    let left = w * 0.08;
-    let column_at = move |ix: f32| left + cell * (ix + 0.5) + gap * ix;
+    let resume = workspace.resume(cx);
+    let start = start_half(ink, cx);
+    let right = resume_half(workspace, resume, ink, cx);
+
+    div()
+        .key_context("Home")
+        .track_focus(workspace.home_focus())
+        // The one ground on this screen -- on a translucent window, the single
+        // layer the desktop shows through (see `Theme::translucent`).
+        .bg(ink.bg)
+        .size_full()
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .child(start)
+        .child(right)
+}
+
+/// The left half: START, and the three ways in.
+fn start_half(ink: Ink, cx: &mut Context<Workspace>) -> AnyElement {
+    let ssh_detail = Profiles::latest(cx).unwrap_or_default();
+    let local_detail = format!("{} \u{b7} {}", shell_name(cx), user_at_host());
+
+    div()
+        .w(relative(0.44))
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .px(px(GUTTER))
+        .pt(px(GUTTER))
+        .border_r_1()
+        .border_color(ink.border)
+        .child(section_head("start", "01\u{2013}03", ink))
+        .child(
+            entry("home-ssh", 1, "ssh", "remote host / password or key", ssh_detail, ink)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.open_connections(window, cx)
+                })),
+        )
+        .child(
+            entry("home-local", 2, "this computer", "local shell / no connection", local_detail, ink)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.connect_local(window, cx)
+                })),
+        )
+        .child(
+            entry("home-settings", 3, "settings", "appearance / tiling / keys", String::new(), ink)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.open_settings(window, cx)
+                })),
+        )
+        .into_any_element()
+}
+
+/// The right half: RESUME, TIME and the footer.
+fn resume_half(
+    workspace: &Workspace,
+    resume: Option<Resume>,
+    ink: Ink,
+    _cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let now = chrono::Local::now();
+    let date = format!(
+        "{} \u{b7} {}",
+        now.format("%d %b %Y").to_string().to_uppercase(),
+        now.format("%A").to_string().to_uppercase()
+    );
+    let measured = workspace.home_dials();
+    let bounds = measured.get();
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .flex_col()
+        .px(px(GUTTER + 8.))
+        .pt(px(GUTTER))
+        .child(section_head(
+            "resume",
+            if resume.as_ref().is_some_and(|r| r.live) {
+                "running"
+            } else {
+                "last session"
+            },
+            ink,
+        ))
+        .child(resume_block(resume, ink))
+        .child(div().mt(px(STEP * 2.)).child(section_head("time", &date, ink)))
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    canvas(move |b, _, _| measured.set(b), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+                .child(dials(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    now,
+                    ink,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_between()
+                .gap_x_4()
+                .gap_y_1()
+                .py(px(12.))
+                .border_t_1()
+                .border_color(ink.border)
+                .text_size(ink.micro)
+                .text_color(ink.fg_subtle)
+                // Two lines rather than one crowded one when the panel is
+                // narrow: tracked type cannot be squeezed, only wrapped.
+                .child(div().child(kit::label(&format!("pulseterm \u{b7} {}", env!("CARGO_PKG_VERSION")))))
+                .child(div().child(kit::label("ctrl+shift+k \u{2014} command bar"))),
+        )
+        .into_any_element()
+}
+
+/// What space (or escape) would do, and what it would bring back.
+fn resume_block(resume: Option<Resume>, ink: Ink) -> AnyElement {
+    let Some(resume) = resume else {
+        return div()
+            .pt(px(STEP))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(ink.head * 1.5)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(ink.fg)
+                    .child("nothing saved"),
+            )
+            .child(
+                div()
+                    .text_color(ink.fg_muted)
+                    .child("Pick a way in on the left; the layout you leave is kept for next time."),
+            )
+            .into_any_element();
+    };
+
+    let title = match &resume.target {
+        SavedTarget::Local => format!("{} \u{2014} local", user_at_host()),
+        target => describe(target),
+    };
+    let mut detail = format!(
+        "{} column{} \u{b7} {} window{}",
+        resume.columns,
+        if resume.columns == 1 { "" } else { "s" },
+        resume.windows,
+        if resume.windows == 1 { "" } else { "s" },
+    );
+    if let Some(closed) = resume.closed {
+        let closed: chrono::DateTime<chrono::Local> = closed.into();
+        detail.push_str(&format!(" \u{b7} closed {}", closed.format("%H:%M")));
+    }
+    let (key, action) = if resume.live {
+        ("esc", "return")
+    } else {
+        ("space", "continue")
+    };
+
+    // The strip drawn small: one bar per column, its length its share.
+    let total: f32 = resume.shares.iter().map(|(share, _)| share).sum::<f32>().max(1.);
+    let strip = div().flex().gap(px(3.)).w(px(280.)).children(
+        resume.shares.iter().enumerate().map(|(ix, (share, focus))| {
+            div()
+                .h(px(3.))
+                .w(relative(share / total))
+                .bg(if *focus {
+                    ink.accent
+                } else if ix % 2 == 0 {
+                    ink.fg_muted
+                } else {
+                    ink.fg_subtle
+                })
+        }),
+    );
+
+    div()
+        .pt(px(STEP))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            div()
+                .text_size(ink.head * 1.5)
+                .font_weight(FontWeight::BOLD)
+                .text_color(ink.fg)
+                .child(title),
+        )
+        .child(div().text_color(ink.fg_muted).child(detail))
+        .child(strip)
+        .child(
+            div()
+                .mt(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(keycap(key, ink))
+                .child(
+                    div()
+                        .text_size(ink.micro)
+                        .text_color(ink.fg)
+                        .child(kit::label(action)),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The three dials, laid out in a panel `w` by `h`.
+fn dials(w: f32, h: f32, now: chrono::DateTime<chrono::Local>, ink: Ink) -> AnyElement {
+    // The first frame has no measurement yet; the next one draws for real.
+    if w <= 0. || h <= 0. {
+        return div().into_any_element();
+    }
+    let hour = now.format("%H").to_string();
+    let minute = now.format("%M").to_string();
+    let second = now.format("%S").to_string();
+    // Sub-second, or the dials would step instead of slide.
+    let within = now.timestamp_subsec_millis() as f32 / 1000.;
+    let seconds: f32 = second.parse().unwrap_or(0.) + within;
+    let minutes: f32 = minute.parse().unwrap_or(0.) + seconds / 60.;
+    let hours: f32 = hour.parse().unwrap_or(0.) + minutes / 60.;
+
+    // Each dial is one centre line: its graduations, its reading and its
+    // unit label all sit on it, so the three read as one instrument each.
+    // The scale's numbers sit just right of the graduations, which is what a
+    // column needs room for beyond the reading -- 52px either side of centre.
+    const HALF: f32 = 52.;
+    // Sized by both axes: height so a short window does not grow digits into
+    // the labels, width so three columns and two gaps fit in 92% of the panel.
+    // Two monospace digits are about 1.2 of the type size; 1.4 leaves air.
+    let across = (w * 0.92 / (1.4 * 3. + 0.5 * 2.)).max(16.);
+    let digit = (h * 0.16).min(across).clamp(16., 96.);
+    let line = f32::from(ink.line);
     let middle = h * 0.5;
-    // Fine enough that a dial reads as a scale rather than as a few dashes:
-    // thirty-odd graduations are on screen at once.
-    let pitch = (h * 0.032).max(26.);
+    let column = (digit * 1.4).max(HALF * 2.);
+    let gap = ((w * 0.92 - column * 3.) / 2.).clamp(8., digit * 0.8);
+    let block = column * 3. + gap * 2.;
+    let origin = ((w - block) / 2.).max(0.);
+    let centre = move |ix: f32| origin + column / 2. + ix * (column + gap);
+    let scale_x = centre;
+    let reading_x = centre;
+    let pitch = (h * 0.072).max(18.);
 
-    // Two patches of window the dials stay out of: the reading with the date
-    // under it, and the block of ways in down in the corner. The second only
-    // matters once the window is narrow enough for the two to share a column,
-    // but it is measured the same way either way.
-    let reading_clear = Clear {
+    let reading_band = Clear {
+        x: origin,
+        y: middle - digit * 0.75,
+        w,
+        h: digit * 1.5,
+    };
+    let date_band = Clear {
         x: 0.,
-        y: middle - digit_px * 0.9,
-        w: left + span + digit_px * 4.,
-        h: digit_px * 2.4,
+        y: h - line * 2.2,
+        w,
+        h: line * 2.2,
     };
-    // Measured from the type rather than guessed at: a constant that was right
-    // at one font size put a dial straight through the text at another. The
-    // widest line is the host name under "continue", not one of the actions,
-    // since it is set larger and tracked.
-    let (block_w, block_h) = if compact {
-        (cell_w * 22., f32::from(line_height) * 10.)
-    } else {
-        (cell_w * 1.4 * 44., f32::from(line_height) * 13.)
-    };
-    let block_clear = Clear {
-        x: w - w * 0.06 - block_w,
-        y: h - h * 0.1 - block_h,
-        w: block_w + w * 0.06,
-        h: block_h + h * 0.1,
-    };
-    let clear = [reading_clear, block_clear];
+    let clear = [reading_band, date_band];
 
-    // The date, and whether it fits under the reading. The separator and its
-    // two gaps are the +3.
-    let (date_day, date_weekday) = if compact {
-        (
-            SharedString::from(day.clone()),
-            SharedString::from(weekday.clone()),
-        )
-    } else {
-        (spaced(&day), spaced(&weekday))
-    };
-    let date_fits =
-        (date_day.chars().count() + date_weekday.chars().count() + 3) as f32 * cell_w < span;
-
-    let dial = move |ix: f32, value: f32, modulus: i32| {
-        scale(
-            column_at(ix),
-            value,
-            modulus,
-            h,
-            middle,
-            pitch,
-            clear,
-            fg_subtle,
-        )
-    };
     let reading = move |ix: f32, value: String| {
         div()
             .absolute()
-            .left(px(column_at(ix) - cell / 2.))
-            .top(px(middle - digit_px * 0.72))
-            .w(px(cell))
+            .left(px(reading_x(ix) - digit * 0.7))
+            .top(px(middle - digit * 0.65))
+            .w(px(digit * 1.4))
             .text_center()
-            .text_size(digit_size)
-            .font_weight(FontWeight::BLACK)
-            .text_color(fg)
+            .text_size(px(digit))
+            .font_weight(FontWeight::BOLD)
+            .text_color(ink.fg)
             .child(value)
     };
     let colon = move |x: f32| {
         div()
             .absolute()
-            .left(px(x - digit_px * 0.2))
-            .top(px(middle - digit_px * 0.6))
-            .w(px(digit_px * 0.4))
+            .left(px(x - digit * 0.2))
+            .top(px(middle - digit * 0.5))
+            .w(px(digit * 0.4))
             .text_center()
-            .text_size(digit_size * 0.7)
-            .text_color(accent)
+            .text_size(px(digit * 0.7))
+            .text_color(ink.accent)
             .child(":")
     };
-
-    // Another frame, please: this is the whole animation loop. Nothing else on
-    // this screen changes by itself, and nothing asks once home is gone.
-    //
-    // Not while the window is in the background, though: a clock nobody is
-    // looking at is not worth a frame every sixteen milliseconds, and gpui
-    // repaints on activation anyway, so the tapes are already where they belong
-    // by the time the window is back in front.
-    if window.is_window_active() {
-        window.request_animation_frame();
-    }
+    let unit = move |ix: f32, text: &str| {
+        div()
+            .absolute()
+            .left(px(reading_x(ix) - 60.))
+            .bottom(px(line * 0.4))
+            .w(px(120.))
+            .text_center()
+            .text_size(ink.micro)
+            .text_color(ink.fg_subtle)
+            .child(kit::label(text))
+    };
 
     div()
-        .key_context("Home")
-        .track_focus(workspace.home_focus())
-        // The one ground on this screen. On a translucent window nothing else
-        // paints a background, so this is the single layer the desktop shows
-        // through -- see `Theme::translucent`.
-        .bg(bg)
-        .size_full()
-        .relative()
+        .absolute()
+        .inset_0()
         .overflow_hidden()
-        // The value itself, fraction and all: a dial slides by exactly one
-        // graduation per unit -- one a second on the right, one a minute in the
-        // middle, one an hour on the left -- and numbers its own scale from it.
-        .child(dial(0., hours, 24))
-        .child(dial(1., minutes, 60))
-        .child(dial(2., seconds, 60))
+        .child(scale(scale_x(0.), hours, 24, h, middle, pitch, clear, ink.fg_subtle))
+        .child(scale(scale_x(1.), minutes, 60, h, middle, pitch, clear, ink.fg_subtle))
+        .child(scale(scale_x(2.), seconds, 60, h, middle, pitch, clear, ink.fg_subtle))
         .child(reading(0., hour))
         .child(reading(1., minute))
         .child(reading(2., second))
-        .child(colon(left + cell + gap * 0.5))
-        .child(colon(left + cell * 2. + gap * 1.5))
-        // Centred under the reading, in a box exactly as wide as it -- unless
-        // the line is wider than the reading, in which case centring would
-        // hang it off both ends and the left end is the one that falls off the
-        // screen. Then it starts where the reading does instead. Monospace is
-        // what makes that decidable without laying anything out first.
-        .child(
-            div()
-                .absolute()
-                .left(px(left))
-                .top(px(middle + digit_px * 0.85))
-                .w(px(span))
-                .flex()
-                .items_center()
-                .when(date_fits, |this| this.justify_center())
-                .gap(px(10.))
-                .text_color(fg_subtle)
-                .child(date_day)
-                .child(div().child("·"))
-                .child(date_weekday),
-        )
-        .child(super::nav_bar::home_chrome(
-            caption_height,
-            fg,
-            fg_subtle,
-            danger,
-            window,
-            cx,
-        ))
-        .child(way_in(
-            workspace, w, h, compact, font_size, fg, fg_subtle, cx,
-        ))
+        // Midway between neighbouring centres.
+        .child(colon((centre(0.) + centre(1.)) / 2.))
+        .child(colon((centre(1.) + centre(2.)) / 2.))
+        .child(unit(0., "hours"))
+        .child(unit(1., "minutes"))
+        .child(unit(2., "seconds"))
+        .into_any_element()
 }
 
-/// One dial, standing on end: a graduation per unit down the whole window,
-/// long and numbered every fifth, sliding upward as the value runs.
+/// One dial, standing on end: a graduation per unit down the panel, long and
+/// numbered every fifth, sliding upward as the value runs.
 ///
 /// `value` is the live reading, fraction and all. Its whole part decides what
 /// each graduation is called and its fraction is how far the scale has slid, so
@@ -295,7 +488,7 @@ fn scale(
         (-reach..=reach)
             .filter_map(move |step| {
                 let y = middle + (step as f32 - slide) * pitch;
-                if y < -pitch || y > h + pitch || clear.iter().any(|c| c.covers(x, y)) {
+                if y < 0. || y > h || clear.iter().any(|c| c.covers(x, y)) {
                     return None;
                 }
                 // `rem_euclid`, not `%`: the scale runs backwards past zero too,
@@ -306,29 +499,27 @@ fn scale(
             .flat_map(move |(y, reading)| {
                 let major = reading % 5 == 0;
                 let width = if major { 34. } else { 14. };
-                // Faded by distance from the reading: a dial thins out toward
-                // the top and bottom instead of stopping dead. Only so far,
-                // though -- a hairline at a fifth opacity is a smudge.
+                // Faded by distance from the reading, but only so far -- a
+                // hairline at a fifth opacity is a smudge, not a graduation.
                 let fade = 1. - ((y - middle).abs() / (h * 0.55)).clamp(0., 0.6);
 
                 let graduation = div()
                     .absolute()
+                    // Long and short alike centred on the dial's line.
                     .left(px(x - width / 2.))
                     .top(px(y))
                     .w(px(width))
-                    .h(px(if major { 2.5 } else { 1.5 }))
+                    .h(px(if major { 2. } else { 1. }))
                     .bg(ink.opacity(fade))
                     .into_any_element();
 
-                // Numbered on the outside of the long graduations, the way a
-                // scale is: the short ones between are just subdivision. The
-                // number is checked against the keep-outs at its own position,
-                // not the graduation's -- it sits a good way to the right.
+                // Numbered on the outside of the long graduations, as a scale
+                // is; checked against the keep-outs at its own position.
                 let label = (major && !clear.iter().any(|c| c.covers(x + 30., y))).then(|| {
                     div()
                         .absolute()
                         .left(px(x + 26.))
-                        .top(px(y - 9.))
+                        .top(px(y - 8.))
                         .text_color(ink.opacity(fade * 0.85))
                         .child(format!("{reading:02}"))
                         .into_any_element()
@@ -339,129 +530,143 @@ fn scale(
     )
 }
 
-/// The top strip: the mark, and the window buttons.
-///
-/// The chrome is hidden, not abolished. A window that cannot be moved,
-/// minimised or closed is not minimal, it is stuck -- so the caption's two jobs
-/// survive here as unpainted space that drags and three buttons in the corner.
-/// The bottom right: the three ways in, and what one key will do.
-///
-/// They sit together down here because this corner is where the eye ends up,
-/// and because they are one decision -- the lock screen this is shaped after
-/// puts its password field in the same place.
-#[allow(clippy::too_many_arguments)]
-fn way_in(
-    workspace: &Workspace,
-    w: f32,
-    h: f32,
-    compact: bool,
-    font_size: Pixels,
-    fg: Hsla,
-    fg_subtle: Hsla,
-    cx: &mut Context<Workspace>,
-) -> impl IntoElement {
-    let (caption, target, key) = match (workspace.is_connected(), workspace.saved_target()) {
-        // Reached from the rail while a session is running: home is a screen
-        // you step onto and back off.
-        (true, _) => ("RETURN TO", "YOUR SESSION".to_string(), "ESC"),
-        (false, Some(target)) => ("CONTINUE", describe(&target).to_uppercase(), "SPACE"),
-        (false, None) => ("NOTHING SAVED", "PICK A HOST".to_string(), ""),
-    };
-
-    // Tracking is the first thing to go when the window narrows: it is what
-    // makes this row half again as wide as the words in it, and the row is what
-    // runs into the clock.
-    let action = move |id: &'static str, label: &'static str| {
-        div()
-            .id(id)
-            .px(px(if compact { 0. } else { 10. }))
-            .py(px(2.))
-            .text_size(font_size * if compact { 1. } else { 1.15 })
-            .text_color(fg_subtle)
-            .hover(move |s| s.text_color(fg))
-            .child(if compact {
-                SharedString::from(label)
-            } else {
-                spaced(label)
-            })
-    };
-
+/// A section's head: its name on the left, a reading on the right, a hairline
+/// under both -- START / 01-03, RESUME / LAST SESSION, TIME / the date.
+fn section_head(name: &str, reading: &str, ink: Ink) -> AnyElement {
     div()
-        .absolute()
-        .right(px(w * 0.06))
-        .bottom(px(h * 0.1))
         .flex()
-        .flex_col()
-        .items_end()
-        .gap(px(10.))
-        // One under another at every size. Abreast they were a line across the
-        // window that grew with the font and had to be measured against the
-        // clock; stacked they are a corner, and the corner is where the eye
-        // already is.
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_end()
-                .gap(px(2.))
-                .pb(px(12.))
-                .child(
-                    action("home-ssh", "CONNECT SSH").on_click(cx.listener(
-                        |this, _: &ClickEvent, window, cx| this.open_connections(window, cx),
-                    )),
-                )
-                .child(
-                    action("home-local", "THIS COMPUTER").on_click(cx.listener(
-                        |this, _: &ClickEvent, window, cx| this.connect_local(window, cx),
-                    )),
-                )
-                .child(
-                    action("home-settings", "SETTINGS").on_click(cx.listener(
-                        |this, _: &ClickEvent, window, cx| this.open_settings(window, cx),
-                    )),
-                ),
-        )
-        .child(div().text_color(fg_subtle).child(if compact {
-            SharedString::from(caption)
-        } else {
-            spaced(caption)
-        }))
-        .child(
-            div()
-                .text_size(font_size * if compact { 1.1 } else { 1.4 })
-                .font_weight(FontWeight::BOLD)
-                .text_color(fg)
-                .child(if compact {
-                    SharedString::from(target.clone())
-                } else {
-                    spaced(&target)
-                }),
-        )
-        .when(!key.is_empty(), |this| {
-            this.child(
-                div()
-                    .mt(px(4.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .border_1()
-                    .border_color(fg_subtle)
-                    .text_color(fg_subtle)
-                    .child(spaced(key)),
-            )
-        })
+        .justify_between()
+        .items_center()
+        .pb(px(14.))
+        .border_b_1()
+        .border_color(ink.border)
+        .text_size(ink.micro)
+        .child(div().text_color(ink.fg).child(kit::label(name)))
+        .child(div().text_color(ink.fg_subtle).child(kit::label(reading)))
+        .into_any_element()
 }
 
-/// Wide letter spacing, the hard way: gpui has no tracking, so the string
-/// carries it. Display text only -- nothing is ever parsed back out of one.
-fn spaced(text: &str) -> SharedString {
-    let mut out = String::with_capacity(text.len() * 2);
-    for (ix, ch) in text.chars().enumerate() {
-        if ix > 0 {
-            out.push(' ');
-        }
-        out.push(ch);
+/// One way in: heading, what it needs, what it would reach, and its numeral.
+fn entry(
+    id: &'static str,
+    number: usize,
+    heading: &str,
+    needs: &str,
+    detail: String,
+    ink: Ink,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .py(px(STEP + 4.))
+        .min_h(ink.display * 2.4)
+        .border_b_1()
+        .border_color(ink.border)
+        .hover(move |this| this.bg(ink.raised.opacity(0.5)))
+        .child(
+            div()
+                .text_size(ink.head)
+                .font_weight(FontWeight::BOLD)
+                .text_color(ink.fg)
+                .child(heading.to_uppercase()),
+        )
+        // The words keep clear of the numeral and give way on one line
+        // rather than wrapping into it: in a narrow window the tracked
+        // subtitle is the first thing to run out of room.
+        // Padding outside, truncation inside: gpui clips at the padding's
+        // outer edge, so a truncating box with its own padding still lets
+        // the text run under the numeral.
+        .child(
+            div().pr(ink.display * 1.4).child(
+                div()
+                    .truncate()
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_subtle)
+                    .child(kit::label(needs)),
+            ),
+        )
+        .when(!detail.is_empty(), |this| {
+            this.child(
+                div().mt(px(4.)).pr(ink.display * 1.4).child(
+                    div().truncate().text_color(ink.fg_muted).child(detail),
+                ),
+            )
+        })
+        .child(
+            div()
+                .absolute()
+                .right_0()
+                .bottom(px(STEP * 0.6))
+                .text_size(ink.display)
+                .font_weight(FontWeight::BOLD)
+                .text_color(ink.fg)
+                .child(format!("{number:02}")),
+        )
+}
+
+fn keycap(text: &str, ink: Ink) -> AnyElement {
+    div()
+        .px(px(10.))
+        .py(px(3.))
+        .border_1()
+        .border_color(ink.fg_subtle)
+        .text_size(ink.micro)
+        .text_color(ink.fg_muted)
+        .child(kit::label(text))
+        .into_any_element()
+}
+
+/// The local shell as the entry names it: the configured one's file name, or
+/// the session's own -- no probing, because this is on the first frame and the
+/// startup budget allows no scan.
+fn shell_name(cx: &Context<Workspace>) -> String {
+    let configured = cx.global::<Settings>().local_shell.clone();
+    let path = if configured.is_empty() {
+        std::env::var("SHELL")
+            .or_else(|_| std::env::var("ComSpec"))
+            .unwrap_or_default()
+    } else {
+        configured
+    };
+    path.rsplit(['/', '\\'])
+        .next()
+        .map(|name| name.trim_end_matches(".exe").to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "shell".to_string())
+}
+
+/// `user@host`, worked out once: environment variables and one system call,
+/// never a file, for the same startup reason as `shell_name`.
+fn user_at_host() -> SharedString {
+    static ONCE: OnceLock<SharedString> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "user".into());
+        format!("{user}@{}", host_name()).into()
+    })
+    .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn host_name() -> String {
+    let mut buffer = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if rc != 0 {
+        return "localhost".into();
     }
-    out.into()
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".into())
 }
 
 fn describe(target: &SavedTarget) -> String {
@@ -477,16 +682,5 @@ fn describe(target: &SavedTarget) -> String {
             port,
             username,
         } => format!("{username}@{host}:{port}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tracking_is_spelled_into_the_string() {
-        assert_eq!(spaced("MONDAY"), SharedString::from("M O N D A Y"));
-        assert_eq!(spaced(""), SharedString::from(""));
     }
 }

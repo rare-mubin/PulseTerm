@@ -15,7 +15,6 @@ use super::icon::{for_filename, icon, small, Icon};
 use super::text_field::text_input;
 use crate::host::{FileEntry, Host, Progress, Properties};
 use crate::theme::Theme;
-use crate::workspace::item::ItemId;
 
 pub enum ExplorerEvent {
     /// Double-clicked a file; the workspace opens it in an editor tab -- or, if
@@ -24,6 +23,9 @@ pub enum ExplorerEvent {
     /// Asked for the rendered version from the context menu: Markdown drawn as
     /// Markdown, an image as a picture.
     PreviewFile(String),
+    /// "Open in terminal" beside the path: a new terminal column whose shell
+    /// starts in this directory.
+    OpenTerminal(String),
 }
 
 impl EventEmitter<ExplorerEvent> for ExplorerView {}
@@ -86,7 +88,6 @@ struct Target {
 /// means expanding a folder inserts one entry, and collapsing keeps what was
 /// already fetched so re-expanding is instant.
 pub struct ExplorerView {
-    pub item_id: ItemId,
     pub focus_handle: FocusHandle,
     host: Option<Host>,
     /// The directory the tree is rooted at. Double-clicking a folder moves here
@@ -139,7 +140,6 @@ impl ExplorerView {
         ];
 
         Self {
-            item_id: ItemId::next(),
             focus_handle: cx.focus_handle(),
             host: None,
             root: None,
@@ -166,22 +166,6 @@ impl ExplorerView {
         self.root.as_deref()
     }
 
-    /// The column header's title: `files \u{2014} ~/src`, or just `files`
-    /// before there is a host to read a directory from. The last segment
-    /// only, because a header is one line and an absolute path on a remote
-    /// machine is most of it.
-    pub fn title(&self) -> SharedString {
-        match self.root.as_deref() {
-            Some(root) => {
-                let name = root
-                    .rsplit(|c| c == '/' || c == '\\')
-                    .find(|part| !part.is_empty())
-                    .unwrap_or(root);
-                format!("files \u{2014} {name}").into()
-            }
-            None => "files".into(),
-        }
-    }
 
     /// Restores what the last session had. Called *before* the connection is
     /// handed over: `set_host` heads for the home directory the moment it
@@ -863,11 +847,6 @@ impl Render for ExplorerView {
                         .pl(indent)
                         .pr_2()
                         .child(div().w(px(12.)).flex_none())
-                        .child(icon(
-                            if row.is_dir { Icon::Folder } else { Icon::File },
-                            small(),
-                            accent,
-                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -885,15 +864,6 @@ impl Render for ExplorerView {
                         .into_any_element(),
                     RowKind::Entry => {
                         let is_selected = selected.as_deref() == Some(row.path.as_str());
-                        let glyph = if row.is_dir {
-                            if row.expanded {
-                                Icon::FolderOpen
-                            } else {
-                                Icon::Folder
-                            }
-                        } else {
-                            for_filename(&row.name)
-                        };
 
                         let for_chevron = row.path.clone();
                         let for_row = row.path.clone();
@@ -913,7 +883,12 @@ impl Render for ExplorerView {
                             .h(line_height)
                             .pl(indent)
                             .pr_2()
-                            .when(is_selected, |this| this.bg(raised))
+                            // The design's selection: the raised ground and a
+                            // 2px accent rule on the leading edge, the same mark
+                            // a focused window header carries.
+                            .when(is_selected, |this| {
+                                this.bg(raised).border_l_2().border_color(accent)
+                            })
                             .hover(|s| s.bg(raised.opacity(0.6)))
                             .text_color(if is_selected { fg } else { fg_muted })
                             // The chevron is the *only* thing that expands a
@@ -928,16 +903,11 @@ impl Render for ExplorerView {
                                     .flex_none()
                                     .items_center()
                                     .justify_center()
+                                    // `+` and `-`, as the design writes them:
+                                    // characters on the grid, not chevrons.
+                                    .text_color(fg_subtle)
                                     .children(row.is_dir.then(|| {
-                                        icon(
-                                            if row.expanded {
-                                                Icon::ChevronDown
-                                            } else {
-                                                Icon::ChevronRight
-                                            },
-                                            px(12.),
-                                            fg_subtle,
-                                        )
+                                        if row.expanded { "-" } else { "+" }
                                     }))
                                     .when(row.is_dir, |this| {
                                         this.hover(|s| s.bg(raised)).on_mouse_down(
@@ -951,16 +921,15 @@ impl Render for ExplorerView {
                                         )
                                     }),
                             )
-                            .child(icon(
-                                glyph,
-                                small(),
-                                if row.is_dir { accent } else { fg_muted },
-                            ))
+                            // No file or folder icons: the expander already says
+                            // which rows are folders, and a column of
+                            // pictograms is noise beside monospace names.
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
+                                    .when(row.is_dir && !is_selected, |this| this.text_color(fg))
                                     .when(row.is_symlink, |this| this.text_color(fg_subtle))
                                     .child(row.name.clone()),
                             )
@@ -1024,18 +993,23 @@ impl Render for ExplorerView {
                     .items_center()
                     .gap_1()
                     .px_1()
-                    .py_1()
+                    // Exactly a window header's height, so the panel's top
+                    // line runs level with the headers of the columns beside
+                    // it rather than a few pixels off.
+                    .h(crate::ui::kit::header(cx.global::<Theme>()))
                     .flex_none()
                     .border_b_1()
                     .border_color(border)
+                    // The design's path line: a `PATH` label and the path as
+                    // plain text. It is still an input -- type a path, press
+                    // enter -- just drawn without a box.
                     .child(
                         div()
-                            .id("explorer-up")
-                            .p_1()
+                            .pl_1()
+                            .flex_none()
+                            .text_size(crate::ui::kit::micro(cx.global::<Theme>()))
                             .text_color(fg_subtle)
-                            .hover(|s| s.text_color(fg).bg(raised))
-                            .child(icon(Icon::ArrowUp, px(12.), fg_subtle))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.go_up(cx))),
+                            .child(super::kit::label("path")),
                     )
                     .child(
                         div()
@@ -1047,28 +1021,45 @@ impl Render for ExplorerView {
                                     this.sync_path_field(cx);
                                 }
                             }))
-                            .child(text_input(&self.path_field, font_size)),
+                            .child(text_input(&self.path_field, font_size).appearance(false)),
                     )
+                    // A shell in this directory, in a column of its own.
                     .child(
                         div()
-                            .id("explorer-copy-path")
-                            .p_1()
-                            .text_color(fg_subtle)
-                            .hover(|s| s.text_color(fg).bg(raised))
-                            .child(icon(Icon::Copy, px(12.), fg_subtle))
+                            .id("explorer-terminal")
+                            .px_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .hover(|s| s.bg(raised))
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Open in terminal").build(window, cx)
+                            })
+                            .child(icon(Icon::SquareTerminal, px(13.), fg_subtle))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 if let Some(root) = this.root.clone() {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(root));
+                                    cx.emit(ExplorerEvent::OpenTerminal(root));
                                 }
                             })),
+                    )
+                    // Up a level and reload, as characters rather than icons.
+                    // (Copy path lives in the context menu.)
+                    .child(
+                        div()
+                            .id("explorer-up")
+                            .px_1()
+                            .text_color(fg_subtle)
+                            .hover(|s| s.text_color(fg).bg(raised))
+                            .child("\u{2191}")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.go_up(cx))),
                     )
                     .child(
                         div()
                             .id("explorer-refresh")
-                            .p_1()
+                            .px_1()
                             .text_color(fg_subtle)
                             .hover(|s| s.text_color(fg).bg(raised))
-                            .child(icon(Icon::RefreshCw, px(12.), fg_subtle))
+                            .child("\u{21bb}")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
                     ),
             )
@@ -1261,7 +1252,7 @@ impl ExplorerView {
     ) -> impl IntoElement {
         // Names the two transfer entries for the host in front of you.
         let local = self.is_local();
-        let (bg, border, fg, fg_muted, fg_subtle, raised, danger) = {
+        let (bg, border, fg, fg_muted, fg_subtle, raised, danger, accent, row_h, micro) = {
             let t = cx.global::<Theme>();
             (
                 // Opaque whatever the window opacity: a menu you can read the
@@ -1271,10 +1262,14 @@ impl ExplorerView {
                 t.fg,
                 t.fg_muted,
                 t.fg_subtle,
-                t.raised,
+                t.palette.raised,
                 t.danger,
+                t.accent,
+                crate::ui::kit::row(t),
+                crate::ui::kit::micro(t),
             )
         };
+        let _ = fg_subtle;
 
         // Actions on a folder apply inside it; on a file, inside its parent.
         let directory = match &menu.target {
@@ -1286,18 +1281,40 @@ impl ExplorerView {
         };
         let target = menu.target.clone();
 
-        let item = move |id: &'static str, label: &'static str, glyph: Icon, tint: gpui::Hsla| {
+        // The design's list row, as everywhere else in the app: words only,
+        // the row's own height, and on hover the raised ground with the 2px
+        // accent rule on the leading edge -- the mark a selected file, a chosen
+        // Settings section and a focused window header all carry.
+        let item = move |id: &'static str, label: &'static str, _glyph: Icon, tint: gpui::Hsla| {
             div()
                 .id(id)
+                .group(id)
+                .relative()
                 .flex()
                 .items_center()
-                .gap_2()
-                .px_2()
-                .py_0p5()
+                .h(row_h)
+                .px_3()
                 .text_color(tint)
                 .hover(|s| s.bg(raised).text_color(fg))
-                .child(icon(glyph, px(12.), fg_subtle))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .group_hover(id, move |s| s.bg(accent)),
+                )
                 .child(label)
+        };
+        // What the menu is about, as a tracked label over it.
+        let heading = match &menu.target {
+            Some(target) => format!(
+                "{} \u{b7} {}",
+                if target.is_dir { "folder" } else { "file" },
+                target.name
+            ),
+            None => format!("here \u{b7} {directory}"),
         };
 
         // `deferred` paints after every ancestor, which is what lets the menu
@@ -1313,14 +1330,34 @@ impl ExplorerView {
                 .child(
                     div()
                         .id("explorer-menu")
-                        .w(px(190.))
-                        .py_1()
+                        .w(px(220.))
+                        .pb_1()
                         .bg(bg)
                         .border_1()
                         .border_color(border)
                         .text_color(fg_muted)
                         // Keeps clicks from falling through to the tree beneath.
                         .occlude()
+                        // A click anywhere else -- a terminal, the bar, another
+                        // part of the tree -- puts the menu away, as a menu
+                        // should; it used to stay up until the tree was clicked.
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if this.menu.take().is_some() {
+                                cx.notify();
+                            }
+                        }))
+                        .child(
+                            div()
+                                .px_3()
+                                .py(px(6.))
+                                .mb_1()
+                                .border_b_1()
+                                .border_color(border)
+                                .text_size(micro)
+                                .text_color(fg_subtle)
+                                .truncate()
+                                .child(crate::ui::kit::label(&heading)),
+                        )
                         .child({
                             let directory = directory.clone();
                             item("menu-new-file", "New File", Icon::FilePlus, fg_muted).on_click(

@@ -1,0 +1,16 @@
+[package]
+name = "pulseterm-remote"
+version = "0.1.0"
+edition = "2021"
+# GPL because it will link moonlight-common-c. It is a separate program that
+# PulseTerm launches, so PulseTerm itself is not affected. See REMOTE_DESKTOP.md.
+license = "GPL-3.0-or-later"
+description = "PulseTerm Remote: Sunshine/Moonlight remote desktop client launched by PulseTerm"
+
+[[bin]]
+name = "pulseterm-remote"
+path = "src/main.rs"
+
+# Empty on purpose until the spikes settle the stack (SDL3, FFmpeg,
+# moonlight-common-c). Profiles live in the workspace root's Cargo.toml.
+[dependencies]

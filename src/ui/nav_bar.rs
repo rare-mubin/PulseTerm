@@ -34,7 +34,7 @@
 
 use gpui::{
     div, img, prelude::*, px, AnyElement, ClickEvent, Context, Hsla, MouseButton, MouseDownEvent,
-    Pixels, Window,
+    MouseMoveEvent, MouseUpEvent, Pixels, Window,
 };
 
 use super::icon::{icon, logo, Icon};
@@ -89,7 +89,9 @@ pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Works
 /// name of it, and the colour the state dot takes.
 fn session(workspace: &Workspace, theme: &Theme) -> (&'static str, String, Hsla) {
     match workspace.connection_state() {
-        ConnectionState::Disconnected => ("OFFLINE", String::new(), theme.fg_subtle),
+        // The design's word for it (frame 06): nothing is wrong, nothing is
+        // running.
+        ConnectionState::Disconnected => ("IDLE", String::new(), theme.fg_subtle),
         ConnectionState::Connecting(label) => ("DIALING", label.to_string(), theme.warning),
         // Which kind of host, because half of what the bar sits above -- paths,
         // what a shell can reach -- means something different for each.
@@ -157,11 +159,19 @@ fn horizontal(
         // Claims every pixel nothing else wanted, and drags the window with
         // it. This is the only caption the window has.
         .child(drag_region("nav-caption").flex_1().min_w(px(16.)).h_full())
+        // The clock is the way home, like the logo: home is where the big
+        // one is.
         .child(
             div()
+                .id("nav-clock")
                 .px_2()
+                .h_full()
+                .flex()
+                .items_center()
                 .flex_none()
                 .text_color(fg_subtle)
+                .hover(move |s| s.text_color(fg))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_home(window, cx)))
                 .child(clock()),
         )
         .child(window_buttons(false, size, fg, fg_subtle, danger, window, cx))
@@ -208,6 +218,26 @@ fn vertical(
         // session is four or five letters and fits.
         .child(stacked(state, fg_subtle))
         .child(div().my_2().size(px(5.)).flex_none().bg(dot))
+        // The clock, as the design draws it on a side: a face rather than
+        // digits, because four stacked digits would be taller than they are
+        // worth. The time is its tooltip.
+        .child(separator(true, size, border))
+        .child(
+            div()
+                .id("nav-clock")
+                .size(size)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new(format!("{}  \u{b7}  home", clock())).build(window, cx)
+                })
+                .hover(move |s| s.bg(fg.opacity(0.08)))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_home(window, cx)))
+                .child(icon(Icon::Clock, px(14.), fg_subtle)),
+        )
+        .child(separator(true, size, border))
         .child(window_buttons(true, size, fg, fg_subtle, danger, window, cx))
         .into_any_element()
 }
@@ -240,7 +270,7 @@ fn actions(
     let raised = theme.raised;
     let accent = theme.accent;
     let danger = theme.danger;
-    let glyph = px(14.);
+    let glyph = px(15.);
 
     let connected = matches!(workspace.connection_state(), ConnectionState::Connected(_));
     // Local mode has nothing to hang up: those shells are this machine's own
@@ -248,7 +278,13 @@ fn actions(
     let can_disconnect = connected && !workspace.is_local();
     let explorer_open = workspace.explorer_open(cx);
 
-    let cell = move |id: &'static str, which: Icon, tint: Hsla| {
+    let _ = fg;
+    // Icons, but in the app's own hand: one weight, one size, the muted ink
+    // and nothing else -- a pictogram has to say what it does at a glance,
+    // which the plain shapes the design first drew did not. Each carries its
+    // name and its current shortcut as a tooltip, read from the keymap so a
+    // rebinding shows up here too.
+    let cell = move |id: &'static str, which: Icon, tint: Hsla, name: &'static str, command: &'static str| {
         div()
             .id(id)
             .size(size)
@@ -256,32 +292,39 @@ fn actions(
             .flex_none()
             .items_center()
             .justify_center()
-            .text_color(tint)
-            .hover(move |s| s.bg(raised).text_color(fg))
+            .hover(move |s| s.bg(raised))
+            .tooltip(move |window, cx| {
+                let text = match crate::keymap::describe(cx, command) {
+                    Some(keys) => format!("{name}  {keys}"),
+                    None => name.to_string(),
+                };
+                gpui_component::tooltip::Tooltip::new(text).build(window, cx)
+            })
             .child(icon(which, glyph, tint))
     };
-
     let mut out: Vec<AnyElement> = vec![
-        cell("nav-connections", Icon::Plug, accent)
+        cell("nav-connections", Icon::Search, fg_muted, "Command bar \u{2014} connect, open, run", "window.command")
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.open_connections(window, cx)
             }))
             .into_any_element(),
         cell(
             "nav-explorer",
-            Icon::Files,
+            Icon::FolderTree,
             if explorer_open { accent } else { fg_muted },
+            "File tree",
+            "window.files",
         )
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.toggle_explorer(&crate::workspace::ToggleExplorer, window, cx);
         }))
         .into_any_element(),
-        cell("nav-new-terminal", Icon::Terminal, fg_muted)
+        cell("nav-new-terminal", Icon::SquareTerminal, fg_muted, "New terminal column", "tiling.column.new")
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.open_terminal_column(window, cx)
             }))
             .into_any_element(),
-        cell("nav-settings", Icon::Settings, fg_muted)
+        cell("nav-settings", Icon::Settings2, fg_muted, "Settings", "session.settings")
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.open_settings(window, cx)
             }))
@@ -289,7 +332,7 @@ fn actions(
     ];
     if can_disconnect {
         out.push(
-            cell("nav-disconnect", Icon::Power, danger)
+            cell("nav-disconnect", Icon::Unplug, danger, "Disconnect", "session.disconnect")
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.disconnect(window, cx)),
                 )
@@ -338,17 +381,31 @@ fn readout(workspace: &Workspace, vertical: bool, cx: &mut Context<Workspace>) -
                 Segment::Offscreen => subtle,
             };
             let long = px((share * UNIT).max(6.));
-            let mark = div()
+            // The mark stays a 3px rule; what you click is the cell around
+            // it -- the bar's whole thickness across, and half the gap either
+            // side along it -- because a 3px target is a target you miss.
+            let mark = div().flex_none().bg(tint);
+            let mark = if vertical {
+                mark.w(px(THICK)).h(long)
+            } else {
+                mark.h(px(THICK)).w(long)
+            };
+            let cell = div()
                 .id(("nav-segment", ix))
+                .flex()
                 .flex_none()
-                .bg(tint)
+                .items_center()
+                .justify_center()
+                .group("segment")
+                .hover(move |this| this.opacity(0.7))
+                .child(mark)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.focus_column_at(ix, window, cx)
                 }));
             if vertical {
-                mark.w(px(THICK)).h(long).into_any_element()
+                cell.w(px(24.)).py(px(1.5)).into_any_element()
             } else {
-                mark.h(px(THICK)).w(long).into_any_element()
+                cell.h(px(24.)).px(px(1.5)).into_any_element()
             }
         })
         .collect();
@@ -356,7 +413,6 @@ fn readout(workspace: &Workspace, vertical: bool, cx: &mut Context<Workspace>) -
     let row = div()
         .flex()
         .items_center()
-        .gap(px(3.))
         // Shrinks and clips rather than pushing the clock and the window
         // controls off the end: a strip can be arbitrarily long.
         .flex_shrink()
@@ -466,36 +522,20 @@ pub(crate) fn drag_region(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, _| {
             window_controls::caption_press(window);
         })
+        // The rest is Linux's: there the press only arms, the first drag
+        // starts the move, and a double-click is seen as one -- see
+        // `window_controls`. On Windows these are no-ops.
+        .on_mouse_move(|event: &MouseMoveEvent, window, _| {
+            window_controls::caption_drag(window, event);
+        })
+        .on_mouse_up(MouseButton::Left, |_: &MouseUpEvent, _, _| {
+            window_controls::caption_release();
+        })
+        .on_click(|event: &ClickEvent, window, _| {
+            window_controls::caption_click(window, event.click_count());
+        })
+        .on_mouse_down(MouseButton::Right, |event: &MouseDownEvent, window, _| {
+            window_controls::caption_menu(window, event.position);
+        })
 }
 
-/// The home screen's two survivors. Home takes the whole window -- no bar at
-/// all -- but a window that cannot be moved or closed is not minimal, it is
-/// stuck, so it keeps an unpainted caption strip and the three buttons.
-pub(crate) fn home_chrome(
-    height: Pixels,
-    fg: Hsla,
-    fg_subtle: Hsla,
-    danger: Hsla,
-    window: &Window,
-    cx: &mut Context<Workspace>,
-) -> impl IntoElement {
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(height)
-        .flex()
-        .items_center()
-        .child(
-            drag_region("home-caption")
-                .flex_1()
-                .h_full()
-                .px(px(14.))
-                .text_color(fg_subtle)
-                .child("PulseTerm"),
-        )
-        .child(window_buttons(
-            false, height, fg, fg_subtle, danger, window, cx,
-        ))
-}

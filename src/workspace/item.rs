@@ -4,8 +4,6 @@ use gpui::{AnyView, App, Entity, FocusHandle, SharedString};
 
 use crate::terminal::TerminalView;
 use crate::ui::editor::EditorView;
-use crate::ui::explorer::ExplorerView;
-use crate::ui::icon::{for_filename, Icon};
 use crate::ui::preview::PreviewView;
 use crate::ui::settings_view::SettingsView;
 
@@ -35,13 +33,6 @@ pub enum ItemKind {
     Terminal,
     Settings,
     Editor,
-    /// The file tree. A singleton like Settings, and **a window rather than a
-    /// panel**: it lives in a column on the strip, gets a column header like
-    /// everything else, and is scrolled past the same way. As a panel it was
-    /// a permanent 280px that every other thing in the window had to be laid
-    /// out around -- its own border, its own resize handle, its own place in
-    /// the session file -- for something you look at in bursts.
-    Files,
     /// A rendered Markdown file or an image. Deduplicated by path, like an
     /// editor, so the same file can't open twice.
     Preview,
@@ -59,7 +50,6 @@ pub enum PaneItem {
     Settings(Entity<SettingsView>),
     Editor(Entity<EditorView>),
     Preview(Entity<PreviewView>),
-    Files(Entity<ExplorerView>),
 }
 
 impl PaneItem {
@@ -69,7 +59,6 @@ impl PaneItem {
             PaneItem::Settings(_) => ItemKind::Settings,
             PaneItem::Editor(_) => ItemKind::Editor,
             PaneItem::Preview(_) => ItemKind::Preview,
-            PaneItem::Files(_) => ItemKind::Files,
         }
     }
 
@@ -78,7 +67,6 @@ impl PaneItem {
             PaneItem::Terminal(view) => view.read(cx).item_id,
             PaneItem::Settings(view) => view.read(cx).item_id,
             PaneItem::Editor(view) => view.read(cx).item_id,
-            PaneItem::Files(view) => view.read(cx).item_id,
             PaneItem::Preview(view) => view.read(cx).item_id,
         }
     }
@@ -89,21 +77,15 @@ impl PaneItem {
             PaneItem::Settings(_) => "settings".into(),
             PaneItem::Editor(view) => view.read(cx).title(),
             PaneItem::Preview(view) => view.read(cx).title(),
-            PaneItem::Files(view) => view.read(cx).title(),
         }
     }
 
-    /// Takes `cx` because an editor's icon comes from its filename, the same
-    /// way the explorer picks one for that file's row.
-    pub fn icon(&self, cx: &App) -> Icon {
+    /// A vertical hairline the window's content wants continued up through
+    /// its header, at this distance from the left -- Settings' sidebar edge.
+    pub fn header_divider(&self, cx: &App) -> Option<f32> {
         match self {
-            PaneItem::Terminal(_) => Icon::Terminal,
-            PaneItem::Settings(_) => Icon::Settings,
-            PaneItem::Editor(view) => for_filename(view.read(cx).name()),
-            // An eye, not the file's own icon: a preview and the editor can be
-            // open on the same file, and the tabs have to tell apart.
-            PaneItem::Preview(_) => Icon::Eye,
-            PaneItem::Files(_) => Icon::Folder,
+            PaneItem::Settings(view) => view.read(cx).sidebar_edge(),
+            _ => None,
         }
     }
 
@@ -133,7 +115,6 @@ impl PaneItem {
             PaneItem::Settings(view) => view.read(cx).focus_handle.clone(),
             PaneItem::Editor(view) => view.read(cx).focus_handle.clone(),
             PaneItem::Preview(view) => view.read(cx).focus_handle.clone(),
-            PaneItem::Files(view) => view.read(cx).focus_handle.clone(),
         }
     }
 
@@ -143,7 +124,6 @@ impl PaneItem {
             PaneItem::Settings(view) => view.clone().into(),
             PaneItem::Editor(view) => view.clone().into(),
             PaneItem::Preview(view) => view.clone().into(),
-            PaneItem::Files(view) => view.clone().into(),
         }
     }
 }
@@ -155,7 +135,6 @@ impl PartialEq for PaneItem {
             (PaneItem::Settings(a), PaneItem::Settings(b)) => a == b,
             (PaneItem::Editor(a), PaneItem::Editor(b)) => a == b,
             (PaneItem::Preview(a), PaneItem::Preview(b)) => a == b,
-            (PaneItem::Files(a), PaneItem::Files(b)) => a == b,
             _ => false,
         }
     }

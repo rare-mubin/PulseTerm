@@ -1,6 +1,7 @@
 //! The UI-side half of a pseudo-terminal, whichever side of the wire it runs on.
 //!
-//! An SSH channel (`ssh::pty`) and a Windows pseudo-console (`local::conpty`)
+//! An SSH channel (`ssh::pty`) and a local console (`local::open_pty`: ConPTY
+//! on Windows, a Unix pty on Linux)
 //! have nothing in common below this point and everything in common above it:
 //! bytes in, bytes out, a size, and an end. A terminal view is handed one of
 //! these and never learns which it got.
@@ -56,4 +57,7 @@ pub enum PtyProgram {
     /// trigger them is still missing.
     #[allow(dead_code)]
     Command(String),
+    /// The login shell, started in this directory -- the file tree's "open
+    /// in terminal". A path on the host the terminal runs on.
+    ShellIn(String),
 }

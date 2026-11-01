@@ -46,7 +46,7 @@ pub fn render(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let theme = cx.global::<Theme>();
-    let (bg, surface, border) = (theme.bg, theme.surface, theme.border);
+    let (bg, surface, raised, border) = (theme.bg, theme.surface, theme.raised, theme.border);
     let (fg, fg_muted, fg_subtle) = (theme.fg, theme.fg_muted, theme.fg_subtle);
     let accent = theme.accent;
     let micro = kit::micro(theme);
@@ -96,16 +96,20 @@ pub fn render(
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .bg(bg)
+            // The design's three grounds: the overview on the recessed tone,
+            // each card on the window's own, and the focused one raised.
+            .bg(if focused { raised } else { bg })
             .border_1()
             .border_color(if focused { accent } else { border });
 
         let count = card.windows.len();
         for (ix, pane_window) in card.windows.into_iter().enumerate() {
-            let label = if count > 1 {
-                format!("{ordinal:02}.{}", ix + 1)
-            } else {
+            // The same addresses the window headers use: `03`, then `03.2`.
+            let _ = count;
+            let label = if ix == 0 {
                 format!("{ordinal:02}")
+            } else {
+                format!("{ordinal:02}.{}", ix + 1)
             };
             stack = stack.child(
                 div()
@@ -123,7 +127,10 @@ pub fn render(
                             .h(header_height)
                             .px_1()
                             .flex_none()
-                            .bg(surface)
+                            // No band of its own -- it blends with the card,
+                            // like a window header does with its window.
+                            .border_b_1()
+                            .border_color(border)
                             .text_size(micro)
                             .text_color(fg_subtle)
                             .child(label)
@@ -188,7 +195,7 @@ pub fn render(
         .size_full()
         .min_w_0()
         .min_h_0()
-        .bg(bg)
+        .bg(surface)
         .p_2()
         .gap_2()
         // The cards fade up as a block. Not each one in turn: a stagger would
@@ -201,14 +208,18 @@ pub fn render(
             div()
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap_4()
                 .flex_none()
                 .text_size(micro)
                 .text_color(fg)
-                .child(reading)
+                // The reading gives way, never the key caps: they are the
+                // half you act on. It used to run straight into them in a
+                // narrow window.
+                .child(div().flex_1().min_w_0().truncate().child(reading))
                 .child(
                     div()
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap_2()
                         .child(cap("esc"))

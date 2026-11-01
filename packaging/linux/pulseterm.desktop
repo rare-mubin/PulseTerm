@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PulseTerm
+Comment=A GPU-rendered SSH terminal
+Exec=pulseterm
+Icon=pulseterm
+Terminal=false
+Categories=System;TerminalEmulator;
+# Must match `app_id` in src/main.rs, or the window will not pick up its icon
+# or group with this entry in the dock.
+StartupWMClass=pulseterm

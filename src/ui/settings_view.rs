@@ -2,46 +2,36 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, prelude::*, px, rems, App, Axis, Context, Corner, Div, Entity, FocusHandle, Focusable,
-    Hsla, Pixels, SharedString, Subscription, Window,
+    canvas, div, prelude::*, px, AnyElement, App, ClickEvent, Context, Corner, Entity, FocusHandle,
+    Focusable, FontWeight, Hsla, Pixels, SharedString, Subscription, Window,
 };
-use gpui_component::button::Button;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_component::group_box::GroupBoxVariant;
-use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
-use gpui_component::setting::{
-    NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
-    Settings as SettingsPanel,
-};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
-use gpui_component::{Colorize as _, Disableable as _, IndexPath, Sizable as _};
+use gpui_component::{Colorize as _, Sizable as _};
 
+use super::kit;
+use crate::keymap::{self, Keys, COMMANDS, FIXED};
 use crate::store::Settings;
 use crate::theme::{self, Theme, ANSI_NAMES, COLOR_TOKENS};
 use crate::workspace::item::ItemId;
 
-type FontSelect = SelectState<SearchableVec<SharedString>>;
 type Pickers = Rc<Vec<(SharedString, Entity<ColorPickerState>)>>;
 
 /// The font list's first entry, standing for "no family chosen".
 const AUTOMATIC: &str = "Automatic";
 
-// Every size below is in rems, not pixels. The rem follows the font-size
-// setting (see `theme::apply_component_theme`), and so does the text inside
-// these controls; a pixel width stays put while its text grows, which is how
-// "Tokyo Night Storm" came to run off its card at a large font. At the default
-// 13px font a rem is about 14.9px.
 
-/// Below this width (the whole tab, sidebar included) every row puts its
-/// control under its label instead of beside it. Side by side needs roughly a
-/// label column, a `CONTROL_WIDTH_REMS` control, and the page and group padding
-/// around them; any narrower and the control is clipped at the group's edge.
-const NARROW_BELOW_REMS: f32 = 51.25;
+/// Below this the page itself (the tab less its section list and padding)
+/// stacks each row's control under its label.
+const NARROW_ROWS: f32 = 640.;
 
-/// Width of a custom control beside its label. Number inputs get a minimum
-/// instead: gpui-component sizes them at 8rem, which clips a six-digit value.
-const CONTROL_WIDTH_REMS: f32 = 16.25;
-const NUMBER_MIN_WIDTH_REMS: f32 = 10.625;
+/// Below this the section list leaves the side and runs across the top: a
+/// 260px sidebar in a narrow column leaves the page a letter wide.
+const TABS_BELOW: f32 = 640.;
+
+/// The section list's width, as the design draws it (frame 08).
+const SIDEBAR: f32 = 260.;
 
 const WEIGHTS: &[(&str, &str)] = &[
     ("300", "Light"),
@@ -49,31 +39,6 @@ const WEIGHTS: &[(&str, &str)] = &[
     ("500", "Medium"),
     ("600", "Semibold"),
     ("700", "Bold"),
-];
-
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("New terminal, in a new column", "ctrl-shift-t"),
-    ("Stack a terminal in this column", "ctrl-shift-d"),
-    ("Close window", "ctrl-shift-w"),
-    (
-        "Focus column left / right",
-        "ctrl-shift-left / right, ctrl-tab",
-    ),
-    ("Focus window up / down", "ctrl-shift-up / down"),
-    ("Move column along the strip", "ctrl-shift-alt-left / right"),
-    ("Move window within its column", "ctrl-shift-alt-up / down"),
-    ("Expel window into its own column", "ctrl-shift-o"),
-    ("Consume the next column's window", "ctrl-shift-u"),
-    ("Cycle column width", "ctrl-shift-r"),
-    ("Connections", "ctrl-shift-k"),
-    ("Settings", "ctrl-shift-,"),
-    ("Disconnect", "ctrl-shift-q"),
-    ("Toggle file explorer", "ctrl-shift-b"),
-    ("Save file (in an editor)", "ctrl-s"),
-    ("Bigger / smaller font", "ctrl-= / ctrl--"),
-    ("Reset font size", "ctrl-0"),
-    ("Copy / paste in a terminal", "ctrl-shift-c / ctrl-shift-v"),
-    ("Select inside a mouse-driven TUI", "shift + drag"),
 ];
 
 /// The Settings tab.
@@ -91,7 +56,12 @@ const SHORTCUTS: &[(&str, &str)] = &[
 pub struct SettingsView {
     pub item_id: ItemId,
     pub focus_handle: FocusHandle,
-    fonts: Entity<FontSelect>,
+    /// Every monospace family installed, "Automatic" first; measured once,
+    /// when the tab opens.
+    font_names: Vec<SharedString>,
+    /// The font list is open, and what it is filtered by.
+    font_open: bool,
+    font_query: Entity<InputState>,
     opacity: Entity<SliderState>,
     /// Whether the opacity slider has had its settling frame; see `window_page`.
     opacity_settled: Rc<Cell<bool>>,
@@ -101,7 +71,50 @@ pub struct SettingsView {
     /// This tab's width as of the last paint, which picks the row layout. A pane
     /// can be narrow in a wide window, so the window size is no guide.
     width: Rc<Cell<Pixels>>,
+    /// The section on show.
+    page: Page,
+    /// The command whose keys the next chord replaces, while a Keys row is
+    /// recording. Shared with the keystroke interceptor registered in `new`.
+    recording: Rc<Cell<Option<&'static str>>>,
+    /// The Keys page's find box.
+    keys_find: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The design's sections, in its order (frame 08's sidebar).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Interface,
+    Appearance,
+    Terminal,
+    Tiling,
+    Files,
+    Editor,
+    Keys,
+}
+
+impl Page {
+    const ALL: [Page; 7] = [
+        Page::Interface,
+        Page::Appearance,
+        Page::Terminal,
+        Page::Tiling,
+        Page::Files,
+        Page::Editor,
+        Page::Keys,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Page::Interface => "Interface",
+            Page::Appearance => "Appearance",
+            Page::Terminal => "Terminal",
+            Page::Tiling => "Tiling",
+            Page::Files => "Files",
+            Page::Editor => "Editor",
+            Page::Keys => "Keys",
+        }
+    }
 }
 
 impl SettingsView {
@@ -133,34 +146,17 @@ impl SettingsView {
 
         let mut fonts = vec![SharedString::from(AUTOMATIC)];
         fonts.extend(theme::monospace_fonts(cx));
-        let current = cx.global::<Settings>().font_family.clone();
-        let selected = fonts
-            .iter()
-            .position(|font| {
-                if current.is_empty() {
-                    font.as_ref() == AUTOMATIC
-                } else {
-                    font.as_ref() == current
-                }
-            })
-            .map(IndexPath::new);
-        let fonts = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(fonts), selected, window, cx).searchable(true)
-        });
-        subscriptions.push(cx.subscribe_in(
-            &fonts,
-            window,
-            |_, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                if let SelectEvent::Confirm(Some(font)) = event {
-                    let family = if font.as_ref() == AUTOMATIC {
-                        String::new()
-                    } else {
-                        font.to_string()
-                    };
-                    Settings::update(cx, |settings| settings.font_family = family);
-                }
-            },
-        ));
+        // The font list is ours, not gpui-component's Select: its dropdown
+        // paints with the theme's window background, which is transparent on
+        // Linux (the resize margin) and on any translucent window -- so the
+        // list came out see-through. Ours is opaque and drawn like every
+        // other list in the app.
+        let font_query = cx.new(|cx| InputState::new(window, cx).placeholder("font"));
+        subscriptions.push(cx.subscribe_in(&font_query, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
 
         let current_opacity = cx.global::<Settings>().opacity;
         let opacity = cx.new(|_| {
@@ -183,129 +179,1183 @@ impl SettingsView {
             },
         ));
 
+        let keys_find = cx.new(|cx| InputState::new(window, cx).placeholder("command or key"));
+        subscriptions.push(cx.subscribe_in(&keys_find, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
+        // Recording a chord: an interceptor runs before any binding resolves,
+        // so the chord being recorded is captured as typed instead of doing
+        // what it currently does -- recording ctrl+shift+t must not open a
+        // column. Escape cancels; delete or backspace unbinds.
+        let recording: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
+        let weak = cx.entity().downgrade();
+        let armed = recording.clone();
+        subscriptions.push(cx.intercept_keystrokes(move |event, _window, cx| {
+            let Some(id) = armed.get() else {
+                return;
+            };
+            cx.stop_propagation();
+            match event.keystroke.key.as_str() {
+                "escape" => {}
+                "backspace" | "delete" => keymap::assign(cx, id, None),
+                _ => keymap::assign(cx, id, Some(event.keystroke.unparse())),
+            }
+            armed.set(None);
+            if let Some(view) = weak.upgrade() {
+                view.update(cx, |_, cx| cx.notify());
+            }
+        }));
+
         Self {
             item_id: ItemId::next(),
             focus_handle: cx.focus_handle(),
-            fonts,
+            font_names: fonts,
+            font_open: false,
+            font_query,
             opacity,
             opacity_settled: Rc::new(Cell::new(false)),
             pickers: Rc::new(pickers),
             width: Rc::new(Cell::new(px(f32::MAX))),
+            page: Page::Interface,
+            recording,
+            keys_find,
             _subscriptions: subscriptions,
         }
     }
 
-    fn appearance_page(&self, axis: Axis) -> SettingPage {
-        let chrome = COLOR_TOKENS
-            .iter()
-            .zip(self.pickers.iter())
-            .map(|((_, label, description), (_, picker))| {
-                let picker = picker.clone();
-                SettingItem::new(
-                    *label,
-                    SettingField::render(move |_, _, _| {
-                        ColorPicker::new(&picker).small().anchor(Corner::TopRight)
-                    }),
-                )
-                .description(*description)
-                .layout(axis)
-            });
-        let ansi: Vec<_> = self.pickers[COLOR_TOKENS.len()..].to_vec();
+}
 
-        SettingPage::new("Appearance")
-            .description("Pick a theme, then fine-tune any of its colours. Every change applies immediately.")
-            .resettable(false)
-            .group(SettingGroup::new().title("Theme").item(SettingItem::render({
-                let pickers = self.pickers.clone();
-                move |_, _, cx| theme_cards(&pickers, cx)
-            })))
-            .group(
-                SettingGroup::new()
-                    .title("Interface colors")
-                    .description("Overrides on top of the theme. Picking a theme above clears them.")
-                    .item(reset_colors_item(self.pickers.clone(), axis))
-                    .item(
-                        SettingItem::new(
-                            "Show focus ring",
-                            switch(|s| s.focus_ring, |s, v| s.focus_ring = v).default_value(true),
+/// One row of a page: a label and what it does, and the control that sets it.
+struct Row {
+    label: &'static str,
+    description: &'static str,
+    control: AnyElement,
+    /// The control takes the row's whole width under its label -- a palette
+    /// list, a grid of colours -- instead of sitting beside it.
+    wide: bool,
+}
+
+fn row(label: &'static str, description: &'static str, control: impl IntoElement) -> Row {
+    Row {
+        label,
+        description,
+        control: control.into_any_element(),
+        wide: false,
+    }
+}
+
+fn wide(label: &'static str, description: &'static str, control: impl IntoElement) -> Row {
+    Row {
+        wide: true,
+        ..row(label, description, control)
+    }
+}
+
+/// The colours every control is drawn in, read once per frame.
+#[derive(Clone, Copy)]
+struct Ink {
+    border: Hsla,
+    fg: Hsla,
+    fg_muted: Hsla,
+    fg_subtle: Hsla,
+    bg: Hsla,
+    raised: Hsla,
+    accent: Hsla,
+    micro: Pixels,
+}
+
+impl Ink {
+    fn read(cx: &App) -> Self {
+        let t = cx.global::<Theme>();
+        Self {
+            border: t.border,
+            fg: t.fg,
+            fg_muted: t.fg_muted,
+            fg_subtle: t.fg_subtle,
+            bg: t.palette.bg,
+            raised: t.raised,
+            accent: t.accent,
+            micro: kit::micro(t),
+        }
+    }
+}
+
+/// The design's choice control: a row of boxed words, the chosen one solid.
+/// Every setting with a handful of values is one of these -- the bar's edge,
+/// the theme, a column width, on and off -- so the page reads as one kind of
+/// thing rather than switches, dropdowns and radios side by side.
+fn segmented(
+    id: &'static str,
+    options: &[(&'static str, &'static str)],
+    current: &str,
+    set: fn(&mut Settings, &str),
+    ink: Ink,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .children(options.iter().enumerate().map(|(ix, (value, label))| {
+            let chosen = *value == current;
+            let value = *value;
+            div()
+                .id((id, ix))
+                .px(px(16.))
+                .py(px(6.))
+                .border_1()
+                .border_color(if chosen { ink.fg } else { ink.border })
+                // One hairline between neighbours, not two: every box after
+                // the first gives up its left edge, and nothing is drawn over
+                // anything -- an overlap let the next box's edge paint over
+                // the chosen one's.
+                .when(ix > 0, |this| this.border_l_0())
+                .bg(if chosen { ink.fg } else { gpui::transparent_black() })
+                .text_size(ink.micro)
+                .text_color(if chosen { ink.bg } else { ink.fg_muted })
+                .hover(move |this| if chosen { this } else { this.text_color(ink.fg) })
+                .child(kit::label(label))
+                .on_click(move |_: &ClickEvent, _, cx| {
+                    Settings::update(cx, |settings| set(settings, value));
+                })
+        }))
+        .into_any_element()
+}
+
+/// On and off, drawn the design's way: a two-word choice.
+fn toggle(id: &'static str, on: bool, set: fn(&mut Settings, bool), ink: Ink) -> AnyElement {
+    div()
+        .flex()
+        .children([(true, "on"), (false, "off")].into_iter().enumerate().map(
+            move |(ix, (value, label))| {
+                let chosen = value == on;
+                div()
+                    .id((id, ix))
+                    .px(px(16.))
+                    .py(px(6.))
+                    .border_1()
+                    .border_color(if chosen { ink.fg } else { ink.border })
+                    .when(ix > 0, |this| this.border_l_0())
+                    .bg(if chosen { ink.fg } else { gpui::transparent_black() })
+                    .text_size(ink.micro)
+                    .text_color(if chosen { ink.bg } else { ink.fg_muted })
+                    .child(kit::label(label))
+                    .on_click(move |_: &ClickEvent, _, cx| {
+                        Settings::update(cx, |settings| set(settings, value));
+                    })
+            },
+        ))
+        .into_any_element()
+}
+
+/// The design's number control: minus, the value, plus. Clamped by
+/// `Settings::clamp` on the way in, like every other change.
+fn stepper(
+    id: &'static str,
+    value: f32,
+    step: f32,
+    unit: &'static str,
+    set: fn(&mut Settings, f32),
+    ink: Ink,
+) -> AnyElement {
+    // The minus and plus look like small boxes and click like big ones: each
+    // box sits in a transparent margin that takes the press too, laid out
+    // with a matching negative margin so the row is no wider than it looks.
+    const REACH: f32 = 8.;
+    let button = move |ix: usize, text: &'static str, delta: f32, left: bool| {
+        // The reach goes on the outer side and above and below -- never
+        // between the box and the value, which the design joins.
+        div()
+            .id((id, ix))
+            .py(px(REACH))
+            .my(px(-REACH))
+            .when(left, |this| this.pl(px(REACH)).ml(px(-REACH)))
+            .when(!left, |this| this.pr(px(REACH)).mr(px(-REACH)))
+            .group("step")
+            .on_click(move |_: &ClickEvent, _, cx| {
+                Settings::update(cx, |settings| set(settings, value + delta));
+            })
+            .child(
+                div()
+                    .min_w(px(32.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .flex()
+                    .justify_center()
+                    .border_1()
+                    // The edge it shares with the value box is the value
+                    // box's to draw, in its own colour.
+                    .when(left, |this| this.border_r_0())
+                    .when(!left, |this| this.border_l_0())
+                    .border_color(ink.border)
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_muted)
+                    .group_hover("step", move |this| this.text_color(ink.fg))
+                    .child(text),
+            )
+    };
+    div()
+        .flex()
+        .items_center()
+        .child(button(0, "-", -step, true))
+        .child(
+            div()
+                .min_w(px(72.))
+                .px(px(12.))
+                .py(px(6.))
+                .flex()
+                .justify_center()
+                // All four of its own edges; nothing overlaps it, so none
+                // of them is painted over.
+                .border_1()
+                .border_color(ink.fg)
+                .text_size(ink.micro)
+                .text_color(ink.fg)
+                .child(format!("{value}{unit}")),
+        )
+        .child(button(2, "+", step, false))
+        .into_any_element()
+}
+
+impl SettingsView {
+    /// The font choice: a box naming the family in use, and on click an
+    /// opaque list of every installed monospace family -- each drawn in
+    /// itself -- with a find line over it.
+    fn font_picker(&self, cx: &mut Context<Self>, ink: Ink) -> AnyElement {
+        let current = cx.global::<Settings>().font_family.clone();
+        let shown = if current.is_empty() { AUTOMATIC.to_string() } else { current.clone() };
+        let open = self.font_open;
+        let query = self.font_query.read(cx).value().to_lowercase();
+        let row_h = kit::row(cx.global::<Theme>());
+
+        let button = div()
+            .id("font-button")
+            .w(px(300.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py(px(6.))
+            .border_1()
+            .border_color(if open { ink.fg_subtle } else { ink.border })
+            .text_color(ink.fg)
+            .hover(move |this| this.border_color(ink.fg_subtle))
+            .child(div().truncate().child(shown))
+            .child(div().text_color(ink.fg_subtle).child(if open { "\u{25b4}" } else { "\u{25be}" }))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.font_open = !this.font_open;
+                if this.font_open {
+                    this.font_query.update(cx, |state, cx| {
+                        state.set_value("", window, cx);
+                        state.focus(window, cx);
+                    });
+                }
+                cx.notify();
+            }));
+
+        let list = open.then(|| {
+            let rows = self
+                .font_names
+                .iter()
+                .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+                .enumerate()
+                .map(|(ix, name)| {
+                    let chosen = if current.is_empty() {
+                        name.as_ref() == AUTOMATIC
+                    } else {
+                        name.as_ref() == current
+                    };
+                    let family = if name.as_ref() == AUTOMATIC { String::new() } else { name.to_string() };
+                    div()
+                        .id(("font-row", ix))
+                        .relative()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .h(row_h)
+                        .px_3()
+                        .text_color(if chosen { ink.fg } else { ink.fg_muted })
+                        .when(name.as_ref() != AUTOMATIC, |this| this.font_family(name.clone()))
+                        .when(chosen, |this| {
+                            this.bg(ink.raised).child(
+                                div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(ink.accent),
+                            )
+                        })
+                        .hover(move |this| this.bg(ink.raised).text_color(ink.fg))
+                        .child(div().truncate().child(name.clone()))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            let family = family.clone();
+                            Settings::update(cx, |settings| settings.font_family = family);
+                            this.font_open = false;
+                            cx.notify();
+                        }))
+                })
+                .collect::<Vec<_>>();
+            gpui::deferred(
+                gpui::anchored().snap_to_window_with_margin(px(8.)).child(
+                    div()
+                        .id("font-menu")
+                        .w(px(300.))
+                        .h(px(320.))
+                        .mt_1()
+                        .flex()
+                        .flex_col()
+                        .bg(ink.bg)
+                        .border_1()
+                        .border_color(ink.fg_subtle)
+                        .occlude()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.font_open = false;
+                            cx.notify();
+                        }))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "escape" {
+                                this.font_open = false;
+                                cx.notify();
+                            }
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .border_b_1()
+                                .border_color(ink.border)
+                                .child(div().text_size(ink.micro).text_color(ink.fg_subtle).child(kit::label("find")))
+                                .child(div().flex_1().child(Input::new(&self.font_query).appearance(false).xsmall())),
                         )
-                        .description("Outline the focused pane and text field in the focus-ring colour. Off, they keep the ordinary border.")
-                        .layout(axis),
-                    )
-                    .items(chrome),
+                        .child(
+                            div()
+                                .id("font-list")
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
+                ),
             )
-            .group(
-                SettingGroup::new()
-                    .title("Terminal palette")
-                    .description("The 16 colours programs draw with. A program can still set its own.")
-                    .item(SettingItem::render(move |_, _, cx| ansi_grid(&ansi, cx))),
-            )
+        });
+
+        div().flex().flex_col().child(button).children(list).into_any_element()
     }
 
-    fn font_page(&self, axis: Axis) -> SettingPage {
-        let fonts = self.fonts.clone();
-        let defaults = Settings::default();
+    fn interface_rows(&self, window: &mut Window, cx: &mut Context<Self>, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>().clone();
+        let opacity = self.opacity.clone();
+        // The slider positions its thumb from bounds it records during
+        // prepaint without asking for a redraw, so the first frame it is on
+        // screen its thumb sits at the left whatever the value. One extra
+        // frame, once, lets it catch up.
+        if !self.opacity_settled.replace(true) {
+            window.request_animation_frame();
+        }
+        let configured = s.plugins_dir.clone();
+        let plugins_dir = crate::plugins::resolve_dir(&configured);
+        let plugins = crate::plugins::catalog().entries().len();
+        vec![
+            row(
+                "Navigation bar edge",
+                "Which side of the window the one bar lives on. On a side it drops the clock and the host name.",
+                segmented(
+                    "edge",
+                    &[("top", "top"), ("bottom", "bottom"), ("left", "left"), ("right", "right")],
+                    &s.nav_edge,
+                    |s, v| s.nav_edge = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Font family",
+                "Any monospace font installed here. One family for chrome and grid.",
+                self.font_picker(cx, ink),
+            ),
+            row(
+                "Font size",
+                "Chrome and terminal scale together. Open terminals reflow.",
+                stepper("font-size", s.font_size, 1., "", |s, v| s.font_size = v, ink),
+            ),
+            row(
+                "Default column width",
+                "What a new column takes on the strip.",
+                segmented(
+                    "width",
+                    &[("third", "1/3"), ("half", "1/2"), ("two_thirds", "2/3"), ("full", "full")],
+                    &s.default_width,
+                    |s, v| s.default_width = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Widest column",
+                "With more than one column, none is drawn wider than this share of the window, so the next one always peeks in and its edge can be grabbed. A lone column fills the window regardless.",
+                stepper("max-width", s.max_column_width, 5., "%", |s, v| s.max_column_width = v, ink),
+            ),
+            row(
+                "Window opacity",
+                "How much of the ground is painted. Text, borders and menus stay solid.",
+                div()
+                    .w(px(300.))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().flex_1().min_w_0().child(Slider::new(&opacity)))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_none()
+                            .text_right()
+                            .text_color(ink.fg)
+                            .child(format!("{:.0}%", s.opacity)),
+                    ),
+            ),
+            row(
+                "On launch",
+                "Home asks for nothing. Last session reopens the layout you left -- a remote one still needs its password, which is never stored. Local goes straight to a shell here.",
+                segmented(
+                    "startup",
+                    &[("home", "home"), ("resume", "last session"), ("local", "local")],
+                    &s.startup,
+                    |s, v| s.startup = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Plugins folder",
+                "Where file-type support is read from. Only the index is read at launch.",
+                div()
+                    .w(px(300.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(ink.fg_muted)
+                            .child(plugins_dir.to_string_lossy().to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ink.micro)
+                            .text_color(ink.fg_subtle)
+                            .child(kit::label(&format!("{plugins} installed"))),
+                    )
+                    .child(
+                        div()
+                            .id("plugins-choose")
+                            .flex_none()
+                            .px_2()
+                            .py(px(4.))
+                            .border_1()
+                            .border_color(ink.border)
+                            .text_size(ink.micro)
+                            .text_color(ink.fg_muted)
+                            .hover(move |this| this.text_color(ink.fg))
+                            .child(kit::label("choose"))
+                            .on_click(|_: &ClickEvent, _, cx| choose_plugins_folder(cx)),
+                    ),
+            ),
+        ]
+    }
 
-        SettingPage::new("Font")
-            .description("The font the terminals, the editor and the app's chrome are drawn in.")
-            .group(
-                SettingGroup::new()
-                    .item(
-                        SettingItem::new(
-                            "Font family",
-                            SettingField::render(move |options, _, _| {
-                                control(options).child(
-                                    Select::new(&fonts)
-                                        .small()
-                                        .search_placeholder("Search fonts"),
-                                )
-                            }),
-                        )
-                        .description("Monospace fonts installed on this PC. Automatic picks Cascadia Mono, JetBrains Mono, Fira Code or Consolas, whichever is there.")
-                        .layout(axis),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Font size",
-                            number(8., 32., 1., |s| s.font_size as f64, |s, v| s.font_size = v as f32)
-                                .default_value(defaults.font_size as f64),
-                        )
-                        .description("In pixels. Open terminals reflow to the new size.")
-                        .layout(axis),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Line height",
-                            number(100., 200., 5., |s| s.line_height as f64, |s, v| s.line_height = v as f32)
-                                .default_value(defaults.line_height as f64),
-                        )
-                        .description("Row height as a percentage of the font size. Box-drawing characters in TUIs join up cleanly around 130-150.")
-                        .layout(axis),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Font weight",
-                            dropdown(WEIGHTS, |s| s.font_weight.to_string(), |s, v| {
-                                s.font_weight = v.parse().unwrap_or(400)
+    fn appearance_rows(&self, cx: &App, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>();
+        let pickers = self.pickers.clone();
+        let overrides = s.colors.len();
+        let ansi: Vec<_> = self.pickers[COLOR_TOKENS.len()..].to_vec();
+        vec![
+            wide(
+                "Palette",
+                "System follows the desktop's light or dark; Ink and Paper are the design's own; the rest are guests in the same layout. Picking one clears your colour overrides.",
+                palette_list(&self.pickers, cx, ink),
+            ),
+            wide(
+                "Colours",
+                "Override any one colour of the palette. A dot marks the ones you have changed.",
+                colour_grid(&self.pickers, cx, ink),
+            ),
+            wide(
+                "Terminal palette",
+                "The 16 colours programs draw with, normal over bright. A program can still set its own.",
+                ansi_grid(&ansi, cx, ink),
+            ),
+            row(
+                "Reset colours",
+                "Back to the palette's own colours.",
+                div()
+                    .id("reset-colors")
+                    .px(px(16.))
+                    .py(px(6.))
+                    .border_1()
+                    .border_color(ink.border)
+                    .text_size(ink.micro)
+                    .text_color(if overrides == 0 { ink.fg_subtle } else { ink.fg })
+                    .child(kit::label(&if overrides == 0 {
+                        "nothing to reset".to_string()
+                    } else {
+                        format!("reset {overrides}")
+                    }))
+                    .when(overrides > 0, |this| {
+                        this.hover(move |this| this.border_color(ink.fg_subtle))
+                            .on_click(move |_: &ClickEvent, window, cx| {
+                                Settings::update(cx, |settings| settings.colors.clear());
+                                sync_pickers(&pickers, window, cx);
                             })
-                            .default_value(defaults.font_weight.to_string()),
+                    }),
+            ),
+            row(
+                "Font weight",
+                "How heavy the one family is drawn, chrome and grid alike.",
+                segmented(
+                    "weight",
+                    WEIGHTS,
+                    &s.font_weight.to_string(),
+                    |s, v| s.font_weight = v.parse().unwrap_or(400),
+                    ink,
+                ),
+            ),
+            row(
+                "Line height",
+                "Row height as a share of the font size. Box drawing joins up around 130-150.",
+                stepper("line-height", s.line_height, 5., "%", |s, v| s.line_height = v, ink),
+            ),
+            row(
+                "Ligatures",
+                "Draw -> and != as single glyphs in terminals, for fonts that have them.",
+                toggle("ligatures", s.ligatures, |s, v| s.ligatures = v, ink),
+            ),
+            row(
+                "Focus ring",
+                "Outline the focused field in the accent. Off, it keeps the ordinary hairline.",
+                toggle("focus-ring", s.focus_ring, |s, v| s.focus_ring = v, ink),
+            ),
+            row(
+                "Blur behind",
+                "Frosted glass behind a translucent window, where the desktop supports it.",
+                toggle("blur", s.blur, |s, v| s.blur = v, ink),
+            ),
+            wide("Preview", "", font_preview(cx)),
+        ]
+    }
+
+    fn terminal_rows(cx: &App, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>();
+        // Probed when the page is drawn rather than listed in source: offering
+        // a shell that is not installed opens a tab that dies at once.
+        let shells = crate::local::shells();
+        let current = s.local_shell.clone();
+        let shell_choice = div()
+            .flex()
+            .flex_wrap()
+            .children(
+                std::iter::once((String::new(), "default".to_string()))
+                    .chain(shells.into_iter().map(|shell| (shell.command, shell.label)))
+                    .enumerate()
+                    .map(|(ix, (command, label))| {
+                        let chosen = command == current;
+                        div()
+                            .id(("shell", ix))
+                            .px(px(16.))
+                            .py(px(6.))
+                            .border_1()
+                            .border_color(if chosen { ink.fg } else { ink.border })
+                            .when(ix > 0, |this| this.border_l_0())
+                            .bg(if chosen { ink.fg } else { gpui::transparent_black() })
+                            .text_size(ink.micro)
+                            .text_color(if chosen { ink.bg } else { ink.fg_muted })
+                            .child(kit::label(&label))
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                let command = command.clone();
+                                Settings::update(cx, |settings| settings.local_shell = command);
+                            })
+                    }),
+            );
+        vec![
+            row(
+                "Cursor shape",
+                "When a program has not asked for one. vim switches to a bar in insert mode by itself.",
+                segmented(
+                    "cursor",
+                    &[("block", "block"), ("bar", "bar"), ("underline", "underline")],
+                    &s.cursor_shape,
+                    |s, v| s.cursor_shape = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Local shell",
+                "What a local terminal runs; only shells found here are offered. Remote tabs start the account's own.",
+                shell_choice,
+            ),
+            row(
+                "Scrollback",
+                "Lines of history kept per terminal.",
+                stepper(
+                    "scrollback",
+                    s.scrollback as f32,
+                    1000.,
+                    "",
+                    |s, v| s.scrollback = v.max(0.) as usize,
+                    ink,
+                ),
+            ),
+            row(
+                "Copy on select",
+                "Copy to the clipboard the moment a selection ends.",
+                toggle("copy-on-select", s.copy_on_select, |s, v| s.copy_on_select = v, ink),
+            ),
+        ]
+    }
+
+    fn tiling_rows(cx: &App, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>();
+        vec![
+            row(
+                "Animate",
+                "The strip slides, columns grow and the overlays rise instead of cutting. Off, everything lands the frame it changes.",
+                toggle("animate", s.animations, |s, v| s.animations = v, ink),
+            ),
+            row(
+                "Duration",
+                "How long a move takes. Much past 200 ms and the app feels like it is thinking.",
+                stepper("duration", s.animation_ms, 10., " ms", |s, v| s.animation_ms = v, ink),
+            ),
+            row(
+                "Curve",
+                "Ease out settles; linear does not ease; spring overshoots a little and comes back.",
+                segmented(
+                    "curve",
+                    &[("ease", "ease out"), ("linear", "linear"), ("spring", "spring")],
+                    &s.animation_curve,
+                    |s, v| s.animation_curve = v.into(),
+                    ink,
+                ),
+            ),
+        ]
+    }
+
+    fn files_rows(cx: &App, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>();
+        vec![
+            row(
+                "Show hidden files",
+                "Dotfiles such as .bashrc and .config.",
+                toggle("hidden", s.show_hidden, |s, v| s.show_hidden = v, ink),
+            ),
+            row(
+                "Open on connect",
+                "Dock the file tree as soon as a connection succeeds. Otherwise ctrl+shift+b.",
+                toggle("open-on-connect", s.explorer_on_connect, |s, v| s.explorer_on_connect = v, ink),
+            ),
+        ]
+    }
+
+    fn editor_rows(cx: &App, ink: Ink) -> Vec<Row> {
+        let s = cx.global::<Settings>();
+        vec![
+            row(
+                "Line numbers",
+                "",
+                toggle("line-numbers", s.editor_line_numbers, |s, v| s.editor_line_numbers = v, ink),
+            ),
+            row(
+                "Soft wrap",
+                "Wrap long lines at the window's edge instead of scrolling sideways.",
+                toggle("soft-wrap", s.editor_soft_wrap, |s, v| s.editor_soft_wrap = v, ink),
+            ),
+            row(
+                "Tab size",
+                "Applies to files opened from now on.",
+                segmented(
+                    "tab-size",
+                    &[("2", "2"), ("4", "4"), ("8", "8")],
+                    &s.editor_tab_size.to_string(),
+                    |s, v| s.editor_tab_size = v.parse().unwrap_or(4),
+                    ink,
+                ),
+            ),
+        ]
+    }
+
+    /// The Keys page (frame 12): find, the counts, restore defaults, then
+    /// every command by group with its keys. Click a row to record a new
+    /// chord for it.
+    fn keys_page(&self, cx: &mut Context<Self>, ink: Ink, surface: Hsla) -> Vec<AnyElement> {
+        let keys = cx.global::<Keys>().clone();
+        let query = self.keys_find.read(cx).value().to_lowercase();
+        let recording = self.recording.get();
+        let changed = COMMANDS.iter().filter(|c| keys.is_changed(c)).count();
+        let conflicts = keys.conflicts();
+
+        let toolbar = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .py(px(16.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(180.))
+                    .max_w(px(280.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .border_1()
+                    .border_color(ink.border)
+                    .child(div().text_size(ink.micro).text_color(ink.fg_subtle).child(kit::label("find")))
+                    .child(div().flex_1().child(Input::new(&self.keys_find).appearance(false).xsmall())),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py(px(4.))
+                    .border_1()
+                    .border_color(if conflicts > 0 { ink.accent } else { ink.border })
+                    .text_size(ink.micro)
+                    .text_color(if conflicts > 0 { ink.accent } else { ink.fg_subtle })
+                    .child(kit::label(&format!("conflicts {conflicts}"))),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py(px(4.))
+                    .border_1()
+                    .border_color(if changed > 0 { ink.fg } else { ink.border })
+                    .text_size(ink.micro)
+                    .text_color(if changed > 0 { ink.fg } else { ink.fg_subtle })
+                    .child(kit::label(&format!("changed {changed}"))),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("keys-restore")
+                    .px_2()
+                    .py(px(4.))
+                    .border_1()
+                    .border_color(ink.border)
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_muted)
+                    .hover(move |this| this.text_color(ink.fg))
+                    .child(kit::label("restore defaults"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.recording.set(None);
+                        keymap::reset(cx, None);
+                        cx.notify();
+                    })),
+            );
+
+        let matches = |label: &str, id: &str, list: &[String]| {
+            query.is_empty()
+                || label.to_lowercase().contains(&query)
+                || id.contains(&query)
+                || list.iter().any(|k| k.contains(&query))
+        };
+
+        let mut out = vec![toolbar.into_any_element()];
+        for group in ["tiling", "window", "session", "text & view"] {
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for command in COMMANDS.iter().filter(|c| c.group == group) {
+                let list = keys.keys_for(command);
+                if !matches(command.label, command.id, &list) {
+                    continue;
+                }
+                let is_changed = keys.is_changed(command);
+                let is_recording = recording == Some(command.id);
+                let id = command.id;
+                // What the row is doing goes on its second line, under the
+                // label, so the right side only ever holds keys: in a narrow
+                // window that is the half there is no room to lose.
+                let note: Option<(String, Hsla)> = if is_recording {
+                    Some(("recording \u{b7} esc cancels \u{b7} delete unbinds".into(), ink.accent))
+                } else if is_changed {
+                    Some((
+                        format!(
+                            "changed \u{b7} default {}",
+                            command.defaults.first().map(|k| k.replace('-', " ")).unwrap_or_default()
+                        ),
+                        ink.fg_subtle,
+                    ))
+                } else {
+                    None
+                };
+                let right: AnyElement = if is_recording {
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .border_1()
+                        .border_color(ink.accent)
+                        .text_size(ink.micro)
+                        .text_color(ink.accent)
+                        .child(kit::label("press keys"))
+                        .into_any_element()
+                } else if list.is_empty() {
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .border_1()
+                        .border_color(ink.border)
+                        .text_size(ink.micro)
+                        .text_color(ink.fg_subtle)
+                        .child(kit::label("not bound \u{2014} click to set"))
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(chords(&list, ink, true))
+                        .when(is_changed, |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("keys-reset-{id}")))
+                                    .text_size(ink.micro)
+                                    .text_color(ink.fg_subtle)
+                                    .hover(move |this| this.text_color(ink.fg))
+                                    .child(kit::label("reset"))
+                                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        keymap::reset(cx, Some(id));
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .into_any_element()
+                };
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("keys-row-{id}")))
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(ink.border)
+                        .when(is_changed || is_recording, |this| this.bg(ink.raised))
+                        .hover(move |this| this.bg(ink.raised))
+                        // The label and its id stacked, giving way before the
+                        // keys do: the keys are what the row is for.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_color(ink.fg)
+                                        .when(is_changed, |this| {
+                                            this.font_weight(FontWeight::SEMIBOLD)
+                                                .child(div().size(px(5.)).flex_none().bg(ink.accent))
+                                        })
+                                        .child(div().min_w_0().truncate().child(command.label)),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(ink.micro)
+                                        .text_color(ink.fg_subtle)
+                                        .child(command.id),
+                                )
+                                .children(note.map(|(text, color)| {
+                                    div()
+                                        .truncate()
+                                        .text_size(ink.micro)
+                                        .text_color(color)
+                                        .child(kit::label(&text))
+                                })),
                         )
-                        .layout(axis),
+                        .child(div().flex_none().child(right))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.recording.set(Some(id));
+                            window.focus(&this.focus_handle);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if group == "text & view" {
+                for (label, id, list) in FIXED {
+                    if !matches(label, id, &[list.to_string()]) {
+                        continue;
+                    }
+                    rows.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .px(px(12.))
+                            .py(px(6.))
+                            .border_b_1()
+                            .border_color(ink.border)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().truncate().text_color(ink.fg_muted).child(*label))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(ink.micro)
+                                            .text_color(ink.fg_subtle)
+                                            .child(*id),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(div().text_size(ink.micro).text_color(ink.fg_subtle).child(kit::label("fixed")))
+                                    .child(chords(
+                                        &list.split(" / ").map(str::to_string).collect::<Vec<_>>(),
+                                        ink,
+                                        false,
+                                    )),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            out.push(
+                div()
+                    .mt(px(12.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .bg(surface)
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_muted)
+                    .child(kit::label(group))
+                    .into_any_element(),
+            );
+            out.extend(rows);
+        }
+        out
+    }
+}
+
+impl SettingsView {
+    /// Where the section list's right edge falls, while it is a sidebar --
+    /// so the window header above can carry the same hairline up to the top
+    /// of the window instead of the line stopping short under the header.
+    pub fn sidebar_edge(&self) -> Option<f32> {
+        (f32::from(self.width.get()) >= TABS_BELOW).then_some(SIDEBAR)
+    }
+}
+
+impl Focusable for SettingsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ink = Ink::read(cx);
+        let head = kit::head(cx.global::<Theme>());
+        let tabs = f32::from(self.width.get()) < TABS_BELOW;
+        // Rows go side by side only when the *page* has room, not the tab: a
+        // 260px sidebar beside an 840px tab leaves the rows under 500px, and
+        // a label and a four-way choice do not share that.
+        let page_width =
+            f32::from(self.width.get()) - if tabs { 0. } else { SIDEBAR } - 112.;
+        let narrow = page_width < NARROW_ROWS;
+        let width = self.width.clone();
+        let page = self.page;
+
+        let surface = cx.global::<Theme>().palette.surface;
+        let keys_page = (page == Page::Keys).then(|| self.keys_page(cx, ink, surface));
+        let rows = match page {
+            Page::Interface => self.interface_rows(window, cx, ink),
+            Page::Appearance => self.appearance_rows(cx, ink),
+            Page::Terminal => Self::terminal_rows(cx, ink),
+            Page::Tiling => Self::tiling_rows(cx, ink),
+            Page::Files => Self::files_rows(cx, ink),
+            Page::Editor => Self::editor_rows(cx, ink),
+            Page::Keys => Vec::new(),
+        };
+        let count = if page == Page::Keys {
+            COMMANDS.len() + FIXED.len()
+        } else {
+            rows.len()
+        };
+        let noun = if page == Page::Keys { "command" } else { "setting" };
+        let number = Page::ALL.iter().position(|p| *p == page).unwrap_or(0) + 1;
+
+        // The section list: the chosen one raised, with the accent rule on its
+        // leading edge -- the same mark a focused window header carries.
+        let sidebar = div()
+            .flex_none()
+            .flex()
+            .when(tabs, |this| this.flex_row().flex_wrap().w_full().border_b_1())
+            .when(!tabs, |this| {
+                this.w(px(SIDEBAR)).h_full().flex_col().border_r_1().pt(px(24.))
+            })
+            .border_color(ink.border)
+            .children(Page::ALL.iter().enumerate().map(|(ix, p)| {
+                let chosen = *p == page;
+                let target = *p;
+                div()
+                    .id(("settings-page", ix))
+                    .px(px(22.))
+                    .py(px(8.))
+                    .border_l_2()
+                    .border_color(if chosen { ink.accent } else { gpui::transparent_black() })
+                    .when(chosen, |this| this.bg(ink.raised))
+                    .text_color(if chosen { ink.fg } else { ink.fg_muted })
+                    .when(chosen, |this| this.font_weight(FontWeight::SEMIBOLD))
+                    .hover(move |this| this.text_color(ink.fg))
+                    .child(p.name())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.page = target;
+                        this.recording.set(None);
+                        cx.notify();
+                    }))
+            }))
+            .when(!tabs, |this| this.child(div().flex_1()))
+            .when(!tabs, |this| this.child(
+                div()
+                    .px(px(22.))
+                    .pb(px(20.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_subtle)
+                    .child(kit::label("config"))
+                    .child(
+                        div()
+                            .truncate()
+                            .child(crate::store::data_dir().to_string_lossy().to_string()),
+                    ),
+            ));
+
+        let body = div()
+            .id("settings-body")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(if narrow { 24. } else { 56. }))
+            .pt(px(36.))
+            .pb(px(48.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pb(px(18.))
+                    .border_b_1()
+                    .border_color(ink.border)
+                    .child(
+                        div()
+                            .text_size(head * 1.5)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(ink.fg)
+                            .child(page.name().to_uppercase()),
                     )
-                    .item(
-                        SettingItem::new(
-                            "Ligatures",
-                            switch(|s| s.ligatures, |s, v| s.ligatures = v)
-                                .default_value(defaults.ligatures),
-                        )
-                        .description("Draw sequences like -> and != as single glyphs in terminals, for fonts that have them (Cascadia Code, Fira Code, JetBrains Mono).")
-                        .layout(axis),
+                    .child(
+                        div()
+                            .text_size(ink.micro)
+                            .text_color(ink.fg_subtle)
+                            .child(kit::label(&format!(
+                                "{number:02} \u{2014} {count} {noun}{}",
+                                if count == 1 { "" } else { "s" }
+                            ))),
                     ),
             )
-            .group(
-                SettingGroup::new()
-                    .title("Preview")
-                    .item(SettingItem::render(|_, _, cx| font_preview(cx))),
+            .children(keys_page.into_iter().flatten())
+            .children(rows.into_iter().map(|row| {
+                let stacked = narrow || row.wide;
+                div()
+                    .flex()
+                    .when(stacked, |this| this.flex_col().gap_3())
+                    .when(!stacked, |this| this.items_center().gap_6())
+                    .py(px(20.))
+                    .border_b_1()
+                    .border_color(ink.border)
+                    .child(
+                        div()
+                            // Grows along the row, never down it: in a
+                            // stacked row `flex_1` took spare height and left
+                            // a gap under the label.
+                            .when(!stacked, |this| this.flex_1())
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(ink.fg)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(row.label),
+                            )
+                            .when(!row.description.is_empty(), |this| {
+                                this.child(div().text_color(ink.fg_subtle).child(row.description))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .when(row.wide, |this| this.w_full())
+                            .when(!row.wide, |this| this.flex_none().max_w_full())
+                            .child(row.control),
+                    )
+            }));
+
+        div()
+            .id("settings")
+            .track_focus(&self.focus_handle)
+            // Escape closes the font list wherever the keyboard is in this
+            // page -- in its find line or on the page itself. On the list
+            // alone it only heard keys while the find line had focus.
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.font_open && event.keystroke.key == "escape" {
+                    this.font_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .relative()
+            .size_full()
+            .flex()
+            .when(tabs, |this| this.flex_col())
+            .when(!tabs, |this| this.flex_row())
+            .child(sidebar)
+            .child(body.when(tabs, |this| this.w_full().min_h_0().flex_1()))
+            // Measures the tab for the next frame's layout choice, and asks for
+            // that frame only when the choice flips.
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        // Several layout choices hang off this width, so any
+                        // change asks for the frame that applies them. It
+                        // only changes while something is being resized.
+                        let changed = (f32::from(width.get()) - f32::from(bounds.size.width)).abs() > 0.5;
+                        width.set(bounds.size.width);
+                        if changed {
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
             )
     }
 }
@@ -336,443 +1386,6 @@ fn choose_plugins_folder(cx: &mut App) {
     .detach();
 }
 
-/// What the app does before you have touched it.
-fn general_page(axis: Axis) -> SettingPage {
-    let defaults = Settings::default();
-    SettingPage::new("General")
-        .description("What PulseTerm does when it opens.")
-        .group(
-            SettingGroup::new()
-                .title("Plugins")
-                .item(
-                    SettingItem::new(
-                        "Plugins folder",
-                        SettingField::render(move |options, _window, cx| {
-                            let configured = cx.global::<Settings>().plugins_dir.clone();
-                            let dir = crate::plugins::resolve_dir(&configured);
-                            let count = crate::plugins::catalog().entries().len();
-                            control(options)
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(dir.to_string_lossy().to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .child(format!("{count} installed")),
-                                )
-                                .child(
-                                    div()
-                                        .id("plugins-choose")
-                                        .flex_none()
-                                        .px_2()
-                                        .border_1()
-                                        .border_color(cx.global::<Theme>().border)
-                                        .child("Choose")
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            |_, _window, cx| choose_plugins_folder(cx),
-                                        ),
-                                )
-                        }),
-                    )
-                    .description("Where file-type support and other plugins are read from. Only the index is read at launch; a plugin's manifest and queries are read the first time a file it claims is opened.")
-                    .layout(axis),
-                ),
-        )
-        .group(
-            SettingGroup::new().title("Startup").item(
-                SettingItem::new(
-                    "On launch",
-                    dropdown(
-                        &[
-                            ("home", "Home screen"),
-                            ("resume", "Last session"),
-                            ("local", "New local terminal"),
-                        ],
-                        |s| s.startup.clone(),
-                        |s, v| s.startup = v.to_string(),
-                    )
-                    .default_value(defaults.startup.clone()),
-                )
-                .description("Home asks for nothing and is the quickest. Last session reopens the local layout you left, or comes up on the host you were using -- a remote one still needs its password, which is never stored. New local terminal goes straight to a shell on this machine.")
-                .layout(axis),
-            ),
-        )
-}
-
-fn window_page(opacity: Entity<SliderState>, settled: Rc<Cell<bool>>, axis: Axis) -> SettingPage {
-    let defaults = Settings::default();
-    SettingPage::new("Window")
-        .description("How the window itself is drawn.")
-        .group(
-            SettingGroup::new().title("Navigation").item(
-                SettingItem::new(
-                    "Bar edge",
-                    dropdown(
-                        &[
-                            ("left", "Left"),
-                            ("right", "Right"),
-                            ("top", "Top"),
-                            ("bottom", "Bottom"),
-                        ],
-                        |s| s.nav_edge.clone(),
-                        |s, v| s.nav_edge = v.to_string(),
-                    )
-                    .default_value(defaults.nav_edge.clone()),
-                )
-                .description("Which edge the navigation bar sits on. There is only ever one bar, and it carries the window buttons, so this also moves them -- on the left or right it goes narrow and drops the clock and the host name, which do not survive being stacked a letter at a time.")
-                .layout(axis),
-            ),
-        )
-        .group(
-            SettingGroup::new()
-                .title("Motion")
-                .description("The strip is longer than the window, so where a column went matters as much as where it is. One speed and one curve for the whole app.")
-                .item(
-                    SettingItem::new(
-                        "Animate",
-                        switch(|s| s.animations, |s, v| s.animations = v).default_value(true),
-                    )
-                    .description("Scrolling the strip, resizing a column and opening the command bar or the overview all move instead of cutting. Off, everything lands on its final value the frame it changes.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Duration",
-                        number(
-                            40.,
-                            600.,
-                            10.,
-                            |s| s.animation_ms as f64,
-                            |s, v| s.animation_ms = v as f32,
-                        )
-                        .default_value(defaults.animation_ms as f64),
-                    )
-                    .description("Milliseconds a move takes. Short enough that holding the focus key still walks the strip at the speed you press it; much past 200 and the app starts feeling like it is thinking.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Curve",
-                        dropdown(
-                            &[
-                                ("ease", "Ease out"),
-                                ("linear", "Linear"),
-                                ("spring", "Spring"),
-                            ],
-                            |s| s.animation_curve.clone(),
-                            |s, v| s.animation_curve = v.to_string(),
-                        )
-                        .default_value(defaults.animation_curve.clone()),
-                    )
-                    .description("Ease out is fast off the mark and settles; linear does not ease at all; spring passes the target by a little and comes back.")
-                    .layout(axis),
-                ),
-        )
-        .group(
-            SettingGroup::new()
-                .title("Transparency")
-                .item(
-                    SettingItem::new(
-                        "Opacity",
-                        SettingField::render(move |options, window, cx| {
-                            // The slider positions its thumb from bounds it
-                            // records during prepaint, without asking for a
-                            // redraw -- so the first frame it is on screen it
-                            // still has zero width and the thumb sits at the
-                            // left end whatever the value. One extra frame,
-                            // once, lets it catch up.
-                            if !settled.replace(true) {
-                                window.request_animation_frame();
-                            }
-                            let value = cx.global::<Settings>().opacity;
-                            control(options)
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(div().flex_1().min_w_0().child(Slider::new(&opacity)))
-                                .child(
-                                    div()
-                                        .w(px(40.))
-                                        .flex_none()
-                                        .text_right()
-                                        .child(format!("{value:.0}%")),
-                                )
-                        }),
-                    )
-                    .description("How much of the background is painted. Text, borders and menus stay solid; only the grounds let the desktop through.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Blur behind",
-                        switch(|s| s.blur, |s, v| s.blur = v).default_value(false),
-                    )
-                    .description("Frosted-glass blur of whatever is behind the window. Only visible below 100% opacity.")
-                    .layout(axis),
-                ),
-        )
-}
-
-fn terminal_page(axis: Axis) -> SettingPage {
-    let defaults = Settings::default();
-    SettingPage::new("Terminal")
-        .description("Terminal behaviour. Applies to open terminals as well as new ones.")
-        .group(
-            SettingGroup::new()
-                .item(
-                    SettingItem::new(
-                        "Cursor shape",
-                        dropdown(
-                            &[("block", "Block"), ("bar", "Bar"), ("underline", "Underline")],
-                            |s| s.cursor_shape.clone(),
-                            |s, v| s.cursor_shape = v.to_string(),
-                        )
-                        .default_value(defaults.cursor_shape.clone()),
-                    )
-                    .description("The shape when a program hasn't asked for one. vim, for one, switches to a bar in insert mode on its own.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Shell",
-                        shell_dropdown(),
-                    )
-                    .description("What a local terminal runs. Only shells found on this machine are listed; remote tabs always start the account's own login shell.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Scrollback",
-                        number(0., 200_000., 1000., |s| s.scrollback as f64, |s, v| {
-                            s.scrollback = v as usize
-                        })
-                        .default_value(defaults.scrollback as f64),
-                    )
-                    .description("Lines of history kept per terminal.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Copy on select",
-                        switch(|s| s.copy_on_select, |s, v| s.copy_on_select = v)
-                            .default_value(defaults.copy_on_select),
-                    )
-                    .description("Copy text to the clipboard as soon as you finish selecting it.")
-                    .layout(axis),
-                ),
-        )
-}
-
-fn explorer_page(axis: Axis) -> SettingPage {
-    let defaults = Settings::default();
-    SettingPage::new("File explorer")
-        .description("The remote file tree.")
-        .group(
-            SettingGroup::new()
-                .item(
-                    SettingItem::new(
-                        "Show hidden files",
-                        switch(|s| s.show_hidden, |s, v| s.show_hidden = v)
-                            .default_value(defaults.show_hidden),
-                    )
-                    .description("Dotfiles such as .bashrc and .config.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Open on connect",
-                        switch(|s| s.explorer_on_connect, |s, v| s.explorer_on_connect = v)
-                            .default_value(defaults.explorer_on_connect),
-                    )
-                    .description("Show the explorer as soon as a connection succeeds. Otherwise it opens from the sidebar or ctrl-shift-b.")
-                    .layout(axis),
-                ),
-        )
-}
-
-fn editor_page(axis: Axis) -> SettingPage {
-    let defaults = Settings::default();
-    SettingPage::new("Editor")
-        .description("Tabs opened from the file explorer.")
-        .group(
-            SettingGroup::new()
-                .item(
-                    SettingItem::new(
-                        "Line numbers",
-                        switch(|s| s.editor_line_numbers, |s, v| s.editor_line_numbers = v)
-                            .default_value(defaults.editor_line_numbers),
-                    )
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Soft wrap",
-                        switch(|s| s.editor_soft_wrap, |s, v| s.editor_soft_wrap = v)
-                            .default_value(defaults.editor_soft_wrap),
-                    )
-                    .description("Wrap long lines at the edge of the tab instead of scrolling sideways.")
-                    .layout(axis),
-                )
-                .item(
-                    SettingItem::new(
-                        "Tab size",
-                        dropdown(
-                            &[("2", "2 spaces"), ("4", "4 spaces"), ("8", "8 spaces")],
-                            |s| s.editor_tab_size.to_string(),
-                            |s, v| s.editor_tab_size = v.parse().unwrap_or(4),
-                        )
-                        .default_value(defaults.editor_tab_size.to_string()),
-                    )
-                    .description("Applies to files opened from now on.")
-                    .layout(axis),
-                ),
-        )
-}
-
-fn shortcuts_page(axis: Axis) -> SettingPage {
-    SettingPage::new("Shortcuts")
-        .description("App shortcuts use ctrl+shift, so plain ctrl keys still reach the remote shell.")
-        .resettable(false)
-        .group(SettingGroup::new().items(SHORTCUTS.iter().map(move |(label, keys)| {
-            SettingItem::new(*label, SettingField::render(move |_, _, cx| keycap(keys, cx)))
-                .layout(axis)
-        })))
-}
-
-impl Focusable for SettingsView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let threshold = f32::from(window.rem_size()) * NARROW_BELOW_REMS;
-        let narrow = f32::from(self.width.get()) < threshold;
-        let axis = if narrow { Axis::Vertical } else { Axis::Horizontal };
-        let width = self.width.clone();
-
-        div()
-            .id("settings")
-            .track_focus(&self.focus_handle)
-            .relative()
-            .size_full()
-            .child(
-                SettingsPanel::new("settings-panel")
-                    .sidebar_width(px(210.))
-                    .with_group_variant(GroupBoxVariant::Outline)
-                    .page(general_page(axis))
-                    .page(self.appearance_page(axis))
-                    .page(self.font_page(axis))
-                    .page(window_page(self.opacity.clone(), self.opacity_settled.clone(), axis))
-                    .page(terminal_page(axis))
-                    .page(explorer_page(axis))
-                    .page(editor_page(axis))
-                    .page(shortcuts_page(axis)),
-            )
-            // Measures the tab for the next frame's layout choice, and asks for
-            // that frame only when the choice flips -- a resize that stays on one
-            // side of the threshold costs nothing.
-            .child(
-                canvas(
-                    move |bounds, window, _| {
-                        let was_narrow = f32::from(width.get()) < threshold;
-                        width.set(bounds.size.width);
-                        if (f32::from(bounds.size.width) < threshold) != was_narrow {
-                            window.refresh();
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-    }
-}
-
-/// The box a custom control sits in: fixed width beside its label, full width
-/// under it.
-fn control(options: &RenderOptions) -> Div {
-    if options.layout == Axis::Vertical {
-        div().w_full()
-    } else {
-        div().w(rems(CONTROL_WIDTH_REMS))
-    }
-}
-
-/// A switch bound to one `Settings` field.
-fn switch(get: fn(&Settings) -> bool, set: fn(&mut Settings, bool)) -> SettingField<bool> {
-    SettingField::switch(
-        move |cx| get(cx.global::<Settings>()),
-        move |value, cx| Settings::update(cx, |settings| set(settings, value)),
-    )
-}
-
-/// A number input bound to one `Settings` field.
-fn number(
-    min: f64,
-    max: f64,
-    step: f64,
-    get: fn(&Settings) -> f64,
-    set: fn(&mut Settings, f64),
-) -> SettingField<f64> {
-    SettingField::number_input(
-        NumberFieldOptions { min, max, step },
-        move |cx| get(cx.global::<Settings>()),
-        move |value, cx| Settings::update(cx, |settings| set(settings, value)),
-    )
-    // Applied after gpui-component's own `w_32`, so it wins.
-    .min_w(rems(NUMBER_MIN_WIDTH_REMS))
-}
-
-/// A dropdown bound to one `Settings` field. Options are (stored value, label).
-fn dropdown(
-    options: &[(&'static str, &'static str)],
-    get: fn(&Settings) -> String,
-    set: fn(&mut Settings, &str),
-) -> SettingField<SharedString> {
-    SettingField::dropdown(
-        options
-            .iter()
-            .map(|(value, label)| (SharedString::from(*value), SharedString::from(*label)))
-            .collect(),
-        move |cx| get(cx.global::<Settings>()).into(),
-        move |value, cx| Settings::update(cx, |settings| set(settings, &value)),
-    )
-}
-
-/// The installed shells, as a dropdown. Options discovered at runtime rather
-/// than listed in source: which shells exist differs per machine, and offering
-/// one that isn't there produces a tab that opens and immediately dies.
-///
-/// The empty value is a real option -- "whatever is best here" -- so a machine
-/// without the shell a settings file names still opens terminals.
-fn shell_dropdown() -> SettingField<SharedString> {
-    let mut options = vec![(SharedString::from(""), SharedString::from("Default"))];
-    options.extend(crate::local::shells().into_iter().map(|shell| {
-        (
-            SharedString::from(shell.command),
-            SharedString::from(shell.label),
-        )
-    }));
-    SettingField::dropdown(
-        options,
-        |cx| cx.global::<Settings>().local_shell.clone().into(),
-        |value, cx| {
-            Settings::update(cx, |settings| settings.local_shell = value.to_string());
-        },
-    )
-}
-
 /// Pickers hold their own copy of the colour, so after anything that changes
 /// colours wholesale -- a theme switch, a reset -- they are pointed back at the
 /// theme. `set_value` doesn't emit a change, so this can't loop back into
@@ -789,64 +1402,141 @@ fn opaque(color: Hsla) -> Hsla {
     Hsla { a: 1., ..color }
 }
 
-/// One card per preset, drawn in that preset's own colours so the grid is a
-/// preview as well as a picker.
-fn theme_cards(pickers: &Pickers, cx: &App) -> impl IntoElement {
+/// Every preset as a row, in the app's own list language: a strip of its
+/// colours, its name, and whether it is light or dark. The chosen one is
+/// raised with the accent rule on its leading edge -- the mark a selected
+/// file, a chosen Settings section and a focused window all carry.
+fn palette_list(pickers: &Pickers, cx: &App, ink: Ink) -> AnyElement {
     let current = cx.global::<Settings>().theme.clone();
-    let accent = cx.global::<Theme>().accent;
-
+    // Following the desktop is a palette choice like any other, so it sits at
+    // the head of the list: Paper's chips and Ink's side by side, because it
+    // is whichever of the two the desktop asks for.
+    let system = {
+        let chosen = current == "system";
+        let paper = theme::preset("paper").palette;
+        let ink_p = theme::preset("ink").palette;
+        let pickers = pickers.clone();
+        div()
+            .id("palette-system")
+            .relative()
+            .flex()
+            .items_center()
+            .gap_4()
+            .px(px(12.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(ink.border)
+            .when(chosen, |this| {
+                this.bg(ink.raised).child(
+                    div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(ink.accent),
+                )
+            })
+            .hover(move |this| this.bg(ink.raised))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .border_1()
+                    .border_color(ink.border)
+                    .child(
+                        div().flex().p(px(3.)).gap(px(2.)).bg(paper.bg).children(
+                            [paper.surface, paper.accent, paper.ansi[1], paper.ansi[4]]
+                                .map(|color| div().size(px(10.)).bg(color)),
+                        ),
+                    )
+                    .child(
+                        div().flex().p(px(3.)).gap(px(2.)).bg(ink_p.bg).children(
+                            [ink_p.surface, ink_p.accent, ink_p.ansi[1], ink_p.ansi[4]]
+                                .map(|color| div().size(px(10.)).bg(color)),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(if chosen { ink.fg } else { ink.fg_muted })
+                    .when(chosen, |this| this.font_weight(FontWeight::SEMIBOLD))
+                    .child("System"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(ink.micro)
+                    .text_color(ink.fg_subtle)
+                    .child(kit::label("follows desktop")),
+            )
+            .on_click(move |_: &ClickEvent, window, cx| {
+                Settings::update(cx, |settings| {
+                    settings.theme = "system".into();
+                    settings.colors.clear();
+                });
+                sync_pickers(&pickers, window, cx);
+            })
+    };
     div()
         .flex()
-        .flex_wrap()
-        .gap_2()
+        .flex_col()
+        .border_t_1()
+        .border_color(ink.border)
+        .child(system)
         .children(theme::presets().into_iter().enumerate().map(|(ix, preset)| {
-            let selected = preset.id == current;
+            let chosen = preset.id == current;
             let p = preset.palette;
             let id = preset.id;
             let pickers = pickers.clone();
-
             div()
-                .id(("theme-preset", ix))
-                .w(rems(10.75))
+                .id(("palette", ix))
                 .flex()
-                .flex_col()
-                .gap_1p5()
-                .p_2()
-                .bg(p.bg)
-                .border_1()
-                .border_color(if selected { accent } else { p.border })
-                .hover(move |style| style.border_color(accent))
-                .cursor_pointer()
+                .items_center()
+                .gap_4()
+                .px(px(12.))
+                .py(px(8.))
+                .relative()
+                .border_b_1()
+                .border_color(ink.border)
+                .when(chosen, |this| {
+                    // gpui has one border colour per box, so the accent
+                    // rule is a 2px bar of its own on the leading edge.
+                    this.bg(ink.raised).child(
+                        div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(ink.accent),
+                    )
+                })
+                .hover(move |this| this.bg(ink.raised))
                 .child(
+                    // The palette's own ground behind its accent and six of
+                    // its ANSI colours: enough to tell two dark themes apart.
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_1()
-                        .text_color(p.fg)
-                        // Truncated as a backstop: the card is sized in rems so
-                        // the longest name fits, but a wide font could still
-                        // overrun it.
-                        .child(div().min_w_0().truncate().child(preset.name))
-                        .when(selected, |this| {
-                            this.child(div().flex_none().text_color(p.accent).child("●"))
-                        }),
-                )
-                .child(
-                    div().flex().gap_0p5().children(
-                        [
-                            p.surface, p.raised, p.accent, p.ansi[1], p.ansi[2], p.ansi[3],
-                            p.ansi[4], p.ansi[5], p.ansi[6],
-                        ]
-                        .map(|color| div().size(px(12.)).bg(color)),
-                    ),
+                        .flex_none()
+                        .p(px(3.))
+                        .gap(px(2.))
+                        .bg(p.bg)
+                        .border_1()
+                        .border_color(ink.border)
+                        .children(
+                            [p.surface, p.accent, p.ansi[1], p.ansi[2], p.ansi[3], p.ansi[4], p.ansi[5], p.ansi[6]]
+                                .map(|color| div().size(px(10.)).bg(color)),
+                        ),
                 )
                 .child(
                     div()
-                        .text_color(p.fg_subtle)
-                        .child(if preset.light { "light" } else { "dark" }),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if chosen { ink.fg } else { ink.fg_muted })
+                        .when(chosen, |this| this.font_weight(FontWeight::SEMIBOLD))
+                        .child(preset.name),
                 )
-                .on_click(move |_, window, cx| {
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ink.micro)
+                        .text_color(ink.fg_subtle)
+                        .child(kit::label(if preset.light { "light" } else { "dark" })),
+                )
+                .on_click(move |_: &ClickEvent, window, cx| {
                     Settings::update(cx, |settings| {
                         settings.theme = id.to_string();
                         settings.colors.clear();
@@ -854,42 +1544,67 @@ fn theme_cards(pickers: &Pickers, cx: &App) -> impl IntoElement {
                     sync_pickers(&pickers, window, cx);
                 })
         }))
+        .into_any_element()
 }
 
-fn reset_colors_item(pickers: Pickers, axis: Axis) -> SettingItem {
-    SettingItem::new(
-        "Reset colors",
-        SettingField::render(move |_, _, cx| {
-            let pickers = pickers.clone();
-            let overrides = cx.global::<Settings>().colors.len();
-            Button::new("reset-colors")
-                .label(if overrides == 0 {
-                    "nothing to reset".to_string()
-                } else {
-                    format!("reset {overrides} override(s)")
-                })
-                .small()
-                .outline()
-                .disabled(overrides == 0)
-                .on_click(move |_, window, cx| {
-                    Settings::update(cx, |settings| settings.colors.clear());
-                    sync_pickers(&pickers, window, cx);
-                })
-        }),
-    )
-    .description("Go back to the theme's own colours.")
-    .layout(axis)
+/// A colour picker's swatch with a hairline round it, so a dark colour on a
+/// dark page -- the ground itself -- is still a visible box.
+fn swatch(picker: &Entity<ColorPickerState>, ink: Ink) -> AnyElement {
+    div()
+        .flex_none()
+        .p(px(2.))
+        .border_1()
+        .border_color(ink.fg_subtle)
+        .child(ColorPicker::new(picker).small().anchor(Corner::TopRight))
+        .into_any_element()
+}
+
+/// The chrome colours as a compact grid -- swatch, name, hex, and a dot when
+/// overridden -- rather than a full row each: thirteen rows of one small
+/// square apiece was a page of scrolling for what is one table.
+fn colour_grid(pickers: &Pickers, cx: &App, ink: Ink) -> AnyElement {
+    let s = cx.global::<Settings>();
+    let palette = cx.global::<Theme>().palette;
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_x_6()
+        .children(COLOR_TOKENS.iter().zip(pickers.iter()).map(|((token, label, _), (_, picker))| {
+            let changed = s.colors.contains_key(*token);
+            let hex = palette.get(token).map(|c| opaque(c).to_hex()).unwrap_or_default();
+            div()
+                .w(px(232.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .py(px(6.))
+                .border_b_1()
+                .border_color(ink.border)
+                .child(swatch(picker, ink))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(ink.fg)
+                        .child(*label),
+                )
+                .when(changed, |this| this.child(div().size(px(5.)).flex_none().bg(ink.accent)))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ink.micro)
+                        .text_color(ink.fg_subtle)
+                        .child(hex.to_uppercase()),
+                )
+        }))
+        .into_any_element()
 }
 
 /// The 16 ANSI slots, normal over bright -- the way every terminal documents
 /// its palette. Each row wraps, so a narrow tab gets two lines of four rather
 /// than eight swatches running off the edge.
-fn ansi_grid(pickers: &[(SharedString, Entity<ColorPickerState>)], cx: &App) -> impl IntoElement {
-    let (fg_muted, fg_subtle) = {
-        let t = cx.global::<Theme>();
-        (t.fg_muted, t.fg_subtle)
-    };
-
+fn ansi_grid(pickers: &[(SharedString, Entity<ColorPickerState>)], _cx: &App, ink: Ink) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -898,20 +1613,28 @@ fn ansi_grid(pickers: &[(SharedString, Entity<ColorPickerState>)], cx: &App) -> 
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .child(div().text_color(fg_muted).child(label))
+                .gap_2()
+                .child(div().text_size(ink.micro).text_color(ink.fg_subtle).child(kit::label(label)))
                 .child(div().flex().flex_wrap().gap_3().children((0..8).map(|index| {
                     let (_, picker) = &pickers[start + index];
+                    // Plain lower case, not tracked: "magenta" spelled out
+                    // letter by letter does not fit under a swatch.
                     div()
-                        .w(rems(3.5))
+                        .w(px(52.))
                         .flex()
                         .flex_col()
-                        .items_center()
-                        .gap_0p5()
-                        .child(ColorPicker::new(picker).small())
-                        .child(div().text_xs().text_color(fg_subtle).child(ANSI_NAMES[index]))
+                        .items_start()
+                        .gap_1()
+                        .child(swatch(picker, ink))
+                        .child(
+                            div()
+                                .text_size(ink.micro)
+                                .text_color(ink.fg_subtle)
+                                .child(ANSI_NAMES[index]),
+                        )
                 })))
         }))
+        .into_any_element()
 }
 
 /// A few lines of fake shell session in the current font and colours.
@@ -950,14 +1673,42 @@ fn font_preview(cx: &App) -> impl IntoElement {
         .child(span("┌─┬─┐ │ ├─┼─┤ │ └─┴─┘  the quick brown fox", t.fg_subtle))
 }
 
-fn keycap(keys: &'static str, cx: &App) -> impl IntoElement {
-    let t = cx.global::<Theme>();
-    div()
-        .px_2()
-        .py_0p5()
-        .border_1()
-        .border_color(t.border)
-        .bg(t.palette.surface)
-        .text_color(t.fg)
-        .child(keys)
+/// One or more chords as the design draws them (frame 12): every key of a
+/// chord boxed on its own -- CTRL, SHIFT, T -- and chords separated by a
+/// slash. Parsed with gpui's own parser, so `ctrl--` is ctrl and minus rather
+/// than two dashes.
+fn chords(list: &[String], ink: Ink, strong: bool) -> AnyElement {
+    let cap = move |text: String| {
+        div()
+            .px(px(6.))
+            .py(px(2.))
+            .border_1()
+            .border_color(if strong { ink.fg_subtle } else { ink.border })
+            .text_size(ink.micro)
+            .text_color(if strong { ink.fg } else { ink.fg_muted })
+            .child(text)
+    };
+    let mut row = div().flex().flex_wrap().items_center().gap_1();
+    for (ix, chord) in list.iter().enumerate() {
+        if ix > 0 {
+            row = row.child(div().px_1().text_color(ink.fg_subtle).child("/"));
+        }
+        let Ok(keystroke) = gpui::Keystroke::parse(chord) else {
+            row = row.child(cap(chord.to_uppercase()));
+            continue;
+        };
+        let m = keystroke.modifiers;
+        for (on, name) in [
+            (m.control, "CTRL"),
+            (m.alt, "ALT"),
+            (m.shift, "SHIFT"),
+            (m.platform, "SUPER"),
+        ] {
+            if on {
+                row = row.child(cap(name.into()));
+            }
+        }
+        row = row.child(cap(keystroke.key.to_uppercase()));
+    }
+    row.into_any_element()
 }

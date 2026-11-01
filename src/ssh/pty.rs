@@ -42,6 +42,18 @@ pub async fn open(
                 .request_shell(true)
                 .await
                 .map_err(|e| format!("Failed to start shell: {e}"))?,
+            // There is no "start the shell here" request in SSH, so the
+            // server's shell is asked to change directory and then replace
+            // itself with the account's login shell. Single-quoted, with any
+            // quote inside the path closed, escaped and reopened, so a path
+            // with spaces or quotes cannot break out of the argument.
+            PtyProgram::ShellIn(path) => {
+                let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                channel
+                    .exec(true, format!("cd {quoted} && exec \"${{SHELL:-/bin/sh}}\" -l"))
+                    .await
+                    .map_err(|e| format!("Failed to start shell: {e}"))?
+            }
         }
 
         runtime::detach(pump(channel, rx, event_tx));

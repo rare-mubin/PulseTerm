@@ -5123,6 +5123,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "icons",
+ "libc",
  "raw-window-handle",
  "resvg",
  "russh",
@@ -5155,6 +5156,10 @@ dependencies = [
  "tree-sitter-zig",
  "windows 0.61.3",
 ]
+
+[[package]]
+name = "pulseterm-remote"
+version = "0.1.0"
 
 [[package]]
 name = "pxfm"

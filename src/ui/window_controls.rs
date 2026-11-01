@@ -25,7 +25,7 @@
 //! one physical press arrive twice, the second indistinguishable from a
 //! double-click, and no move loop ever started.
 
-use gpui::Window;
+use gpui::{MouseMoveEvent, Pixels, Point, Window};
 
 /// Handles a left press on the caption: hands the drag to the OS, or toggles
 /// maximise/restore on a double-click.
@@ -36,6 +36,27 @@ pub fn caption_press(window: &Window) {
 /// Maximises, or restores if already maximised.
 pub fn toggle_maximize(window: &Window) {
     platform::toggle_maximize(window);
+}
+
+/// The pointer moved over the caption. On Linux this is what starts the move
+/// (see the Linux `platform`); on Windows the move loop already owns it.
+pub fn caption_drag(window: &Window, event: &MouseMoveEvent) {
+    platform::caption_drag(window, event);
+}
+
+/// The caption button came up without a drag.
+pub fn caption_release() {
+    platform::caption_release();
+}
+
+/// A completed click on the caption; only a double-click means anything.
+pub fn caption_click(window: &Window, click_count: usize) {
+    platform::caption_click(window, click_count);
+}
+
+/// A right-click on the caption: the desktop's own window menu where there is one.
+pub fn caption_menu(window: &Window, position: Point<Pixels>) {
+    platform::caption_menu(window, position);
 }
 
 #[cfg(target_os = "windows")]
@@ -147,14 +168,53 @@ mod platform {
             _ => None,
         }
     }
+
+    // The drag, the release and the double-click all happen inside the
+    // `SC_MOVE` loop, so the Linux half of the caption API has nothing to do
+    // here -- and Windows has no window menu worth opening from it.
+    pub fn caption_drag(_: &Window, _: &gpui::MouseMoveEvent) {}
+    pub fn caption_release() {}
+    pub fn caption_click(_: &Window, _: usize) {}
+    pub fn caption_menu(_: &Window, _: gpui::Point<gpui::Pixels>) {}
 }
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use gpui::Window;
+    //! X11 and Wayland implement `start_window_move` and a `zoom_window` that
+    //! toggles, so none of the Windows machinery is needed -- but *when* the
+    //! move starts matters. Handing the pointer to the compositor on the press
+    //! swallows the release, so a double-click would never be seen. Zed's
+    //! answer, used here: the press only arms, the first drag starts the move,
+    //! and a click that never moved is an ordinary click.
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    pub fn caption_press(window: &Window) {
-        window.start_window_move();
+    use gpui::{MouseButton, MouseMoveEvent, Pixels, Point, Window};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub fn caption_press(_: &Window) {
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn caption_drag(window: &Window, event: &MouseMoveEvent) {
+        if event.pressed_button == Some(MouseButton::Left) && ARMED.swap(false, Ordering::Relaxed)
+        {
+            window.start_window_move();
+        }
+    }
+
+    pub fn caption_release() {
+        ARMED.store(false, Ordering::Relaxed);
+    }
+
+    pub fn caption_click(window: &Window, click_count: usize) {
+        if click_count == 2 {
+            window.zoom_window();
+        }
+    }
+
+    pub fn caption_menu(window: &Window, position: Point<Pixels>) {
+        window.show_window_menu(position);
     }
 
     pub fn toggle_maximize(window: &Window) {

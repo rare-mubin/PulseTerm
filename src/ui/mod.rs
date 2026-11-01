@@ -1,4 +1,5 @@
 pub mod command_bar;
+pub mod decorations;
 pub mod editor;
 pub mod explorer;
 pub mod home;
