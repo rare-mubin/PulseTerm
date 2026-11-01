@@ -1,0 +1,133 @@
+[package]
+name = "pulseterm"
+version = "0.1.0"
+edition = "2021"
+description = "A GPU-accelerated SSH terminal with a TUI aesthetic and a Zed-style tab manager"
+
+[[bin]]
+name = "PulseTerm"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+
+# The code editor: rope-backed, with tree-sitter syntax highlighting. Pinned to
+# 0.5.1 because it is the last release built on crates.io `gpui` 0.2.2 -- from
+# 0.6.0 it moved to `gpui-pre`, a different crate, and mixing the two gives two
+# incompatible App/Window/Entity type families. Only its editor and the Settings
+# page widgets are used; tabs and chrome stay ours.
+#
+# Its `tree-sitter-languages` feature is off on purpose: it is all-or-nothing,
+# 28 grammars whose parse tables were ~30 MB of the release binary. The grammars
+# worth keeping are listed below and registered by `ui::languages` instead.
+gpui-component = "=0.5.1"
+
+# Syntax-highlighting grammars for the editor, registered by `ui::languages`.
+# Versions are the ones gpui-component's feature had resolved, so nothing new is
+# downloaded. Left out -- those files open as plain text: C#, Scala, Swift, SQL,
+# Ruby and Elixir, several of them among the largest grammars.
+tree-sitter = "0.25.10"
+tree-sitter-bash = "0.23.3"
+tree-sitter-c = "0.24.2"
+tree-sitter-cmake = "0.7.4"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-css = "0.23.2"
+tree-sitter-diff = "0.1.0"
+tree-sitter-embedded-template = "0.23.2"
+tree-sitter-go = "0.23.4"
+tree-sitter-graphql = "0.1.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-jsdoc = "0.23.2"
+tree-sitter-make = "1.1.1"
+tree-sitter-md = "0.5.3"
+tree-sitter-proto = "0.2.0"
+tree-sitter-python = "0.23.6"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-zig = "1.1.2"
+
+# Terminal emulation: VT/ANSI state machine and grid model. Same crate Zed's
+# terminal is built on; we drive it with bytes from an SSH channel instead of
+# a local pty, so none of alacritty's own tty/spawn code is used.
+alacritty_terminal = "0.26.0"
+
+# SSH/SFTP. Pinned to the versions the Tauri build was known-good against.
+# `ring` is the pure-Rust crypto backend -- the default `aws-lc-rs` one needs a
+# C toolchain we deliberately don't have here.
+russh-sftp = "2.4.0"
+russh = { version = "0.62.6", default-features = false, features = ["ring", "flate2", "rsa"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "time", "macros"] }
+
+# Cross-runtime channels: gpui's executor is smol-based, russh's is tokio, and
+# flume/futures-channel work on both without a compat shim.
+flume = "0.12.0"
+futures = "0.3"
+
+anyhow = "1.0.104"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6.0.0"
+# Already in the tree via gpui, so formatting timestamps costs nothing extra.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Lucide icon set from rust-ui.com. No features enabled on purpose: the `leptos`
+# and `dioxus` features generate framework components we can't use, while the
+# always-compiled `common` module exposes the raw path data, which is all gpui
+# needs. `ui::icon` renders SVG markup from it on demand.
+icons = { version = "0.18.3", default-features = false }
+
+# Windows-only, and only for the caption: gpui's `start_window_move` is an empty
+# default on Windows and its `zoom_window` cannot restore, so both go through
+# `WM_SYSCOMMAND` instead. Versions match what gpui already resolves, so no
+# second copy of either crate is pulled in.
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6.2"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.61.3"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    # ConPTY, for local terminal tabs: the pseudo-console itself, the pipes it
+    # talks through, and the process-thread attribute that hands it to a child.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]
+
+[build-dependencies]
+# `build.rs` rasterises assets/logo.svg into the exe's icon. This is the same
+# resvg gpui already draws SVGs with, so no second renderer comes in; and
+# embed-resource drives MinGW's `windres` to link the icon into the binary.
+resvg = "0.45.1"
+embed-resource = "3.0.11"
+
+[profile.dev]
+# gpui's dependency graph is large; optimising deps keeps debug builds usable
+# without slowing down iteration on our own code.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Release is tuned for size without giving up speed (opt-level stays at 3).
+# Measured on the 97 MB default build: ~21 MB of it was the symbol table, which
+# does nothing at runtime -- panic messages live in .rdata and are kept, only
+# symbol names go. Fat LTO with one codegen unit lets the optimiser see the whole
+# program at once: it drops code that's never called and stops the same generic
+# being compiled separately in every unit. The cost is a much slower release
+# build, and it only applies to release; `cargo run` is unaffected.
+#
+# The other big block, ~30 MB of .rdata, is tree-sitter grammar tables -- data,
+# so no optimisation level touches it. See the `gpui-component` comment above.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1

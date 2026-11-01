@@ -1,0 +1,5 @@
+# Build output: ~1400 crates' worth of generated code, none of it ours.
+target/
+
+# Rasterised icon/logo output and vendored query files are data, not structure.
+graphify-out/
