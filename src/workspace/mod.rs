@@ -49,6 +49,9 @@ actions!(
         ToggleExplorer,
         Disconnect,
         OpenRemoteDesktop,
+        NextSession,
+        PreviousSession,
+        CloseHomeForm,
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
@@ -173,6 +176,69 @@ pub struct Workspace {
     /// otherwise do, and the whole price of showing the time.
     #[allow(dead_code)]
     clock: Task<()>,
+    /// Which session is on screen. Every field above that belongs to one
+    /// host -- the strip, the file tree, the connection, the remote desktop,
+    /// the saved target -- is *this* session's; the others wait in `parked`
+    /// and trade places with it on a switch (`swap_session`). So nothing else
+    /// in the workspace ever deals with more than one session.
+    session_id: u64,
+    parked: Vec<Parked>,
+    /// The sessions in the order the navigation bar shows them.
+    session_order: Vec<u64>,
+    next_session: u64,
+    /// Home's SSH entry, opened into a list of saved hosts: whether it is
+    /// open, its slide, and the slide's value for this frame (sampled in
+    /// `render`, where the workspace is mutable; `home::render` only reads).
+    home_ssh_open: bool,
+    home_ssh: crate::ui::motion::Glide,
+    home_ssh_shown: f32,
+    /// The connect form inside home's SSH list, when one is open: under a
+    /// saved host (asking its secret) or under "new connection" (asking the
+    /// address, then the secret). One field serves every question, like the
+    /// command bar's, and is cleared the moment a connect is handed the secret.
+    home_form: Option<HomeForm>,
+    home_input: Entity<gpui_component::input::InputState>,
+    _home_input_events: Subscription,
+    home_form_glide: crate::ui::motion::Glide,
+    home_form_shown: f32,
+}
+
+/// What home's connect form is asking.
+pub enum HomeAsk {
+    /// `user@host` or `user@host:port`, for a host not saved yet.
+    Address,
+    /// The password, or the passphrase of the key at `key`.
+    Secret {
+        host: String,
+        port: u16,
+        username: String,
+        key: Option<String>,
+    },
+}
+
+pub struct HomeForm {
+    /// The saved host it opened under; `None` for "new connection".
+    pub profile: Option<u64>,
+    pub ask: HomeAsk,
+    pub error: Option<String>,
+    /// A connect has been started from it, so the session's progress and
+    /// failure are this form's to show.
+    pub submitted: bool,
+}
+
+/// A session that is not on screen: what belongs to one host, parked while
+/// another is shown. Its shells keep running -- nothing about a pty depends on
+/// being drawn -- and its helper and file tree are kept as they were.
+struct Parked {
+    id: u64,
+    strip: Strip,
+    active_pane: Entity<Pane>,
+    connection: ConnectionState,
+    remote: Option<crate::remote::Session>,
+    explorer: Entity<ExplorerView>,
+    explorer_docked: bool,
+    explorer_width: f32,
+    target: Option<SavedTarget>,
 }
 
 /// A tab close that has been asked about and is waiting for the answer.
@@ -189,11 +255,23 @@ struct PendingClose {
 }
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `launch` is a program from the command line (`launch`): a local tab
+    /// running it replaces whatever the startup setting would have opened.
+    pub fn new(launch: Option<PtyProgram>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
         let pane_id = pane.read(cx).id;
         let subscription = Self::subscribe_to_pane(&pane, window, cx);
         let session = Session::load();
+        let home_input = cx.new(|cx| gpui_component::input::InputState::new(window, cx));
+        let home_input_events = cx.subscribe_in(
+            &home_input,
+            window,
+            |this, _, event: &gpui_component::input::InputEvent, window, cx| {
+                if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                    this.home_submit(window, cx);
+                }
+            },
+        );
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -205,7 +283,7 @@ impl Workspace {
             connections: None,
             overview_entrance: crate::ui::motion::Entrance::new(),
             connections_subscription: None,
-            explorer: cx.new(|cx| ExplorerView::new(window, cx)),
+            explorer: Self::new_explorer(window, cx),
             explorer_docked: false,
             explorer_width: EXPLORER_WIDTH,
             explorer_bounds: Default::default(),
@@ -222,6 +300,18 @@ impl Workspace {
             home_focus: cx.focus_handle(),
             home_dials: Default::default(),
             clock: Self::tick_clock(cx),
+            session_id: 0,
+            parked: Vec::new(),
+            session_order: vec![0],
+            next_session: 1,
+            home_ssh_open: false,
+            home_ssh: crate::ui::motion::Glide::new(0.0),
+            home_ssh_shown: 0.0,
+            home_form: None,
+            home_input,
+            _home_input_events: home_input_events,
+            home_form_glide: crate::ui::motion::Glide::new(0.0),
+            home_form_shown: 0.0,
         };
 
         // Alt-F4, the taskbar, the OS -- every close that isn't our own X ends
@@ -241,10 +331,27 @@ impl Workspace {
             }
         })
         .detach();
-        // Double-clicking a file in the explorer opens it in an editor tab.
-        // Detached rather than stored: the explorer lives exactly as long as
-        // the workspace, so there is nothing to tear down separately.
-        let explorer = this.explorer.clone();
+        // What the window opens on is a setting. Every branch of it has to
+        // reach the first frame without waiting on anything: none of them dial,
+        // read a file or spawn a shell before returning.
+        if let Some(program) = launch {
+            this.start_local_running(false, program, window, cx);
+            return this;
+        }
+        match cx.global::<crate::store::Settings>().startup.as_str() {
+            "local" => this.start_local(false, window, cx),
+            "resume" => this.resume_at_launch(window, cx),
+            // Home asks for nothing and is the fallback for an unknown value.
+            _ => this.show_home(window, cx),
+        }
+        this
+    }
+
+    /// A file tree for one session, wired to the workspace. Detached rather
+    /// than stored: the subscription ends with the explorer, which lives
+    /// exactly as long as its session.
+    fn new_explorer(window: &mut Window, cx: &mut Context<Self>) -> Entity<ExplorerView> {
+        let explorer = cx.new(|cx| ExplorerView::new(window, cx));
         cx.subscribe_in(
             &explorer,
             window,
@@ -265,17 +372,396 @@ impl Workspace {
             },
         )
         .detach();
+        explorer
+    }
 
-        // What the window opens on is a setting. Every branch of it has to
-        // reach the first frame without waiting on anything: none of them dial,
-        // read a file or spawn a shell before returning.
-        match cx.global::<crate::store::Settings>().startup.as_str() {
-            "local" => this.start_local(false, window, cx),
-            "resume" => this.resume_at_launch(window, cx),
-            // Home asks for nothing and is the fallback for an unknown value.
-            _ => this.show_home(window, cx),
+    // --- sessions --------------------------------------------------------
+
+    /// Trades the on-screen session's fields with a parked one's.
+    fn swap_session(&mut self, p: &mut Parked) {
+        std::mem::swap(&mut self.session_id, &mut p.id);
+        std::mem::swap(&mut self.strip, &mut p.strip);
+        std::mem::swap(&mut self.active_pane, &mut p.active_pane);
+        std::mem::swap(&mut self.connection, &mut p.connection);
+        std::mem::swap(&mut self.remote, &mut p.remote);
+        std::mem::swap(&mut self.explorer, &mut p.explorer);
+        std::mem::swap(&mut self.explorer_docked, &mut p.explorer_docked);
+        std::mem::swap(&mut self.explorer_width, &mut p.explorer_width);
+        std::mem::swap(&mut self.target, &mut p.target);
         }
-        this
+
+    /// Parks the session on screen and puts a new, empty one in its place,
+    /// just after it in the bar. Connecting somewhere while connected is an
+    /// addition, not a move: the old host's shells go on running.
+    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
+        let pane_id = pane.read(cx).id;
+        let subscription = Self::subscribe_to_pane(&pane, window, cx);
+        self.pane_subscriptions.insert(pane_id, subscription);
+        let id = self.next_session;
+        self.next_session += 1;
+        let mut parked = Parked {
+            id,
+            strip: Strip::new(pane.clone()),
+            active_pane: pane,
+            connection: ConnectionState::Disconnected,
+            remote: None,
+            explorer: Self::new_explorer(window, cx),
+            explorer_docked: false,
+            explorer_width: EXPLORER_WIDTH,
+            target: None,
+        };
+        self.swap_session(&mut parked);
+        let at = self
+            .session_order
+            .iter()
+            .position(|&i| i == parked.id)
+            .map_or(self.session_order.len(), |i| i + 1);
+        self.session_order.insert(at, id);
+        self.parked.push(parked);
+    }
+
+    /// Shows another session. Nothing is torn down or rebuilt: its strip is
+    /// exactly as it was left, shells and scroll position included.
+    pub fn switch_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if id != self.session_id {
+            let Some(ix) = self.parked.iter().position(|p| p.id == id) else {
+                return;
+            };
+            let mut parked = self.parked.remove(ix);
+            self.swap_session(&mut parked);
+            self.parked.push(parked);
+            self.sync_connections_view(cx);
+        }
+        self.home_open = false;
+        self.overview_open = false;
+        self.focus_active_item(window, cx);
+        // The column's header draws its FOCUS tag from the focus; it is a view
+        // of its own and redraws only when told, so it came up a beat late.
+        for pane in self.strip.panes() {
+            pane.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
+    /// Moves to the next (or previous) session in the bar's order, wrapping.
+    pub fn cycle_session(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.session_order.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let at = self
+            .session_order
+            .iter()
+            .position(|&i| i == self.session_id)
+            .unwrap_or(0) as isize;
+        let id = self.session_order[(at + step).rem_euclid(n) as usize];
+        self.switch_session(id, window, cx);
+    }
+
+    /// Runs `f` with session `id` in place, on screen or not -- for what
+    /// arrives late and belongs to one session: a connect finishing after
+    /// the user has switched away. `None` when the session is gone.
+    fn in_session<R>(&mut self, id: u64, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        if id == self.session_id {
+            return Some(f(self));
+        }
+        let ix = self.parked.iter().position(|p| p.id == id)?;
+        let mut parked = self.parked.remove(ix);
+        self.swap_session(&mut parked);
+        let result = f(self);
+        self.swap_session(&mut parked);
+        self.parked.insert(ix, parked);
+        Some(result)
+    }
+
+    /// Closes the session on screen and shows its neighbour in the bar --
+    /// the one before it, or after when it was first. Only when there is
+    /// another to show; the last session ends as it always did.
+    fn drop_current_session(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        let at = self
+            .session_order
+            .iter()
+            .position(|&i| i == self.session_id)
+            .unwrap_or(0);
+        let next = if at > 0 {
+            self.session_order[at - 1]
+        } else {
+            self.session_order[at + 1]
+        };
+        let Some(ix) = self.parked.iter().position(|p| p.id == next) else {
+            return false;
+        };
+        let mut closed = self.parked.remove(ix);
+        self.swap_session(&mut closed);
+        // What is left in `closed` is the session that ended: its panes, and
+        // through them its terminals and their channels, drop with it.
+        for pane in closed.strip.panes() {
+            let pane_id = pane.read(cx).id;
+            self.pane_subscriptions.remove(&pane_id);
+        }
+        self.session_order.retain(|&i| i != closed.id);
+        drop(closed);
+        self.sync_connections_view(cx);
+        self.home_open = false;
+        self.focus_active_item(window, cx);
+        for pane in self.strip.panes() {
+            pane.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+        true
+    }
+
+    /// Every session for the navigation bar, in its order: id, whether it
+    /// is the one on screen, and its connection.
+    pub fn sessions(&self) -> Vec<(u64, bool, &ConnectionState)> {
+        self.session_order
+            .iter()
+            .filter_map(|&id| {
+                if id == self.session_id {
+                    Some((id, true, &self.connection))
+                } else {
+                    self.parked
+                        .iter()
+                        .find(|p| p.id == id)
+                        .map(|p| (id, false, &p.connection))
+                }
+            })
+            .collect()
+    }
+
+    /// Every SSH host connected, on screen or parked -- what closing the
+    /// window has to hang up.
+    fn live_hosts(&self) -> Vec<Host> {
+        std::iter::once(&self.connection)
+            .chain(self.parked.iter().map(|p| &p.connection))
+            .filter_map(|c| match c {
+                ConnectionState::Connected(host) if !host.is_local() => Some(host.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A disconnect is offered for SSH, and for this computer too once there
+    /// is another session to go back to -- with one, there was never anything
+    /// to disconnect from.
+    pub fn can_disconnect(&self) -> bool {
+        matches!(self.connection, ConnectionState::Connected(_))
+            && (!self.is_local() || !self.parked.is_empty())
+    }
+
+    // --- home's SSH list ---------------------------------------------------
+
+    pub fn toggle_home_ssh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.home_ssh_open = !self.home_ssh_open;
+        if !self.home_ssh_open {
+            self.home_form_close(window, cx);
+        }
+        let motion = crate::ui::motion::Motion::from_settings(cx);
+        self.home_ssh
+            .to(if self.home_ssh_open { 1.0 } else { 0.0 }, &motion);
+        cx.notify();
+    }
+
+    /// How far home's SSH list is open this frame, 0 to 1.
+    pub fn home_ssh_shown(&self) -> f32 {
+        self.home_ssh_shown
+    }
+
+    /// Opens home's connect form under a saved host (`Some`) or under "new
+    /// connection" (`None`); the same one again folds it away.
+    pub fn home_pick(&mut self, profile: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .home_form
+            .as_ref()
+            .is_some_and(|f| f.profile == profile)
+        {
+            self.home_form_close(window, cx);
+            return;
+        }
+        let ask = match profile {
+            None => HomeAsk::Address,
+            Some(id) => {
+                let Some(p) = cx
+                    .global::<Profiles>()
+                    .items
+                    .iter()
+                    .find(|p| p.id == id)
+                    .cloned()
+                else {
+                    return;
+                };
+                HomeAsk::Secret {
+                    host: p.host,
+                    port: p.port,
+                    username: p.username,
+                    key: match p.auth {
+                        crate::store::SavedAuth::PrivateKey { path } => Some(path),
+                        crate::store::SavedAuth::Password => None,
+                    },
+                }
+            }
+        };
+        let was_open = self.home_form.is_some();
+        self.home_form = Some(HomeForm {
+            profile,
+            ask,
+            error: None,
+            submitted: false,
+        });
+        self.ask_home_field(window, cx);
+        let motion = crate::ui::motion::Motion::from_settings(cx);
+        if !was_open {
+            self.home_form_glide.jump(0.0);
+        }
+        self.home_form_glide.to(1.0, &motion);
+        cx.notify();
+    }
+
+    /// Points the one field at the form's current question.
+    fn ask_home_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.home_form else { return };
+        let (masked, hint) = match &form.ask {
+            HomeAsk::Address => (false, "user@host or user@host:port"),
+            HomeAsk::Secret { key: None, .. } => (true, "password"),
+            HomeAsk::Secret { key: Some(_), .. } => (true, "blank if none"),
+        };
+        self.home_input.update(cx, |state, cx| {
+            state.set_masked(masked, window, cx);
+            state.set_value("", window, cx);
+            state.set_placeholder(hint, window, cx);
+            state.focus(window, cx);
+        });
+    }
+
+    /// Enter in home's form: the address leads on to the password; the
+    /// secret starts the connect. The form stays up meanwhile to show
+    /// progress and, if it comes to that, the failure to retry from.
+    fn home_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.home_input.read(cx).value().to_string();
+        let Some(form) = &mut self.home_form else {
+            return;
+        };
+        match &form.ask {
+            HomeAsk::Address => match crate::ui::command_bar::parse_target(value.trim()) {
+                Some((username, host, port)) => {
+                    form.ask = HomeAsk::Secret {
+                        host,
+                        port,
+                        username,
+                        key: None,
+                    };
+                    form.error = None;
+                    self.ask_home_field(window, cx);
+                }
+                None => form.error = Some("Type it as user@host or user@host:port.".into()),
+            },
+            HomeAsk::Secret {
+                host,
+                port,
+                username,
+                key,
+            } => {
+                let auth = match key {
+                    None => crate::ssh::AuthMethod::Password(value),
+                    Some(path) => crate::ssh::AuthMethod::PrivateKey {
+                        path: path.clone(),
+                        passphrase: (!value.is_empty()).then_some(value),
+                    },
+                };
+                let params = ConnectParams {
+                    host: host.clone(),
+                    port: *port,
+                    username: username.clone(),
+                    auth,
+                };
+                form.error = None;
+                form.submitted = true;
+                // Cleared before the connect runs, as the command bar does:
+                // `auth` owns the secret now, and the field should not.
+                self.home_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.connect(params, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Folds home's form away. A session it left failed goes with it, when
+    /// there is another to fall back on -- an empty FAILED entry in the bar
+    /// would be the only trace of a mistyped password.
+    pub fn home_form_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let submitted = self.home_form.take().is_some_and(|f| f.submitted);
+        self.home_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.set_masked(false, window, cx);
+        });
+        let motion = crate::ui::motion::Motion::from_settings(cx);
+        self.home_form_glide.to(0.0, &motion);
+        if submitted
+            && matches!(
+                self.connection,
+                ConnectionState::Failed(_) | ConnectionState::Disconnected
+            )
+        {
+            let home = self.home_open;
+            self.drop_current_session(window, cx);
+            self.home_open = home;
+            if home {
+                window.focus(&self.home_focus);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Forgets a saved host, from home's list.
+    pub fn forget_profile(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .home_form
+            .as_ref()
+            .is_some_and(|f| f.profile == Some(id))
+        {
+            self.home_form_close(window, cx);
+        }
+        cx.global_mut::<Profiles>().remove(id);
+        cx.notify();
+    }
+
+    /// Home's form for drawing: where it sits, its field, what it is asking,
+    /// and a line under it -- an error, or the connect's progress.
+    pub fn home_form(
+        &self,
+    ) -> Option<(
+        Option<u64>,
+        &Entity<gpui_component::input::InputState>,
+        &'static str,
+        Option<(String, bool)>,
+    )> {
+        let form = self.home_form.as_ref()?;
+        let label = match &form.ask {
+            HomeAsk::Address => "address",
+            HomeAsk::Secret { key: None, .. } => "password",
+            HomeAsk::Secret { key: Some(_), .. } => "passphrase",
+        };
+        let status = if let Some(e) = &form.error {
+            Some((e.clone(), true))
+        } else if form.submitted {
+            match &self.connection {
+                ConnectionState::Connecting(_) => Some(("connecting\u{2026}".to_string(), false)),
+                ConnectionState::Failed(e) => Some((e.to_string(), true)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some((form.profile, &self.home_input, label, status))
+    }
+
+    pub fn home_form_shown(&self) -> f32 {
+        self.home_form_shown
     }
 
     /// Wakes on each minute boundary rather than every sixty seconds, so the
@@ -465,6 +951,14 @@ impl Workspace {
         if !self.is_connected() && self.connections.is_some() {
             self.connections = None;
             self.connections_subscription = None;
+            // A connection that failed (or was never made) in a session of
+            // its own: dismissing the bar removes it and goes back to the
+            // session it was opened from. One still dialing is left alone.
+            if !matches!(self.connection, ConnectionState::Connecting(_))
+                && self.drop_current_session(window, cx)
+            {
+                return;
+            }
             self.show_home(window, cx);
             return;
         }
@@ -472,6 +966,13 @@ impl Workspace {
         self.connections_subscription = None;
         self.focus_active_item(window, cx);
         cx.notify();
+    }
+
+    /// Takes the command bar down without the side trips `close_connections`
+    /// makes (home, dropping a session).
+    fn close_connections_quietly(&mut self) {
+        self.connections = None;
+        self.connections_subscription = None;
     }
 
     fn focus_active_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -554,7 +1055,7 @@ impl Workspace {
         // the file by this route alone -- a drag moves weights the panes never
         // hear about.
         self.save_session(cx);
-        let connected = matches!(self.connection, ConnectionState::Connected(_)) && !self.is_local();
+        let connected = !self.live_hosts().is_empty();
         if !connected && self.unsaved_files(cx).is_empty() {
             return true;
         }
@@ -565,9 +1066,18 @@ impl Workspace {
 
     /// The names of editor tabs with unsaved changes, in tab order.
     fn unsaved_files(&self, cx: &App) -> Vec<SharedString> {
+        // Every session's, not just the one on screen: closing the window
+        // closes them all.
         self.strip
             .panes()
             .iter()
+            .chain(
+                self.parked
+                    .iter()
+                    .flat_map(|p| p.strip.panes())
+                    .collect::<Vec<_>>()
+                    .iter(),
+            )
             .flat_map(|pane| pane.read(cx).items().to_vec())
             .filter_map(|item| match item {
                 PaneItem::Editor(view) => {
@@ -690,15 +1200,14 @@ impl Workspace {
         self.closing = true;
         cx.notify();
 
-        let host = match &self.connection {
-            ConnectionState::Connected(host) => Some(host.clone()),
-            _ => None,
-        };
+        let hosts = self.live_hosts();
         cx.spawn_in(window, async move |this, cx| {
-            if let Some(connection) = host {
-                let goodbye = Box::pin(connection.disconnect_and_wait());
+            if !hosts.is_empty() {
+                // Every session hangs up at once, under one two-second cap.
+                let goodbyes =
+                    futures::future::join_all(hosts.iter().map(|h| h.disconnect_and_wait()));
                 let deadline = Box::pin(cx.background_executor().timer(Duration::from_secs(2)));
-                futures::future::select(goodbye, deadline).await;
+                futures::future::select(Box::pin(goodbyes), deadline).await;
             }
             let _ = this.update_in(cx, |_, window, _| window.remove_window());
         })
@@ -1123,6 +1632,15 @@ impl Workspace {
         if let ConnectionState::Connected(host) = &self.connection {
             host.disconnect();
         }
+        // With other sessions open, disconnecting ends this one and shows its
+        // neighbour; its tabs go with it, as they would below.
+        if !self.parked.is_empty() {
+            self.remote = None;
+            self.connections = None;
+            self.connections_subscription = None;
+            self.drop_current_session(window, cx);
+            return;
+        }
         // Synced here rather than left to `open_connections` below: that returns
         // early when the popup is already up -- which it always is when its own
         // disconnect button was the trigger -- so the popup went on showing
@@ -1402,6 +1920,9 @@ impl Workspace {
             pane,
             window,
             |this, pane, event: &PaneEvent, window, cx| match event {
+                // Only the session on screen is drawn, so only its panes can
+                // be clicked; anything from a parked one is stale.
+                _ if !this.strip.panes().contains(pane) => {}
                 PaneEvent::Focused => {
                     if this.active_pane != *pane {
                         this.focus_pane(pane.clone());
@@ -1772,16 +2293,27 @@ impl Workspace {
         // local session for a remote one -- is a move, not an addition. The old
         // host's tabs cannot follow it: their shells and their open files
         // belong to the machine being left.
-        if matches!(self.connection, ConnectionState::Connected(_)) {
-            self.disconnect(window, cx);
+        //
+        // Not any more: a host already open stays open, and the new one gets a
+        // session of its own beside it (`new_session`).
+        if matches!(
+            self.connection,
+            ConnectionState::Connected(_) | ConnectionState::Connecting(_)
+        ) {
+            self.new_session(window, cx);
         }
         let label: SharedString = format!("{}@{}", params.username, params.host_id()).into();
         self.set_connection(ConnectionState::Connecting(label.clone()), cx);
 
         let remembered = params.clone();
+        let session = self.session_id;
         cx.spawn_in(window, async move |this, cx| {
             let result = crate::ssh::connect(params).await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
+            // Into the session that asked, which may no longer be on screen
+            // -- or may be gone, and the connection with it.
+            let _ = this.update_in(cx, |this, window, cx| {
+                let shown = this.session_id == session;
+                this.in_session(session, |this| match result {
                 Ok(connection) => {
                     // Only remember a target that actually accepted us, so the
                     // saved list never fills with typos. No secret is stored --
@@ -1792,9 +2324,16 @@ impl Workspace {
                     // leaves for the home directory as soon as it has one.
                     let layout = this.take_matching_session(&SavedTarget::ssh(&remembered), cx);
                     let host = Host::remote(connection);
-                    this.home_open = false;
                     this.set_connection(ConnectionState::Connected(host.clone()), cx);
+                        if shown {
+                            this.home_open = false;
                     this.close_connections(window, cx);
+                        }
+                        // Home's form did its job; next time home opens, it is shut.
+                        this.home_form = None;
+                        this.home_form_glide.jump(0.0);
+                        this.home_ssh_open = false;
+                        this.home_ssh.jump(0.0);
                     match layout {
                         // A restored layout brings its own terminals.
                         Some(layout) => this.restore_layout(layout, &host, window, cx),
@@ -1803,6 +2342,7 @@ impl Workspace {
                     cx.notify();
                 }
                 Err(error) => this.set_connection(ConnectionState::Failed(error.into()), cx),
+            });
             });
         })
         .detach();
@@ -1988,8 +2528,30 @@ impl Workspace {
     }
 
     fn start_local(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_local_running(restore, PtyProgram::LoginShell, window, cx);
+    }
+
+    /// `start_local`, with the first tab running `program` when nothing is
+    /// restored -- the command line's `-e` and `--working-directory`.
+    fn start_local_running(
+        &mut self,
+        restore: bool,
+        program: PtyProgram,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.connection, ConnectionState::Connected(_)) {
+            // Somewhere already. This computer is one session: go to it if it
+            // is open, otherwise open it beside the one on screen.
+            let local = self.sessions().into_iter().find_map(|(id, _, c)| {
+                matches!(c, ConnectionState::Connected(host) if host.is_local()).then_some(id)
+            });
+            if let Some(id) = local {
+                self.close_connections_quietly();
+                self.switch_session(id, window, cx);
             return;
+        }
+            self.new_session(window, cx);
         }
         let host = Host::local();
         self.target = Some(SavedTarget::Local);
@@ -2016,7 +2578,7 @@ impl Workspace {
         self.home_open = false;
         match layout {
             Some(layout) => self.restore_layout(layout, &host, window, cx),
-            None => self.open_terminal(PtyProgram::LoginShell, window, cx),
+            None => self.open_terminal(program, window, cx),
         }
         if open_explorer {
             self.toggle_explorer(&ToggleExplorer, window, cx);
@@ -2220,6 +2782,12 @@ impl Render for Workspace {
         // Before anything below renders a pane: this reads them, and reading a
         // leased entity aborts the process.
         self.track_layout_changes(cx);
+        // Home's SSH list slides; home asks for every frame itself.
+        if self.home_open {
+            let motion = crate::ui::motion::Motion::from_settings(cx);
+            self.home_ssh_shown = self.home_ssh.sample(&motion);
+            self.home_form_shown = self.home_form_glide.sample(&motion);
+        }
         // Every app shortcut is bound in the `Workspace` context, so they all
         // die the moment keyboard focus is somewhere outside it -- on nothing,
         // or on a view that was closed and is no longer drawn. Whatever got it
@@ -2402,6 +2970,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &Disconnect, window, cx| {
                 this.disconnect(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextSession, window, cx| this.cycle_session(1, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &PreviousSession, window, cx| {
+                this.cycle_session(-1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenRemoteDesktop, _, cx| {
                 this.open_remote_desktop(cx);

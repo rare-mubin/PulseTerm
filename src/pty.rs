@@ -49,13 +49,12 @@ impl Drop for Pty {
 }
 
 /// What a new pty should run: the shell, or a specific command in place of it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PtyProgram {
     #[default]
     LoginShell,
-    /// Plumbed for the TTY1-4 `sudo conspy N` console shortcuts; only the UI to
-    /// trigger them is still missing.
-    #[allow(dead_code)]
+    /// A command line in place of the shell: `pulseterm -e ...` (see
+    /// `launch`), and plumbed for the TTY1-4 `sudo conspy N` console shortcuts.
     Command(String),
     /// The login shell, started in this directory -- the file tree's "open
     /// in terminal". A path on the host the terminal runs on.

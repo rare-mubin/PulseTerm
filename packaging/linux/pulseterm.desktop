@@ -1,11 +1,28 @@
 [Desktop Entry]
 Type=Application
 Name=PulseTerm
+GenericName=Terminal
 Comment=A GPU-rendered SSH terminal
+Keywords=terminal;shell;ssh;console;command;prompt;
 Exec=pulseterm
+TryExec=pulseterm
 Icon=pulseterm
 Terminal=false
+# TerminalEmulator is what makes desktops, menus and xdg-terminal-exec list it
+# among the terminals.
 Categories=System;TerminalEmulator;
+# Every launch is a window of its own; this tells docks to open another on a
+# click instead of only raising the one already open.
+SingleMainWindow=false
+StartupNotify=true
 # Must match `app_id` in src/main.rs, or the window will not pick up its icon
 # or group with this entry in the dock.
 StartupWMClass=pulseterm
+# The arguments xdg-terminal-exec and file managers use (src/launch.rs).
+X-TerminalArgExec=-e
+X-TerminalArgDir=--working-directory=
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=pulseterm

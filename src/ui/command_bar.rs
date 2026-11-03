@@ -768,7 +768,7 @@ fn status_line(
 
 /// `user@host`, `user@host:port`. Returns nothing for anything else, which is
 /// what keeps an ordinary filter word from being offered as a machine.
-fn parse_target(text: &str) -> Option<(String, String, u16)> {
+pub(crate) fn parse_target(text: &str) -> Option<(String, String, u16)> {
     let (username, rest) = text.split_once('@')?;
     let username = username.trim();
     let rest = rest.trim();

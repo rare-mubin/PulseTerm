@@ -103,8 +103,9 @@ guessed differently.
   maximised from floating; the side bar's identical button had worked minutes
   before. Both call `window_controls::toggle_maximize`. Unexplained.
 * The window has no title as far as niri can tell (`title: null`).
-* §3.7 (portal checks), §8 (packaging beyond the `.desktop` file in
-  `packaging/linux/`).
+* §3.7 (portal checks), §8 (packaging beyond `packaging/linux/`: the
+  `.desktop` file and `install.sh`, a per-user install that makes desktops
+  list PulseTerm as a terminal -- no distro package yet).
 * The Windows arm of every file touched here was edited without a Windows
   compiler. The changes there are small (new no-op functions in
   `window_controls`' Windows `platform`, cfg gates), but the first Windows
@@ -769,6 +770,29 @@ window. Everything below is by hand, because there is no UI test.
 - [ ] Font size `ctrl-=` / `ctrl--` / `ctrl-0` reflows terminals and the whole UI.
 - [ ] Ink and Paper both look like frames 01 and 10.
 - [ ] Startup time, measured, against §5.
+
+**Added after the first checklist (2026-11-03)**
+
+- [ ] Sessions: this computer plus two SSH hosts open at once; the bar's numbered
+      entries switch them, `ctrl-shift-pagedown`/`pageup` cycle them, a parked
+      session's shells keep running, disconnect closes only the one on screen,
+      and closing the window asks while any SSH host is connected.
+- [ ] Home's SSH list: it slides open, a host asks for its password inline (space
+      types, escape folds), "new connection…" asks the address then the
+      password, the x forgets a host.
+- [ ] The disconnect button sits at the far end of the bar, beside the clock.
+- [ ] Translucent window: windows on the strip are exactly as see-through as the
+      bar (the strip paints no ground of its own when translucent).
+- [ ] Throughput: `seq 1 2000000` in well under a second; normal output still
+      drawn at full frame rate (`PULSETERM_TRACE=1` prints the numbers).
+- [ ] **`-e` is POSIX-only as written.** `launch.rs` quotes the command for
+      `/bin/sh` and turns `--working-directory` plus `-e` into
+      `cd '<dir>' && exec <cmd>`, which ConPTY's command line will not
+      understand. On Windows, join the words with Windows quoting and pass the
+      directory as ConPTY's working directory instead. `--working-directory`
+      alone (a shell in that folder) should already work.
+- [ ] No `.desktop` or install script equivalent exists for Windows; the
+      Start-menu entry and "open terminal here" registration are still to do.
 
 ---
 

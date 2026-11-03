@@ -106,6 +106,7 @@ struct Ink {
     head: Pixels,
     display: Pixels,
     line: Pixels,
+    row: Pixels,
 }
 
 pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> impl IntoElement {
@@ -123,13 +124,17 @@ pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Works
             head: kit::head(t),
             display: kit::display(t),
             line: t.line_height,
+            row: kit::row(t),
         }
     };
 
     // Focus lives here while home is up, so space and escape reach the `Home`
     // key context. Checked first: focusing unconditionally would steal it back
     // on every frame.
-    if !workspace.home_focus().is_focused(window) {
+    // Not while the connect form is up: its field has the keyboard, and on
+    // the frame it first appears it is not yet part of home's focus tree --
+    // checking then took the keyboard straight back out of it.
+    if workspace.home_form().is_none() && !workspace.home_focus().contains_focused(window, cx) {
         window.focus(workspace.home_focus());
     }
     // The whole animation loop. Not while the window is in the background: a
@@ -140,7 +145,7 @@ pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Works
     }
 
     let resume = workspace.resume(cx);
-    let start = start_half(ink, cx);
+    let start = start_half(ink, workspace, cx);
     let right = resume_half(workspace, resume, ink, cx);
 
     div()
@@ -158,8 +163,10 @@ pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Works
 }
 
 /// The left half: START, and the three ways in.
-fn start_half(ink: Ink, cx: &mut Context<Workspace>) -> AnyElement {
+fn start_half(ink: Ink, workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let ssh_open = workspace.home_ssh_shown();
     let ssh_detail = Profiles::latest(cx).unwrap_or_default();
+    let hosts = ssh_list(ink, ssh_open, workspace, cx);
     let local_detail = format!("{} \u{b7} {}", shell_name(cx), user_at_host());
 
     div()
@@ -174,24 +181,238 @@ fn start_half(ink: Ink, cx: &mut Context<Workspace>) -> AnyElement {
         .border_color(ink.border)
         .child(section_head("start", "01\u{2013}03", ink))
         .child(
-            entry("home-ssh", 1, "ssh", "remote host / password or key", ssh_detail, ink)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.open_connections(window, cx)
-                })),
+            entry(
+                "home-ssh",
+                1,
+                // The expander says the entry opens in place, the way the
+                // file tree's folders do.
+                if ssh_open > 0.5 {
+                    "ssh  \u{2212}"
+                } else {
+                    "ssh  +"
+                },
+                "remote host / password or key",
+                ssh_detail,
+                ink,
+            )
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_home_ssh(window, cx)),
+            ),
+        )
+        .child(hosts)
+        .child(
+            entry(
+                "home-local",
+                2,
+                "this computer",
+                "local shell / no connection",
+                local_detail,
+                ink,
+            )
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.connect_local(window, cx)),
+            ),
         )
         .child(
-            entry("home-local", 2, "this computer", "local shell / no connection", local_detail, ink)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.connect_local(window, cx)
-                })),
-        )
-        .child(
-            entry("home-settings", 3, "settings", "appearance / tiling / keys", String::new(), ink)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.open_settings(window, cx)
-                })),
+            entry(
+                "home-settings",
+                3,
+                "settings",
+                "appearance / tiling / keys",
+                String::new(),
+                ink,
+            )
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.open_settings(window, cx)),
+            ),
         )
         .into_any_element()
+}
+
+/// SSH's list, opened under its entry: the saved hosts, newest first, then a
+/// row for a new one. Its height slides with `open` (0 to 1) and clips what
+/// does not fit yet, so the entries below are pushed down rather than drawn
+/// over. Picking a row slides a connect form open under it (`form`): a saved
+/// host asks for its password or passphrase, a new connection for the address
+/// first. Each saved host has an x that forgets it.
+fn ssh_list(ink: Ink, open: f32, workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
+    let mut hosts: Vec<(u64, String, u64)> = cx
+        .global::<Profiles>()
+        .items
+        .iter()
+        .map(|p| (p.id, p.label(), p.last_used))
+        .collect();
+    hosts.sort_by(|a, b| b.2.cmp(&a.2));
+    hosts.truncate(8);
+
+    let font = cx.global::<Theme>().font_size;
+    let form = workspace
+        .home_form()
+        .map(|(at, input, label, status)| (at, input.clone(), label, status));
+    let form_open = workspace.home_form_shown();
+    // Label, then the field under it at a comfortable height, then the
+    // status line: the form's full height, which its slide runs to.
+    let field_h = ink.row + px(8.);
+    let form_h = ink.line + px(6.) + field_h + px(6.) + ink.line + px(20.);
+    let picked = form.as_ref().map(|f| f.0);
+
+    let row = |id: gpui::ElementId, label: String, chosen: bool| {
+        let hover = ink.raised;
+        div()
+            .id(id)
+            .relative()
+            .h(ink.row)
+            .flex_none()
+            .flex()
+            .items_center()
+            .pl(px(STEP))
+            .pr(px(8.))
+            .gap(px(12.))
+            .border_b_1()
+            .border_color(ink.border)
+            .text_color(if chosen { ink.fg } else { ink.fg_muted })
+            .when(chosen, |r| r.bg(ink.raised))
+            .hover(move |s| s.bg(hover).text_color(ink.fg))
+            // Just the host: the form says what it needs once a row is
+            // picked, so the row gives every pixel to the name.
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(ink.accent)
+                    .when(!chosen, |d| d.invisible()),
+            )
+    };
+
+    // The form under the chosen row: what it asks, the field, and a line for
+    // the error or the connect's progress. Its own key context, so Space
+    // types and Escape folds it (main.rs).
+    let form_block = |cx: &mut Context<Workspace>| -> AnyElement {
+        let Some((_, input, label, status)) = form.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .key_context("HomeForm")
+            .on_action(
+                cx.listener(|this, _: &crate::workspace::CloseHomeForm, window, cx| {
+                    this.home_form_close(window, cx)
+                }),
+            )
+            .flex_none()
+            .h(form_h * form_open)
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(ink.border)
+            .child(
+                div()
+                    .pl(px(STEP))
+                    .pr(px(8.))
+                    .pt(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .h(ink.line)
+                            .flex()
+                            .items_end()
+                            .text_size(ink.micro)
+                            .text_color(ink.fg_subtle)
+                            .child(kit::label(label)),
+                    )
+                    .child(
+                        div().w_full().child(
+                            gpui_component::input::Input::new(&input)
+                                .text_size(font)
+                                .h(field_h)
+                                .w_full(),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .h(ink.line)
+                            .truncate()
+                            .text_size(ink.micro)
+                            .text_color(match &status {
+                                Some((_, true)) => ink.accent,
+                                _ => ink.fg_subtle,
+                            })
+                            .child(match status {
+                                Some((text, _)) => text,
+                                None => "enter connects \u{b7} esc folds".to_string(),
+                            }),
+                    ),
+            )
+            .into_any_element()
+    };
+
+    let rows_h = ink.row * (hosts.len() + 1) as f32;
+    let extra = if form.is_some() {
+        form_h * form_open
+    } else {
+        px(0.)
+    };
+    let mut list = div()
+        .flex_none()
+        .h((rows_h + extra) * open)
+        .overflow_hidden()
+        .flex()
+        .flex_col();
+    for (id, label, _) in hosts {
+        let chosen = picked == Some(Some(id));
+        let subtle = ink.fg_subtle;
+        let fg = ink.fg;
+        list = list.child(
+            row(("home-ssh-host", id as usize).into(), label, chosen)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.home_pick(Some(id), window, cx)
+                }))
+                .child(
+                    // Forget this host. Its own click target, which stops
+                    // there: the row under it would open the form.
+                    div()
+                        .id(("home-ssh-forget", id as usize))
+                        .flex_none()
+                        .w(px(22.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(subtle)
+                        .hover(move |s| s.text_color(fg))
+                        .tooltip(|window, cx| {
+                            gpui_component::tooltip::Tooltip::new("Forget this host")
+                                .build(window, cx)
+                        })
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.forget_profile(id, window, cx);
+                        }))
+                        .child("\u{d7}"),
+                ),
+        );
+        if chosen {
+            list = list.child(form_block(cx));
+        }
+    }
+    let new_chosen = picked == Some(None);
+    list = list.child(
+        row(
+            "home-ssh-new".into(),
+            "new connection\u{2026}".into(),
+            new_chosen,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.home_pick(None, window, cx))),
+    );
+    if new_chosen {
+        list = list.child(form_block(cx));
+    }
+    list.into_any_element()
 }
 
 /// The right half: RESUME, TIME and the footer.

@@ -29,6 +29,17 @@ shortcuts.
   `cargo build -p pulseterm-remote` or `--workspace`; PulseTerm finds it at run
   time and hides the remote icon without it. Never make PulseTerm depend on it.
 - `cargo check` — type-check. Do this after any `src/**.rs` change.
+- `packaging/linux/install.sh` — installs for this user, no root: the binary
+  as `~/.local/bin/pulseterm` (the remote helper beside it if built), the
+  icon, and `pulseterm.desktop` (categories `TerminalEmulator`, a New Window
+  action, `SingleMainWindow=false`). Release build if there is one, else
+  debug; `--default-terminal` also puts it first in `xdg-terminals.list`;
+  `--uninstall` removes it all. Run it again after rebuilding -- it copies.
+- `pulseterm -e CMD...` / `--working-directory DIR` — what desktops and file
+  managers pass a terminal (`src/launch.rs`): the first window opens a local
+  tab running that instead of what the startup setting says. Every launch is
+  its own process and window; nothing looks for a running copy. The command
+  is quoted for `/bin/sh` -- POSIX only so far (`LINUX.md`, Windows checklist).
 - `cargo build --release` — optimised standalone `target/release/PulseTerm.exe`.
   Release is tuned for size (`[profile.release]`: strip, fat LTO, one codegen
   unit), so it is much slower to build than debug and rebuilds every crate when
@@ -133,7 +144,20 @@ needs a C toolchain that doesn't exist here.
   otherwise; the legacy one can't express coordinates past 223, so those events
   are dropped rather than reported at a wrong cell.
 - `view.rs` — focus, key handling, scrollback, and the task pumping pty events
-  into the emulator.
+  into the emulator. **The pump takes everything already queued per wake**
+  (up to 1 MB) and asks for a frame when the queue runs dry or 16 ms have
+  passed -- `seq` on a terminal writes a line at a time, ~100,000 events a
+  second, and one trip into the view per event was the cost.
+  `PULSETERM_TRACE=1` prints frames drawn, frames asked for, MB parsed and
+  the element's prepaint/paint cost per frame, once a second.
+- **Trailing blanks are never shaped** (`RowBuilder::trim_trailing_blanks`).
+  A row is built across the whole width, so `1234567` went to the shaper as
+  7 characters and ~190 spaces; during a flood every row is fresh text, and
+  that was ~30 ms a frame -- the release build drew more frames than debug and
+  ended up 3-5x *slower* at `seq 1 2000000`. Blanks draw nothing (backgrounds
+  are their own quads), so they are cut unless an underline or strikethrough
+  runs under them. Measured after: 0.9 ms a frame, `seq` 2M lines in ~0.7 s
+  (Alacritty 0.65 s), coloured `ls` level with Alacritty.
 
 ### `src/workspace/` — the scrollable strip
 
@@ -277,6 +301,7 @@ The gestures, all on ctrl+shift as usual:
 | `^⇧B` | open (or close) the file tree as a column of its own |
 | `^⇧Space` | the overview: the whole strip at once |
 | `^⇧K` | the command bar |
+| `^⇧PgDn` `^⇧PgUp` | next / previous session |
 
 `^⇧I` would have been the obvious partner for `^⇧O`, and is not usable: gpui
 binds it to its own inspector in a debug build, and the inspector wins.
@@ -396,8 +421,9 @@ then where you are, then the window itself.
   strip is unbounded and the bar is not.
 * **The actions are Lucide icons in the app's own hand** -- one weight, one
   size, muted ink, the accent only for the file tree while it is open:
-  `Search` (command bar), `FolderTree`, `SquareTerminal`, `Settings2`,
-  `Unplug` (disconnect, SSH only). The design's plain shapes were tried and
+  `Search` (command bar), `FolderTree`, `SquareTerminal`, `Settings2`.
+  `Unplug` (disconnect) is not among them: it sits at the far end beside the
+  clock (`disconnect_cell`), apart from the controls that open things. The design's plain shapes were tried and
   could not be read at a glance. Every one has a tooltip with its name and its
   *current* shortcut (`keymap::describe`, so a rebinding shows). On a side the
   clock is the `Clock` icon with the time as its tooltip.
@@ -512,7 +538,9 @@ The design's launcher (Figma frame 06), and what the logo brings back. **The
 navigation bar stays** -- it is the window's caption and buttons, and its
 state word reads `IDLE` while nothing is connected -- and home is the body
 beside it: `START` on the left (three numbered ways in: SSH, this computer,
-settings, each with what it needs and what it would reach), `RESUME` on the
+settings, each with what it needs and what it would reach; SSH opens in
+place into the saved hosts, newest first, and "new connection…", sliding
+the other two down), `RESUME` on the
 right (target, columns and windows, "closed HH:MM", the strip drawn small,
 `SPACE CONTINUE`), then `TIME`: three graduated dials and a footer.
 
@@ -536,7 +564,19 @@ right (target, columns and windows, "closed HH:MM", the strip drawn small,
   is environment variables plus `gethostname` -- no file is read and no shell
   probed on the first frame.
 * Space and Escape are bound in the `Home` key context, never `Workspace`, so
-  they are not taken from a shell. Home takes focus on render, checked first.
+  they are not taken from a shell.
+* **Connecting from home happens in place** (`Workspace::home_pick`,
+  `HomeForm`): a saved host slides a field open under its row for the
+  password or key passphrase; "new connection…" asks `user@host[:port]`
+  first (`command_bar::parse_target`), then the password. One `InputState`
+  serves every question and is cleared the moment `connect` is handed the
+  secret, as in the command bar. The form stays up to show "connecting…" or
+  the failure to retry from, and a failed session it opened is dropped when
+  it folds. It has a `HomeForm` key context of its own, where Space is
+  `NoAction` (a password character, not "continue") and Escape folds the
+  form instead of leaving home; and home's per-frame focus grab stands down
+  while it is open, or the new field loses the keyboard on its first frame.
+  The x on a saved host forgets it (`forget_profile`). Home takes focus on render, checked first.
 
 ### Icons
 
@@ -776,10 +816,12 @@ same picture every time you open it.
 ### `src/store.rs` — profiles and settings
 
 Connection profiles record host, port, username, auth *kind*, and key-file path.
-**No secret is ever written to disk** — not passwords, not passphrases. A profile
-click prefills the dialog and focuses the password field; it deliberately stops
-short of connecting. Profiles are only recorded after a connection actually
-succeeds, so the list never fills with typos.
+**No secret is ever written to disk** — not passwords, not passphrases. Picking
+a saved host (home's SSH list, or the command bar) asks for its password or
+key passphrase on the spot and connects with it; nothing about a host lets it
+skip that. Profiles are only recorded after a connection actually succeeds, so
+the list never fills with typos, and home's x (or Delete in the command bar)
+forgets one.
 
 ### `src/session.rs` — resuming last run
 
@@ -913,10 +955,15 @@ mode that avoids it, so the fix is structural (`Theme::translucent`):
 
 * `Root`'s `background` is transparent on a translucent window, so there is no
   window-wide ground at all.
-* Each region paints its own, once: the navigation bar, the explorer,
-  and every window header in `surface`; each window body and the strip's own
-  ground in `bg`. The 7px seam bands paint nothing — the columns either side of
-  them already did, and a band with a ground would stack over one of them.
+* Each region paints its own, once: the navigation bar in `surface`; the
+  explorer dock and each window (header and body together, `Pane`) in `bg`.
+  **The strip paints no ground of its own on a translucent window** -- every
+  window on it already did, and the strip is never left part-empty, so its
+  ground was a second layer under every window (74% over 74% reads as 93%:
+  windows came out near-solid beside a see-through bar). It keeps one on an
+  opaque window, as the safety net. The 7px seam bands paint nothing — the
+  columns either side of them already did, and a band with a ground would
+  stack over one of them.
 * Anything nested inside those paints no ground: terminal, editor, the Settings
   page, and gpui-component's `sidebar` / `group_box` (transparent when
   translucent). A new view that adds `.bg(theme.bg)` breaks this.
@@ -1108,18 +1155,59 @@ which is also the fallback when a configured path has since been uninstalled.
 Read when a terminal is created, so a change reaches the next tab and leaves
 running ones alone.
 
-**No disconnect, deliberately.** There is no session to hang up: local shells
-are this machine's own processes and die with their tabs. So the bar's button
-and the popup's button are both hidden (`Workspace::is_local`),
-and closing the window asks nothing unless an editor is dirty. The two transfer
+**No disconnect while it is the only session.** There is nothing to hang up:
+local shells are this machine's own processes and die with their tabs. So the
+bar's button and the popup's button are hidden (`Workspace::can_disconnect`)
+-- until another session is open, when disconnecting closes the local one and
+shows its neighbour (see *Sessions*). Closing the window asks nothing about a
+local session, only about SSH hosts and dirty editors. The two transfer
 actions keep working and rename themselves -- copying a file into a local
 directory is a copy, not an upload.
 
 A local session **resumes by itself at launch** (`session::SavedTarget::Local`):
 there is nothing to authenticate and nothing to choose, so a popup in front of
 it would only be a key to press before seeing last run's workspace. Connecting
-somewhere else afterwards tears the local one down first -- its tabs cannot
-follow it to another machine.
+somewhere else afterwards opens a session **beside** it (see *Sessions* below);
+it no longer tears the local one down.
+
+## Sessions: several hosts at once
+
+This computer and any number of SSH hosts can be open together, one
+**session** each, and the navigation bar switches between them. A session is
+everything that belongs to one host: its strip, its file tree, its connection,
+its remote desktop helper and its saved target.
+
+**The session on screen lives in the workspace's own fields; the others are
+`Parked`.** A switch (`swap_session`) trades the two sets of fields with
+`mem::swap`, so the 2000-odd lines that say `self.strip` and
+`self.connection` never learned there is more than one -- that was the
+deciding argument against a `Vec<Session>` every method indexes into. A
+parked session's shells keep running: nothing about a pty depends on being
+drawn.
+
+* **Late events find their own session** (`in_session`): a connect that
+  finishes after the user switched away is applied to the session that asked,
+  by swapping it in for the length of the closure. Pane and explorer events
+  need no routing -- only what is drawn can be clicked -- and a pane event from
+  a parked strip is ignored as stale.
+* **Connecting while connected adds a session** (`new_session`, placed just
+  after the current one in the bar). *This computer* goes to the local session
+  if one is open: there is only ever one of it.
+* **Disconnect ends just that session** and shows its neighbour
+  (`drop_current_session`); with only one, it behaves as it always did.
+  Disconnect is offered for local too once there is another session to go back
+  to (`can_disconnect`). A connection that failed in a session of its own is
+  removed when the command bar is dismissed.
+* **Closing the window counts every session**: it asks when any SSH host is
+  connected or any editor anywhere is dirty, and hangs them all up under one
+  two-second cap (`live_hosts`).
+* **One session looks exactly as before.** The bar shows its state block as it
+  always did; from two on it shows one numbered entry per session (number,
+  dot, kind and host along the top or bottom; number and dot on a side, the
+  host in the tooltip), the one on screen in full ink with the accent rule.
+  `Ctrl+Shift+PageDown`/`PageUp` cycle them.
+* `session.json` still holds one layout: the session on screen, as the hash in
+  `track_layout_changes` sees it.
 
 ## Startup: the budget, and where the time actually goes
 

@@ -125,8 +125,56 @@ impl TerminalView {
                 return;
             }
 
-            while let Ok(event) = events.recv_async().await {
-                let keep_going = view.update(cx, |this, cx| this.handle_pty_event(event, cx));
+            // One trip into the view per wake, with everything already
+            // waiting -- not one per read: `seq` on a terminal writes a line at
+            // a time, which arrived as ~100,000 events a second. Capped so a
+            // single trip stays short and keystrokes and frames get their turn.
+            //
+            // A frame is asked for when the queue runs dry -- so the last bytes
+            // are always drawn, and a keystroke's echo at once -- or every
+            // 16 ms while it never does, so a firehose still moves on screen.
+            // (Frames are cheap since trailing blanks stopped being shaped,
+            // `RowBuilder::trim_trailing_blanks`; a rate-based flood throttle
+            // that was here first is not needed and is gone.)
+            const BATCH_BYTES: usize = 1 << 20;
+            const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+            let mut drawn = std::time::Instant::now();
+            while let Ok(first) = events.recv_async().await {
+                let size_of = |e: &PtyEvent| match e {
+                    PtyEvent::Output(chunk) => chunk.len(),
+                    _ => 0,
+                };
+                let mut bytes = size_of(&first);
+                let mut batch = vec![first];
+                let mut drained = false;
+                while bytes < BATCH_BYTES {
+                    match events.try_recv() {
+                        Ok(event) => {
+                            bytes += size_of(&event);
+                            batch.push(event);
+                        }
+                        Err(_) => {
+                            drained = true;
+                            break;
+                        }
+                    }
+                }
+                let redraw = drained || drawn.elapsed() >= FRAME;
+                trace::asked(redraw);
+                if redraw {
+                    drawn = std::time::Instant::now();
+                }
+                let keep_going = view.update(cx, |this, cx| {
+                    for event in batch {
+                        if !this.handle_pty_event(event, cx) {
+                            return false;
+                        }
+                    }
+                    if redraw {
+                        cx.notify();
+                    }
+                    true
+                });
                 match keep_going {
                     Ok(true) => {}
                     _ => break,
@@ -141,9 +189,11 @@ impl TerminalView {
     fn handle_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) -> bool {
         match event {
             PtyEvent::Output(bytes) => {
+                trace::fed(bytes.len());
                 let actions = self.emulator.feed(&bytes);
                 self.apply(actions, cx);
-                cx.notify();
+                // The redraw is the pump's to ask for, once per batch and
+                // throttled under a flood (see where events are received).
                 true
             }
             PtyEvent::Closed { error } => {
@@ -517,8 +567,99 @@ impl Focusable for TerminalView {
     }
 }
 
+/// `PULSETERM_TRACE=1`: once a second on stderr, how many frames the
+/// terminals drew, how many the output asked for, how many bytes were parsed,
+/// and what the terminal element cost per frame -- for telling a parsing cost
+/// from a drawing one. Off, it is one cached check per call.
+pub mod trace {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    /// Time spent in the terminal element's prepaint and paint, in µs.
+    static SPENT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// Times a phase of the terminal element while tracing (0 prepaint,
+    /// 1 paint); nothing at all otherwise.
+    pub struct Span(usize, Option<Instant>);
+    impl Span {
+        pub fn new(phase: usize) -> Self {
+            Span(phase, on().then(Instant::now))
+        }
+    }
+    impl Drop for Span {
+        fn drop(&mut self) {
+            if let Some(t) = self.1 {
+                SPENT[self.0].fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            }
+        }
+    }
+
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    fn on() -> bool {
+        *ON.get_or_init(|| std::env::var_os("PULSETERM_TRACE").is_some())
+    }
+
+    fn start() {
+        if !STARTED.swap(true, Relaxed) {
+            std::thread::spawn(|| {
+                let t0 = Instant::now();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let (f, b) = (FRAMES.swap(0, Relaxed), BYTES.swap(0, Relaxed));
+                    let a = ASKED.swap(0, Relaxed);
+                    let ms: Vec<f64> = SPENT
+                        .iter()
+                        .map(|s| s.swap(0, Relaxed) as f64 / f.max(1) as f64 / 1000.0)
+                        .collect();
+                    if f > 0 {
+                        eprintln!(
+                            "pulseterm trace        per frame: prepaint {:.1} ms, paint {:.1} ms",
+                            ms[0], ms[1]
+                        );
+                    }
+                    if f > 0 || b > 0 {
+                        eprintln!(
+                            "pulseterm trace {:>5.1}s: {f} frames ({a} asked by output), {:.1} MB parsed",
+                            t0.elapsed().as_secs_f32(),
+                            b as f64 / 1e6
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn frame() {
+        if on() {
+            start();
+            FRAMES.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// The output pump took a batch in, and asked for a frame or not.
+    pub fn asked(redraw: bool) {
+        if on() && redraw {
+            ASKED.fetch_add(1, Relaxed);
+        }
+    }
+
+    pub fn fed(n: usize) {
+        if on() {
+            start();
+            BYTES.fetch_add(n as u64, Relaxed);
+        }
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        trace::frame();
         // Recorded rather than queried at paint time: the element needs to know
         // focus state while laying the cursor out, and it only has `&App`.
         self.focused = self.focus_handle.is_focused(window);

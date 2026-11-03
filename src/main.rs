@@ -6,6 +6,7 @@
 
 mod host;
 mod keymap;
+mod launch;
 mod local;
 mod plugins;
 mod pty;
@@ -31,12 +32,30 @@ use ui::command_bar::{CommandDown, CommandForget, CommandUp, DismissCommandBar};
 use ui::editor::SaveFile;
 use ui::icon::Assets;
 use workspace::{
-    CancelClose, ContinueSession, FocusColumnLeft, FocusColumnRight, HideHome, ToggleOverview,
+    CancelClose, CloseHomeForm, ContinueSession, FocusColumnLeft, FocusColumnRight, HideHome, ToggleOverview,
     Workspace,
 };
 
 fn main() {
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
+    // Before anything opens: `--help` and a mistyped flag answer on the
+    // terminal and exit, without a window flashing up.
+    let launch = match launch::parse(std::env::args().skip(1)) {
+        Ok(launch::Launch::Help) => {
+            println!("{}", launch::USAGE);
+            return;
+        }
+        Ok(launch::Launch::Version) => {
+            println!("PulseTerm {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Ok(launch::Launch::Local(program)) => Some(program),
+        Ok(launch::Launch::Default) => None,
+        Err(e) => {
+            eprintln!("pulseterm: {e}\n\n{}", launch::USAGE);
+            std::process::exit(2);
+        }
+    };
+    Application::new().with_assets(Assets).run(move |cx: &mut App| {
         // gpui-component supplies the code editor and the Settings page's
         // widgets. Its init has to run before `theme::apply`, which maps our
         // palette onto its theme -- otherwise its defaults leak through.
@@ -87,6 +106,11 @@ fn main() {
             // two are safe to take: no terminal is on screen to want them.
             KeyBinding::new("space", ContinueSession, Some("Home")),
             KeyBinding::new("escape", HideHome, Some("Home")),
+            // Home's connect form sits inside `Home`: there Space is a
+            // character of a password, not "continue", and Escape folds the
+            // form rather than leaving home. The deeper context wins.
+            KeyBinding::new("space", NoAction, Some("HomeForm")),
+            KeyBinding::new("escape", CloseHomeForm, Some("HomeForm")),
             KeyBinding::new("ctrl-s", SaveFile, Some("Editor")),
             // `Root` binds tab / shift-tab to focus cycling, and it is an ancestor
             // of everything -- the terminal included, where Tab has to reach the
@@ -137,7 +161,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                let workspace = cx.new(|cx| Workspace::new(launch.clone(), window, cx));
                 // The editor calls `Root::read` while painting, which `expect`s
                 // the window's root view to *be* a `Root` -- so every window is
                 // one, with the workspace inside it.

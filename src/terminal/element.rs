@@ -129,6 +129,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutState {
+        let _span = super::view::trace::Span::new(0);
         let cell = CellMetrics::measure(window, cx.global::<Theme>());
         let grid = cell.grid_size(bounds);
         let (scrollback, cursor) = {
@@ -204,6 +205,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let _span = super::view::trace::Span::new(1);
         let line_height = layout.cell.height;
 
         window.paint_layer(bounds, |window| {
@@ -535,6 +537,30 @@ impl<'a> RowBuilder<'a> {
         }
     }
 
+    fn trim_trailing_blanks(&mut self) {
+        let keep = self.text.trim_end_matches(' ').len();
+        if keep == self.text.len() {
+            return;
+        }
+        let mut at = 0;
+        for run in &self.runs {
+            if at + run.len > keep && (run.underline.is_some() || run.strikethrough.is_some()) {
+                return;
+            }
+            at += run.len;
+        }
+        self.text.truncate(keep);
+        let mut at = 0;
+        self.runs.retain_mut(|run| {
+            if at >= keep {
+                return false;
+            }
+            run.len = run.len.min(keep - at);
+            at += run.len;
+            true
+        });
+    }
+
     fn flush(
         &mut self,
         window: &mut Window,
@@ -558,7 +584,15 @@ impl<'a> RowBuilder<'a> {
             ));
         }
 
-        if !self.text.trim_end().is_empty() {
+        // Trailing blanks are not shaped. A row is built cell by cell across
+        // the whole width, so `1234567` arrived as seven characters and ~190
+        // spaces, and shaping those was nearly all of a frame: measured at
+        // ~30 ms for 50 rows of fresh text during `seq 1 2000000`. Blanks draw
+        // nothing (backgrounds are their own quads), so they are cut -- unless
+        // an underline or strikethrough runs under them, which does show.
+        self.trim_trailing_blanks();
+
+        if !self.text.is_empty() {
             let shaped = window.text_system().shape_line(
                 self.text.clone().into(),
                 self.theme.font_size,

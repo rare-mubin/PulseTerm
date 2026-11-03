@@ -15,7 +15,9 @@
 //! * the **mark** -- the logo, which is also the way home;
 //! * the **actions** -- connections, explorer, new terminal, settings, and
 //!   disconnect when there is something to disconnect from;
-//! * the **session**: what kind of host, its name, and a dot for the state;
+//! * the **session**: what kind of host, its name, and a dot for the state --
+//!   or, with more than one open, one numbered entry per session, the one on
+//!   screen in full ink, each a click away (`sessions`);
 //! * the **read-out**: one segment per column of the strip, as wide as that
 //!   column, accent for the focus and pale for the ones scrolled off screen.
 //!   It is the only place the strip says how long it is;
@@ -88,7 +90,11 @@ pub fn render(workspace: &Workspace, window: &mut Window, cx: &mut Context<Works
 /// What the bar says about the host: a word for the kind of connection, the
 /// name of it, and the colour the state dot takes.
 fn session(workspace: &Workspace, theme: &Theme) -> (&'static str, String, Hsla) {
-    match workspace.connection_state() {
+    describe(workspace.connection_state(), theme)
+}
+
+fn describe(state: &ConnectionState, theme: &Theme) -> (&'static str, String, Hsla) {
+    match state {
         // The design's word for it (frame 06): nothing is wrong, nothing is
         // running.
         ConnectionState::Disconnected => ("IDLE", String::new(), theme.fg_subtle),
@@ -144,7 +150,8 @@ fn horizontal(
         .child(separator(false, size, border))
         // The state word stays muted and the host does not: which machine you
         // are typing into is the thing worth reading twice.
-        .child(
+        .when(workspace.sessions().len() < 2, |bar| {
+            bar.child(
             div()
                 .flex()
                 .items_center()
@@ -155,10 +162,15 @@ fn horizontal(
                 .child(div().text_color(fg_subtle).child(state))
                 .child(div().text_color(fg).child(label)),
         )
+        })
+        .when(workspace.sessions().len() >= 2, |bar| {
+            bar.children(sessions(workspace, false, size, cx))
+        })
         .child(readout(workspace, false, cx))
         // Claims every pixel nothing else wanted, and drags the window with
         // it. This is the only caption the window has.
         .child(drag_region("nav-caption").flex_1().min_w(px(16.)).h_full())
+        .children(disconnect_cell(workspace, size, cx))
         // The clock is the way home, like the logo: home is where the big
         // one is.
         .child(
@@ -216,8 +228,22 @@ fn vertical(
         // The host name is left out here, not shrunk: a name stacked one
         // letter per line would be taller than the window. The kind of
         // session is four or five letters and fits.
-        .child(stacked(state, fg_subtle))
+        .when(workspace.sessions().len() < 2, |bar| {
+            bar.child(stacked(state, fg_subtle))
         .child(div().my_2().size(px(5.)).flex_none().bg(dot))
+        })
+        .when(workspace.sessions().len() >= 2, |bar| {
+            bar.child(separator(true, size, border))
+                .children(sessions(workspace, true, size, cx))
+        })
+        .children(disconnect_cell(workspace, size, cx).map(|cell| {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(separator(true, size, border))
+                .child(cell)
+        }))
         // The clock, as the design draws it on a side: a face rather than
         // digits, because four stacked digits would be taller than they are
         // worth. The time is its tooltip.
@@ -269,13 +295,8 @@ fn actions(
     let fg_muted = theme.fg_muted;
     let raised = theme.raised;
     let accent = theme.accent;
-    let danger = theme.danger;
     let glyph = px(15.);
 
-    let connected = matches!(workspace.connection_state(), ConnectionState::Connected(_));
-    // Local mode has nothing to hang up: those shells are this machine's own
-    // processes and die with their windows.
-    let can_disconnect = connected && !workspace.is_local();
     let explorer_open = workspace.explorer_open(cx);
 
     let _ = fg;
@@ -339,16 +360,43 @@ fn actions(
                 .into_any_element(),
         );
     }
-    if can_disconnect {
-        out.push(
-            cell("nav-disconnect", Icon::Unplug, danger, "Disconnect", "session.disconnect")
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, window, cx| this.disconnect(window, cx)),
-                )
-                .into_any_element(),
-        );
-    }
     out
+}
+
+/// Disconnect, at the far end of the bar beside the clock rather than among
+/// the actions: it ends something, and the one control that does should not
+/// sit a pixel from the ones that open things.
+fn disconnect_cell(
+    workspace: &Workspace,
+    size: Pixels,
+    cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    let connected = matches!(workspace.connection_state(), ConnectionState::Connected(_));
+    if !(connected && workspace.can_disconnect()) {
+        return None;
+    }
+    let theme = cx.global::<Theme>();
+    let (raised, danger) = (theme.raised, theme.danger);
+    Some(
+        div()
+            .id("nav-disconnect")
+            .size(size)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .hover(move |s| s.bg(raised))
+            .tooltip(move |window, cx| {
+                let text = match crate::keymap::describe(cx, "session.disconnect") {
+                    Some(keys) => format!("Disconnect  {keys}"),
+                    None => "Disconnect".to_string(),
+                };
+                gpui_component::tooltip::Tooltip::new(text).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.disconnect(window, cx)))
+            .child(icon(Icon::Unplug, px(15.), danger))
+            .into_any_element(),
+    )
 }
 
 /// A hairline across the bar, at 60% of its thickness so it reads as a divider
@@ -437,6 +485,96 @@ fn readout(workspace: &Workspace, vertical: bool, cx: &mut Context<Workspace>) -
 
 /// Micro type down the bar, a letter per line. The design calls this rotated
 /// text; gpui has no rotation for a `div`, and stacking reads at this size.
+/// One entry per open session, numbered in the bar's order, the one on
+/// screen in full ink with the accent rule beside it; a click switches. Along
+/// the top or bottom an entry is the number, the kind and the host; on a side
+/// it is the number and the state dot, the rest in its tooltip -- a host name
+/// stacked a letter per line would be taller than the window.
+fn sessions(
+    workspace: &Workspace,
+    vertical: bool,
+    size: Pixels,
+    cx: &mut Context<Workspace>,
+) -> Vec<AnyElement> {
+    let theme = cx.global::<Theme>();
+    workspace
+        .sessions()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, current, state))| {
+            let (word, label, dot) = describe(state, theme);
+            let number = format!("{}", i + 1);
+            let ink = if current { theme.fg } else { theme.fg_subtle };
+            let hover_bg = theme.fg.opacity(0.08);
+            let tip = if label.is_empty() {
+                word.to_string()
+            } else {
+                format!("{word}  \u{b7}  {label}")
+            };
+            let mut entry = div()
+                .id(("nav-session", id as usize))
+                .relative()
+                .flex()
+                .items_center()
+                .flex_none()
+                .hover(move |s| s.bg(hover_bg))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.switch_session(id, window, cx)
+                }));
+            entry = if vertical {
+                entry
+                    .w(size)
+                    .py_2()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(ink).child(number))
+                    .child(div().size(px(5.)).bg(dot))
+                    .when(current, |e| {
+                        e.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(theme.accent),
+                        )
+                    })
+            } else {
+                entry
+                    .h(size)
+                    .px_2()
+                    .gap_2()
+                    .child(div().text_color(ink).child(number))
+                    .child(div().size(px(5.)).bg(dot))
+                    .child(div().text_color(theme.fg_subtle).child(word))
+                    .child(
+                        div()
+                            .max_w(px(220.))
+                            .truncate()
+                            .text_color(ink)
+                            .child(label),
+                    )
+                    .when(current, |e| {
+                        e.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(2.))
+                                .bg(theme.accent),
+                        )
+                    })
+            };
+            entry.into_any_element()
+        })
+        .collect()
+}
+
 fn stacked(text: &str, color: Hsla) -> impl IntoElement {
     div()
         .flex()

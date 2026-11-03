@@ -514,7 +514,13 @@ impl Strip {
         let theme = cx.global::<Theme>();
         let border = theme.border;
         let accent = theme.accent;
-        let bg = theme.bg;
+        // The strip's own ground is a safety net for an opaque window only.
+        // Every window on it paints the ground already (`Pane`), and the strip
+        // is never left part-empty (the last column stretches), so on a
+        // translucent window a ground here was a second layer under every
+        // window: 74% over 74% reads as 93%, and the windows came out darker
+        // and less see-through than the bar beside them.
+        let bg = (!theme.translucent()).then_some(theme.bg);
 
         let viewport = f32::from(self.bounds.get().size.width);
         self.scroll_to_focus(viewport);
@@ -525,7 +531,7 @@ impl Strip {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(bg)
+            .when_some(bg, |this, bg| this.bg(bg))
             .child(
                 canvas(move |bounds, _, _| measured.set(bounds), |_, _, _, _| {})
                     .absolute()
