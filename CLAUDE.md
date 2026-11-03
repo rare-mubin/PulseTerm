@@ -194,7 +194,7 @@ from its neighbours.
   plumbing. **Dispatch is confined to that one file** so trading up to a trait
   later is a local change.
 **Everything opens in a column of its own** -- Settings, editors, previews,
-the file tree, `^⇧T` -- through `Workspace::column_for_new_window`, which
+`^⇧T` (the file tree is the exception: docked beside the strip) -- through `Workspace::column_for_new_window`, which
 reuses the focused column only when it is empty (a fresh workspace has one,
 and opening beside it left a column of nothing on screen). Stacking is the
 deliberate gesture: `^⇧D` and a header's "+". Empty columns are collapsed
@@ -298,7 +298,7 @@ The gestures, all on ctrl+shift as usual:
 | `^⇧O` | expel: push the focused window out into a column of its own |
 | `^⇧U` | consume: pull the next column's top window into this one |
 | `^⇧R` | cycle the focused column's width |
-| `^⇧B` | open (or close) the file tree as a column of its own |
+| `^⇧B` | open (or close) the file tree, docked beside the strip |
 | `^⇧Space` | the overview: the whole strip at once |
 | `^⇧K` | the command bar |
 | `^⇧PgDn` `^⇧PgUp` | next / previous session |
@@ -1048,10 +1048,11 @@ recorded `bounds`, the scroll offset and the widths to the left of it. `canvas`
 is gpui's escape hatch for reading laid-out bounds without writing a whole
 custom element, and it is the only way the strip knows its own width.
 
-(There were two. The explorer had a handle of its own, measured against
-`nav_bar::inset_left`; the file tree is a column now, so it is resized at its
-seam like everything else and both the handle and that helper are gone -- one
-gesture for the whole strip instead of a special one for a panel.)
+(The docked file tree has the one other handle, `ExplorerSeam` on its strip
+side, and follows the same rule: its width is measured absolutely from the
+panel's own left edge, never as a delta. While the tree was a column for a
+while it was resized at its seam like everything else; it is a panel again,
+see *File explorer*.)
 
 **Only the dragged column changes size.** Its neighbour is pushed along, not
 squeezed — that is the whole difference between a strip and a split, and it is
