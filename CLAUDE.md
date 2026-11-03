@@ -1406,18 +1406,34 @@ bytes become one texture.
   `site.png` must not make every file inside it look like an image. There's a
   test for exactly that.
 
-## Remote desktop (in progress)
+## Remote desktop (`remote/`, `src/remote.rs`)
 
-`REMOTE_DESKTOP.md` is the design: Sunshine on the host, controlled over the
-existing SSH connection, streaming over Moonlight's UDP ports into a separate
-PulseTerm Remote window opened from an SSH-only nav bar icon. Phase 1 is
-partly built -- `REMOTE_DESKTOP.md` -> "Progress". PulseTerm's side is
-`src/remote.rs` (find, launch, serve the JSON pipe) and `src/ssh/exec.rs`
-(`Connection::exec`, `Connection::forward`); the helper has no SSH of its
-own and gets PulseTerm's theme as JSON at launch. Decided: a separate GPL-3.0 helper (`pulseterm-remote`) with a gpui
-launcher and an SDL3 stream window, FFmpeg decode, and re-pairing on every
-launch against PulseTerm's own Sunshine instance, so no pairing key is ever
-stored and the user's Sunshine config is never touched.
+`REMOTE_DESKTOP.md` is the design and the log; its *Where it stands* section
+is the current picture. In short: an SSH-only nav icon (`Ctrl+Shift+M`)
+starts **`pulseterm-remote`**, a separate GPL-3.0 program -- one SDL3 window
+(a setup screen, then the stream with a sidebar behind an edge arrow) built
+on moonlight-common-c and FFmpeg, streaming from **PulseTerm's own Sunshine**
+on the host. Things to know before touching it:
+
+* **PulseTerm never links it.** It is found at run time (beside the exe, then
+  `PATH`) and the icon is hidden without it. It has no SSH of its own:
+  PulseTerm serves it a JSON pipe (`src/remote.rs`) of exec, port-forward and
+  long-lived spawned commands on the existing connection (`src/ssh/exec.rs`).
+  It gets the theme as JSON at launch and links none of PulseTerm's code.
+* **Building it** needs `git submodule update --init --recursive`
+  (`remote/third_party/moonlight-common-c`), CMake, clang, and the FFmpeg,
+  SDL3, libva, OpenSSL and Opus development packages -- on Fedora RPM
+  Fusion's FFmpeg; `REMOTE_DESKTOP.md` has the list and a `dnf swap` trap
+  that removes the graphics driver.
+* **Nothing secret is stored.** Pairing is redone every launch with a PIN
+  written to Sunshine's stdin over SSH (`-0`), against an instance started
+  with `-1` and its own config/`XDG_CONFIG_HOME`, so the user's Sunshine is
+  never touched. The one exception to "nothing on this machine changes" is
+  opt-in: a keyboards-only udev grant for the full keyboard takeover.
+* **Testing:** with this machine as its own host, clicks stop arriving while
+  Sunshine runs (its virtual devices) and pointer positions move this
+  machine's own cursor -- test input against a second machine.
+  `cargo test -p pulseterm-remote -- --ignored` pairs with a real Sunshine.
 
 ## Not yet ported from RemoteTTY
 

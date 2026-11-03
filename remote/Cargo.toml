@@ -16,8 +16,26 @@ path = "src/main.rs"
 [dependencies]
 # Same versions as PulseTerm's, so a workspace build shares the compiled
 # crates instead of building a second copy.
-gpui = "0.2.2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6.0.0"
+# Pairing's certificate, RSA signatures and AES, and the TLS step. The stream
+# window's moonlight-common-c needs OpenSSL as well, so it is one dependency
+# for both. Linux: openssl-devel.
+openssl = "0.10"
+# Text for the one SDL window: a pure-Rust rasteriser, so the theme's font is
+# drawn without SDL_ttf or FreeType.
+fontdue = "0.9.5"
+# The full keyboard takeover's evdev grab (Linux).
+libc = "0.2"
+# The stream window (REMOTE_DESKTOP.md, 2.7): SDL3 for the window, input and
+# audio; FFmpeg (libavcodec, VAAPI) for decoding. System libraries: SDL3-devel,
+# ffmpeg-devel (RPM Fusion's -- Fedora's ffmpeg-free has no H.264/HEVC).
+sdl3-sys = "0.7.2"
+ffmpeg-sys-next = "9.0.1"
+
+[build-dependencies]
+# moonlight-common-c, built from the submodule in third_party/.
+cmake = "0.1.58"
+bindgen = "0.72"

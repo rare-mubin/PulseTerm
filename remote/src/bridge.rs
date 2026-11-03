@@ -175,7 +175,6 @@ impl Bridge {
     }
 
     /// Writes to a spawned command's stdin.
-    #[allow(dead_code)] // phase 2: the pairing PIN, if Sunshine's `-0` takes it
     pub async fn write(&self, handle: u64, data: &str) -> Result<(), String> {
         match &self.kind {
             Kind::Local { children, .. } => {

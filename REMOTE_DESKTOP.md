@@ -1,7 +1,13 @@
 # Remote desktop — design
 
-Status: **phase 1 under way** (2026-11-02) -- see "Progress" at the end.
-Toolkit and decisions settled (see below). Decided with the user (2026-11-02):
+Status (2026-11-03): **streaming works.** One SDL3 window, Sunshine started,
+paired and launched over the existing SSH connection, video, audio, keyboard
+and mouse -- tested against `orion` (NVIDIA Jetson, Ubuntu, X11) and
+`cachyos` (CachyOS, niri on Wayland, NVIDIA). *Where it stands* below is the
+current picture; the dated sections under *Progress* at the end are the
+history, kept for the reasoning and the traps.
+
+Decided with the user (2026-11-02):
 
 * **Hosts** are mostly Linux, Wayland or X11.
 * **Goal** is smooth video and gaming, not just admin access.
@@ -23,9 +29,69 @@ Decided next (2026-11-02), following the recommendations below:
   on disk" rule holds unchanged. PulseTerm runs **its own Sunshine instance**
   with its own config and credentials, so the user's Sunshine setup is never
   touched (see 2.4).
-* **Toolkit:** the streaming window is **SDL3**, not gpui -- see 2.7. The
-  launcher (status, config, connect) stays **gpui**, for the design language
-  and the shared theme code. Two processes, one event loop each.
+* **Toolkit:** the streaming window is **SDL3**, not gpui -- see 2.7.
+  *Superseded 2026-11-03 at the user's request:* the gpui launcher and the
+  separate stream process are gone; the whole helper is **one SDL3 window**
+  in one process, its setup screen drawn in the design language by a small UI
+  of its own (`remote/src/ui`). gpui is not a dependency of the helper.
+
+---
+
+## Where it stands (2026-11-03)
+
+**Built and verified on real hosts**
+
+* **PulseTerm side:** an SSH-only nav icon / `Ctrl+Shift+M` starts the helper
+  (found beside the exe or on `PATH`; hidden when absent) and serves it over a
+  JSON pipe -- exec, port forward, long-lived spawned commands -- on the SSH
+  connection it already has (`src/remote.rs`, `src/ssh/exec.rs`).
+* **Host checks** in one round trip: Sunshine and how to install it (exact
+  command per distro: COPR on Fedora, the right `.deb` on Ubuntu/Debian,
+  LizardByte's own pacman repo on Arch and derivatives), session type,
+  displays, capture route, hardware encoder (NVENC only with
+  `libnvidia-encode`; Jetson and the NVIDIA driver/library mismatch called
+  out), uinput, an active firewall (the ports to open, for the client's
+  network), port clashes.
+* **PulseTerm's own Sunshine**: own config dir and `XDG_CONFIG_HOME`, `-1`
+  (no saved pairings), `-0` (PIN on stdin), X11 capture on X11 and KMS on
+  Wayland when permitted (no portal dialog), a wrapper on an SSH channel so it
+  dies with the window or the connection, a clean stop-then-start.
+* **Pairing** in Rust over SSH-forwarded ports: nothing to type, nothing
+  stored, a wrong PIN refused (an opt-in test against real Sunshine).
+* **Streaming**: moonlight-common-c (git submodule), FFmpeg VA-API decode,
+  SDL3 window, Opus audio with an adaptive, rate-steered buffer.
+* **One window**: setup screen; while streaming the picture fills it, an arrow
+  revealed at the right edge (or `Ctrl+Alt+Shift+S`) opens a sidebar with
+  readings (fps, received Mbps, network/host/decode ms, audio queue), the
+  controls and the settings.
+* **Settings, mostly live**: resolution, fps, codec, bitrate (rejoin in a
+  second or so); audio here/host/both; full keyboard; mouse desktop/game;
+  pointer host's/both; scroll as here/reversed; latency normal/low; host CPU
+  (encoder speed, threads, error correction -- Apply restarts Sunshine).
+* **Input**: full keyboard while the window is focused and the pointer is on
+  it (an evdev grab, after a one-time keyboards-only udev grant; otherwise
+  the compositor's shortcut inhibit); mouse with drags clamped to the picture,
+  nothing left held on the host, coalesced motion, smooth scrolling.
+
+**Next, in the order agreed**
+
+1. **Zero-copy decode** (VA-API surface → dmabuf → EGL texture): decode
+   measured ~10 ms a frame on cachyos with the copy path; the main client-side
+   delay, and what stands between this and 1440p/4K/120 fps.
+2. **Resolution from the window** ("window" and "native" give 1080p today).
+3. **Choosing the host's display** (Sunshine streams the first; cachyos has
+   two).
+4. **Windows port of the helper** (keyboard grab, font lookup, build) -- it
+   has only ever been built on Linux.
+
+Smaller: live theme updates (the theme is handed over once, at launch); the
+shifted-port case (written, untested); the pointer lock on GNOME/KDE/X11
+hosts; the shifted ports' firewall rule.
+
+**Not planned** (the user does not need them): gamepads, and recognising a
+VPN (Tailscale, WireGuard) in the firewall check. The *Gamepads* switch was
+removed from the settings; the input check still notes that Sunshine needs
+uinput for them, as a fact about the host.
 
 Read `CLAUDE.md` first; the design language (`ui/kit.rs`, Ink/Paper, hairlines,
 no radius, no shadow, monospace grid) applies to the new window unchanged.
@@ -157,8 +223,18 @@ differ.** `remote/src/sunshine.rs`:
   which would otherwise be the user's own folder. **Even `sunshine --version`
   creates `~/.config/sunshine`**, so the probe runs it against a temp dir.
 * Started with `-1` (no state loaded or kept -- every launch has no paired
-  clients, so there is nothing to unpair) and `-0` (PIN from stdin -- if that
-  works as it reads, pairing needs no web password at all; phase 2 tests it).
+  clients, so there is nothing to unpair) and `-0` (PIN from stdin).
+* **`-0` pairing verified (2026-11-02)** with the real Moonlight client
+  (`moonlight pair 127.0.0.1 --pin 4321`) against this exact instance and
+  wrapper: the PIN written into the wrapper's FIFO -- in the product, the SSH
+  channel (`Bridge::write`) -- completed pairing, *"Pairing completed
+  successfully"*, with no web credentials anywhere. Sunshine prints
+  `Please insert pin:` once at start-up, not per request; a PIN written
+  before the client's request arrived was not used, so **our client writes
+  the PIN after it has sent the first pairing request** (it waits on the
+  server during that phase anyway). After the test no state file existed:
+  `-1` kept nothing. So the web API, its credentials and the forwarded
+  47990 port are not needed for pairing at all.
 * It runs under a wrapper on a **spawned channel** (`Connection::spawn`):
   stdin is a FIFO fed by `cat` from the channel, and when `cat` sees EOF the
   wrapper kills Sunshine. Verified: closing the Remote window stops it, and
@@ -333,9 +409,12 @@ by running PulseTerm's own instance rather than the user's.
 3. **Streaming**: protocol (per D1), decode (per D2), render, audio.
    First milestone: a desktop at 60 fps, absolute mouse, keyboard.
 4. **Input for games**: capture mode and release chord, relative mouse
-   (per R2), gamepads with rumble.
+   (per R2). *Done; gamepads dropped -- not needed.*
 5. **Polish**: stats bar, reconnect, multiple displays, resolution matching
-   the window, HDR if hosts support it.
+   the window, HDR if hosts support it. *Readings, reconnect and live
+   settings done; the rest is "Next" above.*
+
+(Phases 0-3 are done; see *Where it stands*.)
 
 ## 6. Testing
 
@@ -378,6 +457,320 @@ GPU encoder on it.
   (Sunshine 2026.914, wayland · niri, H.264 · HEVC, uinput), and disconnecting
   closed the helper.
 
+**Audio gaps while the mouse moved (2026-11-03).** A moving pointer keeps
+the host's picture changing, video frames grow and arrive in bursts, and the
+audio packets beside them arrive unevenly. The audio code made that audible
+two ways: past its limit it *cleared the whole queue* (up to 80 ms at once),
+and when packets were late it ran dry between each one. Now an over-full
+queue drops only the incoming packet, and a dry queue pauses the device until
+a cushion (`audio::PRIME_MS`: 20 ms, 10 in low latency) is rebuilt -- one
+short wait instead of many gaps; playback also starts on that cushion. And
+mouse motion is gathered and sent once per pass of the loop
+(`Stream::flush_motion`, relative movement summed, positions replaced by the
+newest) instead of one input packet per event -- a high-rate mouse or touchpad
+sent hundreds a second. Pending motion is flushed before any button or wheel
+event, so clicks land where the pointer was.
+
+Measured with the sidebar's audio line on cachyos (the cushion then
+63 ms): still -- 128 ms queued, 2 gaps, 3 drops; after ten seconds of mouse
+movement -- 114 ms queued, **2 gaps (unchanged), 36 drops**. So the adaptive
+cushion stopped the underruns, but the queue sat far above it (clumps topped
+it up and nothing drained it) and each further clump overflowed: the drops
+were the clicks. Now the queue is steered back to the cushion with
+`SDL_SetAudioStreamFrequencyRatio` -- 1.02-1.04 above it, 0.98 well below --
+and dropping is kept for the extreme (three cushions plus 60 ms). This also
+brings the sound's delay back down from ~120 ms to about the cushion.
+
+**Bitrate is a cap (2026-11-03).** The user saw ~10-11 Mbps on the network
+with 20 Mbps set. Both expected: moonlight-common-c sends 80% of the setting
+as the video's limit and reserves the rest for error correction
+(`SdpGenerator.c`, `adjustedBitrate = bitrate * 0.80`), and the encoder --
+NVENC without filler, like Sunshine's others -- spends only what the picture
+needs under that cap; a desktop or a still page compresses far below it.
+The sidebar now shows the cap for the picture beside the setting and the
+**received** video bitrate (`decoder::VIDEO_BYTES`, whole frames before
+decoding) beside the frame rate.
+
+**Where sound plays (2026-11-03).** *Audio: this PC / host / both*
+replaces the on/off switch (`StreamConfig::sound`). It drives two things:
+playing here (`stream::set_muted`, instant) and the launch request's
+`localAudioPlayMode` -- 1 keeps the host's own sound playing, 0 lets Sunshine
+take it -- so a change mid-stream rejoins for that half. "Host" also turns
+Sunshine's capture off (`stream_audio = disabled`) the next time it starts,
+saving host CPU. Older files map audio on → this PC, off → host; `sound` is
+empty by default so that the old switch decides (a test caught the default
+overriding it).
+
+**Low latency (2026-11-03).** *Latency: normal / low*. Here, at once
+(`App::sync_latency`): vsync off, so a frame shows the moment it is decoded
+instead of waiting up to a refresh (it may tear), and the audio queue capped
+at 30 ms instead of 80. On the host, through `sunshine::Tuning` (so a change
+mid-stream gets the *Apply · restarts Sunshine* button): every encoder's
+low-latency settings at once -- `nvenc_preset = 1`, `nvenc_twopass =
+disabled`, `nvenc_latency_over_power`, `amd_usage = ultralowlatency`,
+`amd_quality = speed`, `qsv_preset = veryfast`, `vaapi_strict_rc_buffer`, and
+`sw_preset = ultrafast` -- Sunshine uses whichever encoder the host has; all
+were checked to load. The sidebar now reads where the delay is: the network
+round trip (`LiGetEstimatedRttInfo`), the host's processing per frame
+(`frameHostProcessingLatency`, when Sunshine sends it) and decode time here.
+
+**This computer reacts to no key (2026-11-03).** The shortcut inhibit was
+not enough: tested with a bare SDL window on niri 26.04, **Mod+drag moved the
+window with the inhibit on, and with the pointer locked too** -- niri starts
+its interactive move on the modifier state, before any client sees the
+click, and has no rule to switch it off per window. Here Mod is Alt
+(`mod-key "Alt"`), so Alt+drag in the stream moved the stream window.
+
+So the keyboards are now claimed below the compositor (`stream/grab.rs`): an
+exclusive `EVIOCGRAB` on every `/dev/input/eventN` udev marks
+`ID_INPUT_KEYBOARD`, read on a thread and sent to the host as virtual keys
+(`grab::evdev_vk`). niri then sees no key, so no shortcut and no Mod. Rule
+(*Full keyboard: over window*, now the default): held while the window has
+focus **and** the pointer is on it (read from `SDL_GetWindowFlags` every
+pass); released the moment either stops -- with niri's `focus-follows-mouse`
+that is simply moving the pointer off. Mouse and touchpad are not grabbed.
+
+Safety: the grab starts only with no key down (`EVIOCGKEY`), or niri would
+see a press without its release; the Ctrl+Alt+Shift hotkeys are read on the
+grab thread and posted to the window, never sent; a heartbeat from the
+window's loop -- two seconds without it and the grab lets go; and the kernel
+ends a grab when its file closes, so a crash cannot keep the keyboard.
+
+It needs read access to the keyboards, which a desktop user lacks
+(`root:input 0660`). `grab::GRANT` is the one-time fix the settings offer to
+copy: a udev rule tagging keyboard devices only `uaccess`, so logind gives
+the active session an ACL on them -- the trade-off being that any program in
+that session could read the keyboards. Without it the app falls back to the
+compositor's inhibit, and says what the grant would add.
+
+**Full mouse (2026-11-03).**
+
+* **Drags past the picture.** In desktop mode a position outside the
+  picture (the letterbox) is held at its edge (`stream::clamped`) instead of
+  dropped, so an overshooting drag keeps going and the host's screen edges and
+  corners are easy to hit.
+* **Nothing stays held on the host.** The stream remembers which buttons and
+  keys the host was told are down, drops an up it never had a down for, and
+  `Stream::release_all` lets go of the rest on focus loss, when the sidebar
+  opens (`App::set_sidebar`), and when a stream is replaced or ends (`Drop`).
+* **The arrow no longer covers the host.** It shows only while the sidebar is
+  open or after the pointer has rested 300 ms on the window's right edge
+  (`App::tab_visible`); otherwise the host gets the whole picture.
+  Ctrl+Alt+Shift+S still opens the sidebar any time.
+* **One pointer.** This computer's cursor hides over the picture, which shows
+  the host's (`Pointer: host's`). The GameStream protocol carries **no cursor
+  shape** -- the host's hand, text beam and busy cursor are drawn into the
+  video -- so a local cursor cannot follow them; `both` therefore shows a
+  small dot (`app::dot_cursor`) that marks the spot without the round trip
+  instead of an arrow claiming a shape the host is not showing. Matching
+  shapes would need the host's cursor sent out of band (XFixes on X11; no
+  general Wayland way) -- not built.
+* **Scrolling** carries fractions, so touchpads scroll smoothly instead of
+  in rounded steps. Values go out as SDL gives them: they are already in the
+  direction this computer's natural-scroll setting makes them, so the host
+  scrolls the way the touchpad feels here. (For a while the flip was undone,
+  which reversed scrolling on the host for a natural-scroll touchpad -- the
+  user noticed.) *Scroll: as here / reversed* turns it round on purpose. Back and forward
+  (buttons 4, 5) were already passed through.
+* **Mouse: desktop / game.** Game makes a click in the picture capture the
+  pointer (relative motion; with the keyboard setting at "with mouse", the
+  keyboard too) instead of reaching the host; Ctrl+Alt+Shift+Z lets go.
+
+Not exercised here: with this machine as its own host, positions move this
+machine's own pointer and clicks do not arrive (see the testing trap above);
+to be tried against a second machine.
+
+**Full keyboard (2026-11-03).** This computer's own shortcuts (niri's
+Super bindings, Alt+Tab) were acting here instead of on the host. Now
+`SDL_SetWindowKeyboardGrab` hands the host the whole keyboard -- on Wayland
+SDL uses the compositor's keyboard-shortcuts-inhibit protocol (niri offers
+it), on X11 a keyboard grab. A setting, *Full keyboard*: **with mouse**
+(default; while the mouse is captured with Ctrl+Alt+Shift+Z), **always**
+(while streaming), **off**. `App::sync_keyboard` settles it every pass, and it
+is never on while the sidebar is open. The Ctrl+Alt+Shift hotkeys are always
+handled here -- Z gives mouse and keyboard back, S opens the sidebar, Q
+quits -- and niri's `Mod+Escape` (`allow-inhibiting=false`) toggles the
+inhibit off as a last resort.
+
+**A firewall on the host (2026-11-03).** On CachyOS (ufw on by default)
+pairing worked -- it is tunnelled over SSH -- but Connect failed with *RTSP
+handshake failed (110)*: a timeout, the firewall dropping the direct
+connection (no listener would be 111, refused). The probe now reports an
+active ufw or firewalld as a *Firewall* warning with the fix: TCP base+21
+(48010) and UDP base+9..base+11 (47998-48000) -- nothing else, the web admin
+page stays shut -- opened to the client's /24, read from `$SSH_CLIENT` on the
+host. A warning, not a blocker: the rules need root to read. A VPN (Tailscale
+`100.64.0.0/10`) is not special-cased yet.
+
+**Installing Sunshine on Arch (2026-11-03).** Sunshine is not in Arch's
+official repositories. LizardByte publishes its own pacman repository
+(`LizardByte/pacman-repo`) and calls it *"the only official source of
+LizardByte packages"*; it does not support the AUR. So the probe's hint for
+Arch and anything with `ID_LIKE=arch` (EndeavourOS, CachyOS, Manjaro) adds
+`[lizardbyte]` to `/etc/pacman.conf` once and installs with `pacman -Syu
+lizardbyte/sunshine` -- a full upgrade, because installing after a bare
+`-Sy` is a partial upgrade, which Arch does not support. The repository is
+`SigLevel = Optional` (its packages are not signed), as LizardByte's own
+instructions say.
+
+**Settings change mid-stream, without disconnecting (2026-11-03).** Three
+kinds, by where the setting lives:
+
+* **Here, at once:** audio (muting: packets are still decoded, so unmuting
+  is seamless -- `stream::set_muted`), mouse capture, fullscreen.
+* **The session, by rejoining (~1-8 s):** resolution, frame rate, codec,
+  bitrate. The protocol fixes these per session, so no Moonlight client
+  changes them in place; the app rejoins the same desktop (`/resume`, same
+  Sunshine, still paired) 700 ms after the last change, so clicking through
+  options rejoins once. Verified on orion: 30 → 60 fps, same Sunshine pid,
+  sidebar reading 60 decoded / 60 shown.
+* **Sunshine's config, by restarting it (~30 s on orion):** encoder speed,
+  threads, error correction. Mid-stream an *Apply · restarts Sunshine*
+  button appears under Host CPU; Sunshine restarts, pairs again and the
+  stream resumes on its own (verified: new pid, stream back). Audio capture
+  is in the config too but does not force a restart (`Tuning::restart_needed`):
+  it mutes here at once and the host stops capturing next time Sunshine
+  starts.
+
+While a stream is being replaced, its last picture stays up
+(`Stream::freeze` → `stream::Frozen`) with a small status line over it, so a
+change reads as a hiccup rather than a disconnect. The Reconnect button is
+gone.
+
+**Audio and host-CPU settings (2026-11-03).**
+
+* **Audio:** `stream/audio.rs` decodes moonlight-common-c's Opus multistream
+  packets with the system libopus (a four-function `extern` block, linked as
+  `opus`) and queues the PCM on an SDL3 audio stream to the default output.
+  The queue is cleared past 80 ms, so sound never trails the picture. With
+  Audio off no callbacks are given, and Sunshine is started with
+  `stream_audio = disabled`, so the host does not capture sound at all.
+  Verified: during a stream the helper is an active PulseAudio/PipeWire
+  playback stream.
+* **Host CPU** (settings, below Gamepads): *Encoder speed* (Sunshine's
+  `sw_preset`: fastest = ultrafast, fast = superfast -- Sunshine's default --
+  better = veryfast), *Encoder threads* (`min_threads`: 1/2/4/8), *Error
+  correction* (`fec_percentage`: 5/10/20 %), a **720p** resolution, and a
+  *Lowest CPU* button (720p, 30 fps, H.264, fastest, no audio, 10 % FEC).
+  They matter on a host without a hardware encoder -- a Jetson, a VM -- where
+  the encoder is most of the CPU. They are written into PulseTerm's Sunshine
+  config at start (`sunshine::Tuning`); the app remembers what the running
+  instance was started with, and Connect restarts Sunshine (and pairs again)
+  when they differ. Measured on orion (single btop readings, 1080p30):
+  Sunshine at **22.0 % → 15.7 %** CPU going from fast to fastest.
+
+**One window (2026-11-03), at the user's request.** The gpui launcher and
+the separate SDL stream process are gone: the helper is **one SDL3 window**
+in one process (`remote/src/app.rs`), and gpui is no longer a dependency of
+the helper at all.
+
+* Before a stream it is the setup screen (host, checks, stream settings,
+  Connect), drawn by `remote/src/ui` -- a small immediate-mode UI on SDL's
+  renderer in PulseTerm's design language: flat grounds, one-pixel
+  hairlines, tracked capital labels, segmented choices, laid out in points
+  and drawn in pixels for HiDPI. Text is `fontdue` (pure Rust) rasterising
+  the theme's font, found with `fc-match` (`theme::font_files`).
+* While streaming the picture fills the window and a translucent arrow
+  (`‹`) sits on the right edge; it -- or **Ctrl+Alt+Shift+S** -- slides in a
+  sidebar with the stream's readings (asked-for mode, decoded/shown fps), the
+  controls (capture mouse, fullscreen, disconnect, stop Sunshine, each a
+  full-width row with its shortcut) and the same settings with Reconnect.
+  With the sidebar open nothing reaches the host; a click outside it or
+  Escape shuts it. Disconnect returns to the setup screen still paired.
+* Waiting work (probe, Sunshine, pairing, launch) runs on threads and comes
+  back as a message, waking the SDL loop with a user event.
+* **Testing trap:** with this machine as its own host, button presses stop
+  reaching any window while Sunshine runs here (its virtual input devices);
+  kill that Sunshine and clicks arrive again. Test clicks against a second
+  machine.
+
+**Stop, then Connect, failed -- fixed.** Stopping only *asks* the wrapper,
+which takes up to ~3 s to kill Sunshine; a Connect straight after started a
+new instance while the old one still listened, the ready check saw the *old*
+one, and pairing went to a Sunshine that would never read the PIN. The old
+wrapper also deleted the new instance's `pid` and FIFO by name on its way
+out. Now `stop` waits until the instance is gone, `prepare` waits for an old
+one to die and its port to free, and the wrapper removes only its own files.
+The opt-in pairing test runs its two attempts back to back with no pause;
+on orion, Stop Sunshine → Connect started a fresh instance and streamed.
+
+**Over the network, to a second machine -- working (2026-11-03).** Host
+`orion`: an NVIDIA Jetson Orin, Ubuntu 24.04 arm64, X11, over Wi-Fi/LAN from
+this machine. The user installed Sunshine with the launcher's copied command
+(the .deb for `ubuntu24.04_arm64`, found through the GitHub API since the
+file names carry the version). Connect streamed orion's desktop, and the user
+confirmed **keyboard and mouse work**. What it took:
+
+* **KMS capture fails on a Jetson** ("GPU driver doesn't support universal
+  planes"), even though the .deb grants `cap_sys_admin`. So an X11 session
+  now always pins `capture = x11` (`probe::capture`), and KMS is only used on
+  Wayland; the wrapper also finds `XAUTHORITY` (GDM's
+  `/run/user/<uid>/gdm/Xauthority`, then `~/.Xauthority`) and falls back to
+  `DISPLAY=:0`.
+* **Sunshine cannot use a Jetson's video encoder** (it is not NVENC; the
+  probe now asks for `libnvidia-encode`, not just `nvidia-smi`), so it
+  encodes in software on the ARM cores; the check says so.
+* **The tegra kernel has no `uinput` module at all**, and Ubuntu has no
+  extra-modules package for it -- yet keyboard and mouse worked: on X11
+  Sunshine falls back to XTest. Only gamepads need uinput there. The Input
+  check now tells *missing from the kernel*, *not loaded* (`modprobe` fix) and
+  *not writable* (udev fix) apart, and on X11 says keyboard and mouse still
+  work.
+
+**Phase 3, first stream -- working (2026-11-03).** Connect now starts
+Sunshine, pairs, launches the host's "Desktop" app and opens the stream
+window; on this machine (AMD Renoir, niri) it streamed 1080p HEVC at a steady
+**60 fps decoded and shown**, KMS capture and VA-API encode on the host,
+VA-API decode on the client.
+
+* `remote/third_party/moonlight-common-c` is a git submodule (GPL-3.0, with
+  its own enet and nanors submodules); `remote/build.rs` builds it with CMake
+  as a static library (`-Wno-error` over upstream's `-Werror`) and binds
+  `Limelight.h` with bindgen **0.72** (0.73 fails against this workspace's
+  `syn`). Clone with `git submodule update --init --recursive`.
+* After pairing, the launcher (it holds the identity) asks `/serverinfo`
+  and `/applist` over the pinned TLS, then `/launch` -- or `/resume` when
+  `currentgame` is set, because closing the stream window leaves the app
+  running on the host the way every Moonlight client does. Only the *port* of
+  the returned `sessionUrl0` is used; moonlight-common-c connects to the
+  address we give it, so a tunnelled HTTPS step and a direct stream mix.
+* `pulseterm-remote stream` is the same binary in a second process. It gets
+  the `Session` as one JSON line on stdin (never the command line: it carries
+  the input AES key) and ends when stdin closes. moonlight-common-c runs on its
+  own threads, started from a thread so the window paints while connecting;
+  video is decoded in its callback (`CAPABILITY_DIRECT_SUBMIT`) by FFmpeg with
+  VA-API, copied to NV12 and handed to the SDL3 thread as the newest picture
+  only; SDL draws it letterboxed with vsync. App id
+  `pulseterm-remote-stream`.
+* Input: SDL scancodes → Windows virtual keys (`stream/keys.rs`), absolute
+  mouse positions relative to the letterboxed picture, relative motion while
+  captured, buttons, high-resolution wheel. Hotkeys on Ctrl+Alt+Shift: **Q**
+  quits, **Z** captures the mouse, **X** fullscreen.
+* Every 5 s the stream logs decoded and shown fps on stderr.
+
+**Phase 2, pairing -- built and verified (2026-11-02).** `remote/src/pairing.rs`
+is the Moonlight pairing handshake in Rust over OpenSSL (pairing is not in
+moonlight-common-c; every client implements it): `getservercert` → AES-128-ECB
+challenges under `SHA-256(salt ‖ PIN)[..16]` → server secret with its RSA
+signature checked against the certificate from step 1 and its hash checked
+against the secret (this is what refuses a wrong PIN or a man in the middle) →
+our signed secret → `pairchallenge` over TLS with our certificate, Sunshine's
+pinned. Then `/serverinfo` over TLS must say `PairStatus` 1.
+
+* **Nothing to type, nothing stored.** A fresh certificate, key and unique id
+  per launch, in memory only (kept in the launcher for the stream window).
+  The PIN is random and goes to Sunshine's stdin through the spawned channel
+  (`Bridge::write`), written 300 ms after the first request is sent.
+* **Over SSH.** Both pairing ports (base and base − 5) are reached through
+  `Connection::forward`, so a host firewall does not matter for pairing.
+* Connect now starts Sunshine *and* pairs; a failed pairing stops Sunshine so
+  the next try starts clean (`-0` reads the PIN once).
+* Verified: through PulseTerm over SSH to `localhost` ("Paired."), and by an
+  opt-in test against real Sunshine instances (`cargo test -p
+  pulseterm-remote -- --ignored`): the right PIN pairs and is confirmed, a
+  wrong one is refused. Sunshine logs nothing about pairing at info level, so
+  the TLS `serverinfo` check is the proof.
+
 **Phase 0 results** (2026-11-02, AMD Renoir iGPU, niri, throwaway spike):
 
 * **Video:** FFmpeg VAAPI decode of 1080p120 H.264 into an SDL3 window, vsync
@@ -393,13 +786,8 @@ GPU encoder on it.
 * Still untested: GNOME, KDE and X11 hosts for the pointer lock; 4K; the
   zero-copy dmabuf → EGL path.
 
-**Not yet:**
-
-* The shifted-port case is written but untested (no second Sunshine here).
-* Live theme updates (the handoff is at launch only).
-* Linux CSD for the launcher: it asks for server-side decorations, which
-  niri and KDE give and GNOME does not.
-* Phase 2 (pairing) and phase 3 (the SDL3 stream window).
+**Not yet:** see *Where it stands* at the top -- that list is kept current.
+(The gpui launcher's GNOME-decorations gap went with the gpui launcher.)
 
 **Fedora packages, and a trap.** The helper needs RPM Fusion's `ffmpeg` (the
 default `ffmpeg-free` has no H.264/HEVC decoder), `mesa-va-drivers-freeworld`

@@ -8,24 +8,29 @@
 //! ```
 //!
 //! and serves it over stdin/stdout (`bridge`). `--local` instead probes this
-//! machine with no PulseTerm and no SSH -- for developing the launcher.
+//! machine with no PulseTerm and no SSH -- for developing it.
 //!
-//! Planned shape (REMOTE_DESKTOP.md, 2.7): this process is the gpui launcher;
-//! `pulseterm-remote stream` will be the SDL3 stream window.
+//! One window, one toolkit (SDL3): the setup screen before a stream, the
+//! stream with a sidebar during one (`app`).
 
+mod app;
 mod bridge;
 mod config;
-mod launcher;
+mod pairing;
 mod probe;
+mod stream;
 mod sunshine;
 mod theme;
+mod ui;
 
-use futures::StreamExt;
-use gpui::{prelude::*, px, size, App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
+use std::ffi::CString;
 
-use bridge::{Bridge, Event};
-use launcher::Launcher;
+use sdl3_sys::everything::*;
+
+use bridge::Bridge;
 use theme::Theme;
+use ui::text::Fonts;
+use ui::Ui;
 
 struct Args {
     label: String,
@@ -58,58 +63,51 @@ fn main() {
     if args.label.is_empty() {
         eprintln!(
             "pulseterm-remote is started by PulseTerm (the remote desktop icon on an SSH session).\n\
-             To try the launcher against this machine: pulseterm-remote --local"
+             To try it against this machine: pulseterm-remote --local"
         );
         std::process::exit(2);
     }
-
     let (bridge, events) = if args.local {
         (Bridge::local(), None)
     } else {
         let (bridge, events) = Bridge::pipe();
         (bridge, Some(events))
     };
-
-    Application::new().run(move |cx: &mut App| {
-        let mut theme = Theme::from_handoff(args.theme.as_deref());
-        theme.resolve_font(&cx.text_system().all_font_names());
-        cx.set_global(theme);
-        let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
-        let (label, address) = (args.label.clone(), args.address.clone());
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(format!("PulseTerm Remote — {label}").into()),
-                        ..Default::default()
-                    }),
-                    app_id: Some("pulseterm-remote".into()),
-                    ..Default::default()
-                },
-                move |_, cx| cx.new(|cx| Launcher::new(label, address, bridge, cx)),
-            )
-            .expect("failed to open window");
-
-        // PulseTerm's side of the pipe: bring the window forward when the icon
-        // is clicked again, and quit when PulseTerm lets go of us.
-        if let Some(mut events) = events {
-            cx.spawn(async move |cx| {
-                while let Some(event) = events.next().await {
-                    match event {
-                        Event::Raise => {
-                            let _ = window.update(cx, |_, window, _| window.activate_window());
-                        }
-                        Event::Closed => {
-                            let _ = cx.update(|cx| cx.quit());
-                            break;
-                        }
-                    }
-                }
-            })
-            .detach();
+    let theme = Theme::from_handoff(args.theme.as_deref());
+    let (regular, bold) = theme.font_files();
+    let fonts = match Fonts::load(&regular, &bold) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("pulseterm-remote: {e}");
+            std::process::exit(1);
         }
-        cx.on_window_closed(|cx| cx.quit()).detach();
-        cx.activate(true);
-    });
+    };
+
+    unsafe {
+        // Native Wayland first: left alone SDL3 picked X11 through XWayland,
+        // and the pointer lock needs the real thing (REMOTE_DESKTOP.md).
+        #[cfg(target_os = "linux")]
+        SDL_SetHint(c"SDL_VIDEO_DRIVER".as_ptr(), c"wayland,x11".as_ptr());
+        SDL_SetHint(c"SDL_APP_ID".as_ptr(), c"pulseterm-remote".as_ptr());
+        if !SDL_Init(SDL_INIT_VIDEO) {
+            eprintln!("pulseterm-remote: SDL could not start: {}", std::ffi::CStr::from_ptr(SDL_GetError()).to_string_lossy());
+            std::process::exit(1);
+        }
+        let title = CString::new(format!("PulseTerm Remote — {}", args.label)).unwrap_or_default();
+        let window = SDL_CreateWindow(title.as_ptr(), 1100, 760, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        let renderer = SDL_CreateRenderer(window, std::ptr::null());
+        if window.is_null() || renderer.is_null() {
+            eprintln!("pulseterm-remote: no window: {}", std::ffi::CStr::from_ptr(SDL_GetError()).to_string_lossy());
+            std::process::exit(1);
+        }
+        SDL_SetRenderVSync(renderer, 1);
+        let ui = Ui { r: renderer, fonts, t: theme, scale: 1.0, width: 1100.0, height: 760.0, mouse: (-1.0, -1.0), click: false, wheel: 0.0 };
+        let mut app = app::App::new(ui, window, args.label, args.address, bridge, events);
+        app.measure();
+        app.run();
+        drop(app);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
 }

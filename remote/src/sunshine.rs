@@ -23,6 +23,60 @@ use crate::probe::Facts;
 pub const DEFAULT_PORT: u16 = 47989;
 pub const SHIFTED_PORT: u16 = 48089;
 
+/// The host-side settings written into Sunshine's config when it starts.
+/// Changing any of them needs a restart (`App::connect` does it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    pub preset: String,
+    pub threads: u32,
+    pub fec: u32,
+    /// Capture the host's sound at all: off saves host CPU.
+    pub audio: bool,
+    /// Every encoder's low-latency settings (only the one in use matters).
+    pub low_latency: bool,
+}
+
+impl Tuning {
+    pub fn from(config: &crate::config::StreamConfig) -> Self {
+        Self {
+            preset: config.sw_preset.clone(),
+            threads: config.threads,
+            fec: config.fec,
+            audio: config.audio,
+            low_latency: config.latency == "low",
+        }
+    }
+
+    /// Whether the running instance must restart for `wanted`. Audio does
+    /// not count: it mutes here at once, and the host's capture follows the
+    /// next time Sunshine starts anyway.
+    pub fn restart_needed(&self, wanted: &Tuning) -> bool {
+        (&self.preset, self.threads, self.fec, self.low_latency) != (&wanted.preset, wanted.threads, wanted.fec, wanted.low_latency)
+    }
+
+    fn lines(&self) -> String {
+        // Low latency, per encoder -- Sunshine uses whichever the host has:
+        // NVENC's fastest preset without a second pass, AMD's ultra-low-latency
+        // usage, QSV's fastest, VA-API's strict per-frame size (no oversized
+        // frame stalls the network), and the software encoder's fastest preset.
+        let low = if self.low_latency {
+            "nvenc_preset = 1\nnvenc_twopass = disabled\nnvenc_latency_over_power = enabled\nnvenc_spatial_aq = disabled\n\
+             amd_usage = ultralowlatency\namd_quality = speed\namd_preanalysis = disabled\namd_vbaq = disabled\n\
+             qsv_preset = veryfast\nvaapi_strict_rc_buffer = enabled\n"
+        } else {
+            ""
+        };
+        let preset = if self.low_latency { "ultrafast" } else { self.preset.as_str() };
+        low.to_string() + &format!(
+            "sw_preset = {}\nsw_tune = zerolatency\nmin_threads = {}\nfec_percentage = {}\nstream_audio = {}\n",
+            preset,
+            self.threads,
+            self.fec,
+            if self.audio { "enabled" } else { "disabled" }
+        )
+    }
+}
+
 pub fn base_port(facts: &Facts) -> u16 {
     if facts.running || facts.port_busy {
         SHIFTED_PORT
@@ -33,16 +87,31 @@ pub fn base_port(facts: &Facts) -> u16 {
 
 const DIR: &str = r#"D="$HOME/.config/pulseterm/sunshine""#;
 
-/// Writes the config and clears any instance a crash left behind. With
-/// `kms`, capture is pinned to KMS -- no portal dialog, so a host with nobody
-/// at it streams; otherwise Sunshine picks (wlroots, X11, then the portal).
-fn prepare_script(port: u16, kms: bool) -> String {
-    let capture = if kms { "capture = kms\n" } else { "" };
+/// Writes the config and clears any instance a crash left behind. `capture`
+/// pins the method (`probe::capture` decides: X11 on X11, KMS on Wayland when
+/// permitted); `None` lets Sunshine pick (wlroots, then the portal).
+fn prepare_script(port: u16, capture: Option<&str>, tuning: &Tuning) -> String {
+    let capture = capture.map(|c| format!("capture = {c}\n")).unwrap_or_default();
+    let tuning = tuning.lines();
     format!(
         r#"set -e
 {DIR}
 mkdir -p "$D"; chmod 700 "$D"
-if [ -f "$D/pid" ]; then kill "$(cat "$D/pid")" 2>/dev/null || true; rm -f "$D/pid"; fi
+# An earlier instance -- a crash, or a Stop a moment ago whose wrapper is
+# still winding down -- must be gone and its port free before this one starts:
+# otherwise the ready check below sees the *old* one listening and pairing
+# talks to a Sunshine that will never read the PIN.
+old=""
+if [ -f "$D/pid" ]; then old=$(cat "$D/pid"); kill "$old" 2>/dev/null || true; fi
+i=0
+while [ $i -lt 50 ]; do
+  busy=no
+  [ -n "$old" ] && kill -0 "$old" 2>/dev/null && busy=yes
+  ss -ltn 2>/dev/null | grep -q ":{port} " && busy=yes
+  [ $busy = no ] && break
+  i=$((i+1)); sleep 0.2
+done
+rm -f "$D/pid"
 cat > "$D/sunshine.conf" <<EOF
 sunshine_name = PulseTerm
 port = {port}
@@ -50,7 +119,7 @@ file_state = $D/state.json
 credentials_file = $D/credentials.json
 log_path = $D/sunshine.log
 origin_web_ui_allowed = pc
-{capture}EOF
+{capture}{tuning}EOF
 echo ok"#
     )
 }
@@ -71,6 +140,14 @@ for v in WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DBUS_SESSI
   val=$(systemctl --user show-environment 2>/dev/null | sed -n "s/^$v=//p")
   [ -n "$val" ] && export "$v=$val"
 done
+# X11 capture needs the display's cookie. The user manager does not always
+# carry XAUTHORITY; GDM keeps it here, older setups in the home directory.
+if [ -n "$DISPLAY" ] && [ -z "$XAUTHORITY" ]; then
+  for a in "/run/user/$(id -u)/gdm/Xauthority" "$HOME/.Xauthority"; do
+    [ -r "$a" ] && {{ export XAUTHORITY="$a"; break; }}
+  done
+fi
+[ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ] && [ -S /tmp/.X11-unix/X0 ] && export DISPLAY=:0
 export XDG_CONFIG_HOME="$HOME/.config/pulseterm"
 f="$D/stdin"; rm -f "$f"; mkfifo -m 600 "$f"
 sunshine -0 -1 "$D/sunshine.conf" <"$f" >"$D/run.log" 2>&1 &
@@ -80,7 +157,8 @@ cat >"$f"
 kill "$pid" 2>/dev/null
 for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
 kill -9 "$pid" 2>/dev/null
-rm -f "$f" "$D/pid""#
+# Only our own files: a newer instance may already have written its own.
+[ "$(cat "$D/pid" 2>/dev/null)" = "$pid" ] && rm -f "$f" "$D/pid""#
     )
 }
 
@@ -108,8 +186,8 @@ pub struct Instance {
     pub port: u16,
 }
 
-pub async fn start(bridge: &Bridge, port: u16, kms: bool) -> Result<Instance, String> {
-    let prepared = bridge.exec(&prepare_script(port, kms)).await?;
+pub async fn start(bridge: &Bridge, port: u16, capture: Option<&str>, tuning: &Tuning) -> Result<Instance, String> {
+    let prepared = bridge.exec(&prepare_script(port, capture, tuning)).await?;
     if prepared.status != Some(0) {
         return Err(format!("could not prepare Sunshine's config: {}", prepared.stderr.trim()));
     }
@@ -123,8 +201,26 @@ pub async fn start(bridge: &Bridge, port: u16, kms: bool) -> Result<Instance, St
     }
 }
 
+/// Stops an instance and waits (up to 5 s) until it is really gone, so a
+/// Connect straight after starts against a free port. Closing the channel
+/// only *asks*: the wrapper takes a moment to kill Sunshine.
 pub async fn stop(bridge: &Bridge, instance: Instance) {
     let _ = bridge.kill(instance.handle).await;
+    let _ = bridge.exec(&gone_script(instance.port)).await;
+}
+
+fn gone_script(port: u16) -> String {
+    format!(
+        r#"{DIR}
+i=0
+while [ $i -lt 50 ]; do
+  alive=no
+  [ -f "$D/pid" ] && kill -0 "$(cat "$D/pid")" 2>/dev/null && alive=yes
+  ss -ltn 2>/dev/null | grep -q ":{port} " && alive=yes
+  [ $alive = no ] && exit 0
+  i=$((i+1)); sleep 0.1
+done"#
+    )
 }
 
 /// The reason from `ready_script`'s output: its first line, plus the last
@@ -157,12 +253,20 @@ mod tests {
 
     #[test]
     fn the_config_is_ours_alone() {
-        let s = prepare_script(48089, false);
+        let tuning = Tuning { preset: "ultrafast".into(), threads: 4, fec: 10, audio: false, low_latency: false };
+        let low = Tuning { low_latency: true, preset: "veryfast".into(), ..tuning.clone() };
+        let l = prepare_script(48089, None, &low);
+        assert!(l.contains("nvenc_preset = 1\n") && l.contains("amd_usage = ultralowlatency\n"));
+        assert!(l.contains("sw_preset = ultrafast\n"), "low latency overrides the software preset");
+        let s = prepare_script(48089, None, &tuning);
+        assert!(s.contains("sw_preset = ultrafast\n") && s.contains("min_threads = 4\n"));
+        assert!(s.contains("fec_percentage = 10\n") && s.contains("stream_audio = disabled\n"));
         assert!(s.contains("port = 48089"));
         assert!(s.contains(".config/pulseterm/sunshine"));
         assert!(s.contains("origin_web_ui_allowed = pc"), "web UI is never on the network");
         assert!(!s.contains("capture"));
-        assert!(prepare_script(47989, true).contains("capture = kms\n"));
+        assert!(prepare_script(47989, Some("kms"), &tuning).contains("capture = kms\n"));
+        assert!(prepare_script(47989, Some("x11"), &tuning).contains("capture = x11\n"));
     }
 
     #[test]

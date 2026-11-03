@@ -112,6 +112,15 @@ guessed differently.
 
 ---
 
+## The remote desktop helper
+
+`remote/` (`pulseterm-remote`) is a second program, built only with
+`cargo build -p pulseterm-remote`, and so far **Linux only**: its full
+keyboard takeover is an evdev grab, its font lookup is `fc-match`, and its
+build has only ever run here. Building it needs the moonlight-common-c
+submodule and system packages -- see `REMOTE_DESKTOP.md` (status, packages,
+and the `dnf swap` trap). PulseTerm itself does not depend on it.
+
 ## Windows: check this on the next Windows build
 
 Everything since the Linux port began was compiled and run **only on Linux**
@@ -178,6 +187,8 @@ Windows keeps painting the ground there as before).
 - [ ] Keys page: record a new chord, it works, restore defaults.
 - [ ] A translucent window (opacity below 100) still has one layer of ground
       everywhere, and the font list stays opaque.
+- [ ] The remote desktop icon stays hidden (the helper is not ported to
+      Windows yet -- `REMOTE_DESKTOP.md`, *Where it stands*).
 
 ---
 

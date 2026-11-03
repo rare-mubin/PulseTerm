@@ -6,28 +6,30 @@
 //! without one (`--local`, or by hand), it falls back to Ink, the design's own
 //! dark palette.
 
-use gpui::{px, rgb, Global, Hsla, Pixels};
+use std::path::PathBuf;
+
 use serde::Deserialize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
 
 #[derive(Clone)]
 pub struct Theme {
     pub font: String,
-    pub font_size: Pixels,
-    pub line_height: Pixels,
-    pub bg: Hsla,
-    pub surface: Hsla,
-    pub raised: Hsla,
-    pub border: Hsla,
-    pub fg: Hsla,
-    pub fg_muted: Hsla,
-    pub fg_subtle: Hsla,
-    pub accent: Hsla,
-    pub success: Hsla,
-    pub warning: Hsla,
-    pub danger: Hsla,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub bg: Rgb,
+    pub surface: Rgb,
+    pub raised: Rgb,
+    pub border: Rgb,
+    pub fg: Rgb,
+    pub fg_muted: Rgb,
+    pub fg_subtle: Rgb,
+    pub accent: Rgb,
+    pub success: Rgb,
+    pub warning: Rgb,
+    pub danger: Rgb,
 }
-
-impl Global for Theme {}
 
 #[derive(Deserialize)]
 #[serde(default)]
@@ -53,8 +55,6 @@ impl Default for Handoff {
     fn default() -> Self {
         let s = |v: &str| v.to_string();
         Self {
-            // Empty: `resolve_font` picks the first installed family PulseTerm
-            // itself prefers. gpui does not resolve a generic "monospace".
             font: String::new(),
             font_size: 13.,
             line_height: 18.,
@@ -73,9 +73,13 @@ impl Default for Handoff {
     }
 }
 
-fn colour(hex: &str, fallback: &str) -> Hsla {
-    let parse = |h: &str| u32::from_str_radix(h.trim_start_matches('#'), 16).ok();
-    rgb(parse(hex).or_else(|| parse(fallback)).unwrap_or(0)).into()
+fn colour(hex: &str, fallback: &str) -> Rgb {
+    let parse = |h: &str| {
+        let h = h.trim_start_matches('#');
+        (h.len() == 6).then(|| u32::from_str_radix(h, 16).ok()).flatten()
+    };
+    let v = parse(hex).or_else(|| parse(fallback)).unwrap_or(0);
+    Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
 impl Theme {
@@ -84,8 +88,8 @@ impl Theme {
         let d = Handoff::default();
         Self {
             font: h.font,
-            font_size: px(h.font_size.clamp(8., 40.)),
-            line_height: px(h.line_height.clamp(10., 60.)),
+            font_size: h.font_size.clamp(8., 40.),
+            line_height: h.line_height.clamp(10., 60.),
             bg: colour(&h.bg, &d.bg),
             surface: colour(&h.surface, &d.surface),
             raised: colour(&h.raised, &d.raised),
@@ -100,44 +104,65 @@ impl Theme {
         }
     }
 
-    /// Settles the font on an installed family: the handed-over one if it is
-    /// here, otherwise the first of the families PulseTerm's `theme.rs`
-    /// prefers on this platform. A family gpui cannot find silently becomes a
-    /// proportional one, which breaks the whole grid look.
-    pub fn resolve_font(&mut self, installed: &[String]) {
-        if installed.iter().any(|i| *i == self.font) {
-            return;
-        }
+    // The design's measurements, derived from the type exactly as PulseTerm's
+    // `ui/kit.rs` derives them, so the two windows share a proportion.
+    pub fn bar(&self) -> f32 {
+        self.line_height + 26.
+    }
+    pub fn row(&self) -> f32 {
+        self.line_height + 10.
+    }
+    pub fn micro(&self) -> f32 {
+        (self.font_size * 0.72).max(8.)
+    }
+    pub fn head(&self) -> f32 {
+        self.font_size * (16. / 12.)
+    }
+
+    /// The regular and bold files of the theme's font -- or, when it is not
+    /// installed, of the first family PulseTerm itself prefers here. A
+    /// proportional fallback would break the whole grid look.
+    pub fn font_files(&self) -> (PathBuf, PathBuf) {
         let preferred: &[&str] = if cfg!(windows) {
             &["Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "Courier New"]
         } else {
             &["JetBrains Mono", "Fira Code", "Cascadia Mono", "Adwaita Mono", "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"]
         };
-        self.font = preferred
-            .iter()
-            .find(|name| installed.iter().any(|i| i == *name))
-            .unwrap_or(&preferred[0])
-            .to_string();
-    }
-
-    // The design's measurements, derived from the type exactly as PulseTerm's
-    // `ui/kit.rs` derives them, so the two windows share a proportion.
-    pub fn bar(&self) -> Pixels {
-        self.line_height + px(26.)
-    }
-    pub fn row(&self) -> Pixels {
-        self.line_height + px(10.)
-    }
-    pub fn micro(&self) -> Pixels {
-        (self.font_size * 0.72).max(px(8.))
-    }
-    pub fn head(&self) -> Pixels {
-        self.font_size * (16. / 12.)
+        let wanted = std::iter::once(self.font.as_str()).filter(|f| !f.is_empty()).chain(preferred.iter().copied());
+        for family in wanted {
+            if let Some(regular) = find_font(family, false) {
+                let bold = find_font(family, true).unwrap_or_else(|| regular.clone());
+                return (regular, bold);
+            }
+        }
+        let last = find_font("monospace", false).unwrap_or_default();
+        (last.clone(), last)
     }
 }
 
-/// Tracked-out label text: gpui has no letter spacing, so the design's 0.18em
-/// is spelled into the string. Display only.
+/// A font family's file, if that exact family is installed.
+#[cfg(not(windows))]
+fn find_font(family: &str, bold: bool) -> Option<PathBuf> {
+    let pattern = format!("{family}:{}", if bold { "weight=bold" } else { "style=Regular" });
+    let out = std::process::Command::new("fc-match").args(["-f", "%{family}\n%{file}", &pattern]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (found, file) = text.split_once('\n')?;
+    // fc-match always answers with *something*; only the family asked for counts.
+    let matches = family == "monospace" || found.split(',').any(|f| f.trim().eq_ignore_ascii_case(family));
+    (matches && !file.is_empty()).then(|| PathBuf::from(file.trim()))
+}
+
+#[cfg(windows)]
+fn find_font(family: &str, bold: bool) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
+    let stem = family.replace(' ', "");
+    let names = if bold { vec![format!("{stem}-Bold.ttf"), format!("{stem}bd.ttf")] } else { vec![format!("{stem}.ttf"), format!("{stem}-Regular.ttf")] };
+    let names = if family == "Consolas" { vec![if bold { "consolab.ttf".into() } else { "consola.ttf".into() }] } else { names };
+    names.into_iter().map(|n| dir.join(n)).find(|p| p.is_file())
+}
+
+/// Tracked-out label text: the design's 0.18em is spelled into the string.
+/// Display only.
 pub fn label(text: &str) -> String {
     let upper = text.to_uppercase();
     let mut out = String::with_capacity(upper.len() * 2);
@@ -157,10 +182,10 @@ mod tests {
     #[test]
     fn a_partial_or_broken_handoff_still_gives_a_whole_theme() {
         let t = Theme::from_handoff(Some(r##"{"accent":"#00ff00","bg":"nonsense"}"##));
-        assert_eq!(t.accent, Hsla::from(rgb(0x00ff00)));
-        assert_eq!(t.bg, Hsla::from(rgb(0x121212)), "bad colour falls back to Ink");
+        assert_eq!(t.accent, Rgb(0, 255, 0));
+        assert_eq!(t.bg, Rgb(0x12, 0x12, 0x12), "bad colour falls back to Ink");
         let t = Theme::from_handoff(Some("not json"));
-        assert_eq!(t.fg, Hsla::from(rgb(0xedeae3)));
+        assert_eq!(t.fg, Rgb(0xed, 0xea, 0xe3));
     }
 
     #[test]
