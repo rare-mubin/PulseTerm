@@ -89,7 +89,7 @@ a fresh install opens on.
   behind it, survives every move.
 - **The strip slides instead of cutting** — moving the focus slides the
   columns across, so you can see which way you went and how far. Speed, curve
-  and off are in Settings → Window → Motion; a seam you are dragging never
+  and off are in Settings → Tiling; a seam you are dragging never
   animates, because it has to stay under the pointer.
 - **See the whole strip** — `ctrl-shift-space` lays every column out as a card,
   with a few lines of each terminal's screen in it so two shells on one host
@@ -178,10 +178,11 @@ cargo build --release
 ### Windows
 
 Release builds compile gpui's shaders ahead of time and need `fxc.exe` from the
-Windows SDK:
+Windows SDK. gpui finds it by itself in the `10.0.26100.0` kit; with a different
+SDK version, point it at that kit's compiler:
 
 ```powershell
-$env:GPUI_FXC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\fxc.exe"
+$env:GPUI_FXC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\fxc.exe"
 ```
 
 The result is `target/release/PulseTerm.exe` — copy it anywhere and run it.
@@ -265,13 +266,15 @@ Not yet built:
 - Restoring every session at launch — only the one on screen when you quit
   comes back
 - `pulseterm -e` and the menu-entry install are Linux-only so far
-- The remote desktop helper runs on Linux only
+- The remote desktop helper streams from Linux; on Windows it builds and
+  opens, but has not streamed yet ([REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md),
+  *Building on Windows*)
 - No end-to-end or UI tests (there are unit tests for the parts that can be
   checked without a window)
 
 Everything since the Linux port began was built and tested on Linux (Fedora,
-niri on Wayland); [LINUX.md](./LINUX.md) lists what to re-check on the next
-Windows build. macOS has not been tried.
+niri on Wayland), then checked on Windows 11; [LINUX.md](./LINUX.md) has the
+Windows results and what is still open there. macOS has not been tried.
 
 ## Project layout
 

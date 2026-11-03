@@ -28,12 +28,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+// Only the Linux grab sends keys itself; elsewhere this module is a stub.
+#[cfg(target_os = "linux")]
 use super::ffi;
 
 /// The one-time permission: a udev rule giving the active user's session
 /// access to keyboard devices -- keyboards only, not mice or other input.
 pub const GRANT: &str = "echo 'SUBSYSTEM==\"input\", KERNEL==\"event*\", ENV{ID_INPUT_KEYBOARD}==\"1\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/70-pulseterm-keyboards.rules && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input";
 
+// Off Linux only `Unavailable` is ever produced; the rest are the grab's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum GrabError {
     /// No permission to open the keyboards; `GRANT` fixes it.
     NoAccess,
@@ -131,6 +135,7 @@ impl Drop for Grab {
 /// evdev key codes (linux/input-event-codes.h) to the Windows virtual keys
 /// the protocol carries -- the same targets as `keys::virtual_key`, from the
 /// kernel's numbering instead of SDL's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn evdev_vk(code: u16) -> Option<i16> {
     const ROW_Q: &[u8] = b"QWERTYUIOP";
     const ROW_A: &[u8] = b"ASDFGHJKL";

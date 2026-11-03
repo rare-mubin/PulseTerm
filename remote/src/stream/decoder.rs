@@ -2,7 +2,8 @@
 //!
 //! moonlight-common-c calls `submit` on its own thread with one whole frame
 //! (Annex-B NAL units for H.264/HEVC, an OBU sequence for AV1). It is decoded
-//! there with VA-API, copied down to an NV12 picture in system memory, and left
+//! there in hardware (VA-API on Linux, D3D11VA on Windows -- `HW`), copied
+//! down to an NV12 picture in system memory, and left
 //! in `LATEST` for the window's thread, which is woken with an SDL event. Only
 //! the newest picture is kept: a frame the screen never showed is not worth
 //! showing late.
@@ -17,6 +18,17 @@ use std::sync::Mutex;
 use ffmpeg_sys_next as ff;
 
 use super::ffi;
+
+/// The platform's hardware decoder: VA-API on Linux, Direct3D 11 on Windows.
+/// Both hand back GPU surfaces that `av_hwframe_transfer_data` downloads to
+/// NV12, so everything after `get_format` is the same; only zero-copy (a DRM
+/// PRIME mapping, `zerocopy`) is VA-API's alone.
+#[cfg(not(windows))]
+const HW: (ff::AVHWDeviceType, ff::AVPixelFormat, &str) =
+    (ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, ff::AVPixelFormat::AV_PIX_FMT_VAAPI, "VA-API");
+#[cfg(windows)]
+const HW: (ff::AVHWDeviceType, ff::AVPixelFormat, &str) =
+    (ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, ff::AVPixelFormat::AV_PIX_FMT_D3D11, "D3D11VA");
 
 /// One decoded picture, in whichever layout the decoder produced.
 pub struct Picture {
@@ -96,7 +108,7 @@ unsafe extern "C" fn get_format(
 ) -> ff::AVPixelFormat {
     let mut fallback = ff::AVPixelFormat::AV_PIX_FMT_NONE;
     while *formats != ff::AVPixelFormat::AV_PIX_FMT_NONE {
-        if *formats == ff::AVPixelFormat::AV_PIX_FMT_VAAPI {
+        if *formats == HW.1 {
             return *formats;
         }
         if fallback == ff::AVPixelFormat::AV_PIX_FMT_NONE {
@@ -104,7 +116,7 @@ unsafe extern "C" fn get_format(
         }
         formats = formats.add(1);
     }
-    eprintln!("pulseterm-remote: no VA-API surface offered, decoding in software");
+    eprintln!("pulseterm-remote: no {} surface offered, decoding in software", HW.2);
     fallback
 }
 
@@ -136,8 +148,7 @@ unsafe extern "C" fn setup(
     (*ctx).height = height;
     (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
     let mut device: *mut ff::AVBufferRef = null_mut();
-    let hardware =
-        ff::av_hwdevice_ctx_create(&mut device, ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, null(), null_mut(), 0) == 0;
+    let hardware = ff::av_hwdevice_ctx_create(&mut device, HW.0, null(), null_mut(), 0) == 0;
     if hardware {
         (*ctx).hw_device_ctx = ff::av_buffer_ref(device);
         // Spare surfaces: the frame on screen stays referenced until the next
@@ -153,7 +164,7 @@ unsafe extern "C" fn setup(
         eprintln!("pulseterm-remote: could not open the {codec_id:?} decoder");
         return -1;
     }
-    eprintln!("pulseterm-remote: decoding {codec_id:?} {width}x{height}, VA-API: {hardware}");
+    eprintln!("pulseterm-remote: decoding {codec_id:?} {width}x{height}, {}: {hardware}", HW.2);
     *DECODER.lock().unwrap() = Some(Decoder {
         ctx,
         packet: ff::av_packet_alloc(),
@@ -230,7 +241,7 @@ unsafe fn decode(unit: ffi::PDECODE_UNIT) -> i32 {
             ZERO_COPY.store(false, Relaxed);
             eprintln!("pulseterm-remote: could not map frames for zero-copy; copying instead");
         }
-        let source = if d.hardware && (*d.frame).format == ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
+        let source = if d.hardware && (*d.frame).format == HW.1 as i32 {
             ff::av_frame_unref(d.software);
             (*d.software).format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
             if ff::av_hwframe_transfer_data(d.software, d.frame, 0) < 0 {

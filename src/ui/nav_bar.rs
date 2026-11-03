@@ -669,14 +669,15 @@ pub(crate) fn drag_region(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, _| {
             window_controls::caption_press(window);
         })
-        // The rest is Linux's: there the press only arms, the first drag
-        // starts the move, and a double-click is seen as one -- see
-        // `window_controls`. On Windows these are no-ops.
+        // The rest is mostly Linux's: there the press only arms, the first
+        // drag starts the move, and a double-click is seen as one -- see
+        // `window_controls`. On Windows only the release matters: it is
+        // where a caption double-click maximises.
         .on_mouse_move(|event: &MouseMoveEvent, window, _| {
             window_controls::caption_drag(window, event);
         })
-        .on_mouse_up(MouseButton::Left, |_: &MouseUpEvent, _, _| {
-            window_controls::caption_release();
+        .on_mouse_up(MouseButton::Left, |_: &MouseUpEvent, window, _| {
+            window_controls::caption_release(window);
         })
         .on_click(|event: &ClickEvent, window, _| {
             window_controls::caption_click(window, event.click_count());

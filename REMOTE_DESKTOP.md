@@ -82,8 +82,15 @@ Decided next (2026-11-02), following the recommendations below:
    (*Resolution "window"* under Progress).
 3. ~~Choosing the host's display~~ -- **done**, checked against cachyos
    (*Choosing the display* under Progress).
-4. **Windows port of the helper** (keyboard grab, font lookup, build) -- it
-   has only ever been built on Linux.
+4. **Windows port of the helper** -- *builds and starts* (2026-11-03, see
+   *Building on Windows* below): it compiles and links with MSVC, its 32 tests
+   pass, and the setup window opens in the design language with a Windows
+   font. **Streams from Windows** (same day, D3D11VA decoding). The full
+   keyboard there is SDL's keyboard grab -- a low-level keyboard hook, so
+   no permission step and no udev notice -- with Alt+Tab sent to the host
+   too (`SDL_ALLOW_ALT_TAB_WHILE_GRABBED=0`); Ctrl+Alt+Del and Win+L stay
+   Windows'. Still to do: the system titlebar SDL adds above the window's
+   own bar.
 
 Smaller: live theme updates (the theme is handed over once, at launch); the
 shifted-port case (written, untested); the pointer lock on GNOME/KDE/X11
@@ -96,6 +103,56 @@ uinput for them, as a fact about the host.
 
 Read `CLAUDE.md` first; the design language (`ui/kit.rs`, Ink/Paper, hairlines,
 no radius, no shadow, monospace grid) applies to the new window unchanged.
+
+### Building on Windows
+
+Done once on Windows 11 with the MSVC toolchain (2026-11-03). Windows has no
+system copies of the libraries, so each is fetched and the build is pointed at
+it with environment variables (`remote/build.rs` explains which reads what):
+
+| needs | from | variable |
+|---|---|---|
+| moonlight-common-c | `git submodule update --init --recursive` | -- |
+| CMake + C compiler | Visual Studio 2022 Build Tools | -- |
+| libclang (bindgen) | `winget install LLVM.LLVM` | `LIBCLANG_PATH=C:\Program Files\LLVM\bin` |
+| OpenSSL | `winget install ShiningLight.OpenSSL.Dev` (4.x: slproweb no longer hosts 3.x) | `OPENSSL_DIR`, `OPENSSL_LIB_DIR=...\lib\VC\x64\MD`, `OPENSSL_INCLUDE_DIR` |
+| SDL3 3.4.x | `SDL3-devel-3.4.18-VC.zip`, libsdl-org GitHub releases | `SDL3_LIB_DIR=...\lib\x64` |
+| FFmpeg 9.0 | `ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip`, BtbN/FFmpeg-Builds | `FFMPEG_DIR` |
+| Opus | source from downloads.xiph.org, built with CMake **as a DLL** | `OPUS_LIB_DIR` |
+
+Here they live under `D:\Apps\pulseterm-remote-deps`. Then:
+
+```bash
+cargo build -p pulseterm-remote
+```
+
+Two traps, both found doing it:
+
+* **Opus must be the DLL build** (`-DBUILD_SHARED_LIBS=ON`). `stream/audio.rs`
+  declares it with a plain `#[link(name = "opus")]`, which on MSVC means a DLL
+  import (`__imp_opus_*`); a static `opus.lib` leaves three unresolved externals.
+* **OpenSSL's MSVC library is `libcrypto`**, not `crypto` -- `build.rs` picks
+  the name by target. moonlight-common-c's own `find_package(OpenSSL)` gets
+  `OPENSSL_ROOT_DIR` from `OPENSSL_DIR`.
+
+**Decoding on Windows is D3D11VA** (`stream/decoder.rs`, `HW`), downloaded to
+NV12 like VA-API's surfaces; zero-copy is not tried there at all, since it is a
+VA-API → DRM PRIME → EGL path. The first stream from Windows (2026-11-03)
+still decoded in software, because VA-API was all it asked for.
+
+**PulseTerm finds the helper beside its own exe**, then on `PATH`, so a debug
+PulseTerm uses `target\debug\pulseterm-remote.exe` and a release one
+`target\release\pulseterm-remote.exe` -- build the helper in the same profile
+(`cargo build --release -p pulseterm-remote`) and stage its DLLs in that folder
+too. A release helper is a Windows-subsystem program, like PulseTerm: started
+from a console-less PulseTerm, a console program would get a console window
+of its own on every launch.
+
+To run, the DLLs go beside `pulseterm-remote.exe`: `SDL3.dll`, the FFmpeg
+`bin\*.dll`, `opus.dll`, and OpenSSL's `libcrypto-4-x64.dll` /
+`libssl-4-x64.dll`. `pulseterm-remote --local --label test` opens the setup
+window without PulseTerm; its host check then fails ("program not found"),
+because `--local` probes *this* machine as the host with `sh`.
 
 ---
 
@@ -164,11 +221,11 @@ PulseTerm and the helper are two programs in one Cargo workspace:
 
 ### 2.1 Nav bar icon (main app)
 
-* Lucide `MonitorPlay` (or `Cast`), in the actions group, **SSH sessions only**
+* Lucide `MonitorPlay`, in the actions group, **SSH sessions only**
   -- hidden in local mode and while disconnected, like disconnect, and hidden
   when the helper is not installed (1.1).
 * Tooltip: `Remote desktop  <shortcut>`; a rebindable command
-  `window.remote` in `keymap::COMMANDS`.
+  `session.remote` in `keymap::COMMANDS`.
 * Click: open (or raise) the Remote window for **this** host. One Remote window
   per host.
 
@@ -464,7 +521,8 @@ audio packets beside them arrive unevenly. The audio code made that audible
 two ways: past its limit it *cleared the whole queue* (up to 80 ms at once),
 and when packets were late it ran dry between each one. Now an over-full
 queue drops only the incoming packet, and a dry queue pauses the device until
-a cushion (`audio::PRIME_MS`: 20 ms, 10 in low latency) is rebuilt -- one
+a cushion (`audio::PRIME_MS` then; now `audio::BASE_MS`, the floor of the
+adaptive cushion described next: 20 ms, 10 in low latency) is rebuilt -- one
 short wait instead of many gaps; playback also starts on that cushion. And
 mouse motion is gathered and sent once per pass of the loop
 (`Stream::flush_motion`, relative movement summed, positions replaced by the

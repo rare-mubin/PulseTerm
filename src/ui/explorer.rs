@@ -413,9 +413,12 @@ impl ExplorerView {
         };
         self.menu = None;
 
+        // Both separators: on Windows a local path's last '/' is nowhere, and
+        // the whole absolute path went to `join` -- which pasted beside the
+        // original instead of into the folder.
         let name = clipboard
             .path
-            .rsplit('/')
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or("copy")
             .to_string();

@@ -140,6 +140,11 @@ pub struct Workspace {
     /// bound in the `Workspace` context -- it would be taken from vim. Shared
     /// with the tab dialog below: only one of the two is ever on screen.
     close_focus: FocusHandle,
+    /// The overview's own keyboard focus. It has to be *on* the element that
+    /// declares the `Overview` key context: gpui looks for bindings from the
+    /// focused element upward, so with the workspace root focused (as it once
+    /// was) escape, enter and the arrows never reached the overview at all.
+    overview_focus: FocusHandle,
     /// A single *tab* close waiting on an answer, because it would lose work.
     confirm_tab: Option<PendingClose>,
     /// Last run's layout, waiting for a connection it belongs to. Taken at the
@@ -290,6 +295,7 @@ impl Workspace {
             confirm_close: false,
             closing: false,
             close_focus: cx.focus_handle(),
+            overview_focus: cx.focus_handle(),
             confirm_tab: None,
             pending_session: Some(session),
             target: None,
@@ -976,6 +982,12 @@ impl Workspace {
     }
 
     fn focus_active_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // While the overview is up the strip is not drawn, so the active
+        // window's handle would be focus on nothing -- the overview keeps it.
+        if self.overview_open {
+            window.focus(&self.overview_focus);
+            return;
+        }
         let handle = self
             .active_pane
             .read(cx)
@@ -1225,10 +1237,18 @@ impl Workspace {
             let t = cx.global::<Theme>();
             (t.surface, t.border, t.fg, t.fg_muted, t.warning, t.danger)
         };
-        let connected = matches!(self.connection, ConnectionState::Connected(_));
-        let label = match &self.connection {
-            ConnectionState::Connected(connection) => connection.label.clone(),
-            _ => String::new(),
+        // The same hosts the guard counted (`live_hosts`): SSH only, from
+        // every session. This computer is not a connection to hang up, and
+        // naming it here said a local shell was "still connected".
+        let hosts: Vec<SharedString> = self
+            .live_hosts()
+            .into_iter()
+            .map(|host| host.label.into())
+            .collect();
+        let connected = !hosts.is_empty();
+        let label = match hosts.as_slice() {
+            [one] => format!("{one} is"),
+            many => format!("{} are", name_list(many)),
         };
         let unsaved = self.unsaved_files(cx);
         let in_progress = self.closing;
@@ -1285,8 +1305,8 @@ impl Workspace {
                     .child(div().text_color(fg).child("close PulseTerm?"))
                     .when(connected, |this| {
                         this.child(div().text_color(fg_muted).child(format!(
-                            "{label} is still connected. Closing hangs the session up, \
-                             and anything still running in its tabs stops."
+                            "{label} still connected. Closing hangs up, and anything \
+                             still running in those tabs stops."
                         )))
                     })
                     .when(!unsaved.is_empty(), |this| {
@@ -2690,10 +2710,11 @@ impl Workspace {
         if self.overview_open {
             self.overview_entrance.restart();
             // The overview needs the keyboard for its own left/right/escape,
-            // so it takes the workspace's handle -- the one the `Workspace`
-            // key context already hangs off. Giving it back on the way out is
-            // what makes escape land you in the column you picked, typing.
-            window.focus(&self.focus_handle);
+            // so it takes a handle of its own, on the element carrying the
+            // `Overview` context (`overview_focus`). Giving focus back on the
+            // way out is what makes escape land you in the column you picked,
+            // typing.
+            window.focus(&self.overview_focus);
         } else {
             self.focus_active_item(window, cx);
         }
@@ -2794,10 +2815,15 @@ impl Render for Workspace {
         // there, the keyboard comes back to the active window. Home, the
         // command bar and the dialogs keep focus of their own and are left
         // alone; only a background window is not worth correcting.
+        //
+        // Focus on the root itself counts as escaped too. The root tracks the
+        // workspace handle, so a press on anything without a handle of its own
+        // -- the navigation bar, the caption a drag starts from -- focuses it,
+        // and the shell stopped receiving keys until it was clicked again.
         if !self.home_open
             && window.is_window_active()
-            && !self.focus_handle.contains_focused(window, cx)
-            && !self.focus_handle.is_focused(window)
+            && (!self.focus_handle.contains_focused(window, cx)
+                || self.focus_handle.is_focused(window))
         {
             self.focus_active_item(window, cx);
         }
@@ -2885,6 +2911,7 @@ impl Render for Workspace {
             // the rest of the time, which is usually a shell.
             div()
                 .key_context("Overview")
+                .track_focus(&self.overview_focus)
                 .flex()
                 .size_full()
                 .min_w_0()

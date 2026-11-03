@@ -63,8 +63,11 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Both separators: a remote path is POSIX, a local one on Windows is
+        // not, and splitting on '/' alone named the window after the whole
+        // `C:\...` path.
         let name: SharedString = path
-            .rsplit('/')
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or(path.as_str())
             .to_string()

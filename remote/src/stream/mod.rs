@@ -190,7 +190,10 @@ impl Stream {
     /// new picture arrived.
     pub fn draw(&mut self, ui: &Ui) -> bool {
         unsafe {
-            if !self.zero_copy_tried {
+            // Zero-copy is VA-API surfaces mapped to DRM PRIME and imported
+            // through EGL -- a Linux path end to end. On Windows the D3D11
+            // frames are downloaded instead, and there is nothing to try.
+            if !self.zero_copy_tried && cfg!(not(windows)) {
                 self.zero_copy_tried = true;
                 match ZeroCopy::new(ui.r) {
                     Ok(z) => {

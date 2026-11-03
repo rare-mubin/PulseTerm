@@ -149,7 +149,8 @@ impl Render for PreviewView {
 }
 
 fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    // Both separators, as in the editor: local paths on Windows use '\'.
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 fn extension(name: &str) -> Option<String> {
@@ -205,5 +206,14 @@ mod tests {
         assert!(image_format("/var/www/site.png/index").is_none());
         assert!(image_format("/var/www/site.png/logo.png").is_some());
         assert!(image_format("/no/extension/here").is_none());
+    }
+
+    /// Local paths on Windows are `\`-separated; the name is still the last
+    /// segment, not the whole path.
+    #[test]
+    fn windows_paths_name_the_file_too() {
+        assert_eq!(file_name(r"C:\Users\rare\notes.md"), "notes.md");
+        assert!(image_format(r"D:\site.png\index").is_none());
+        assert!(image_format(r"D:\site\logo.png").is_some());
     }
 }

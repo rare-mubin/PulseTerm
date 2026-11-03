@@ -6,6 +6,13 @@
 //! depends on this crate (see CLAUDE.md, Commands).
 //!
 //! Needs CMake, a C compiler, clang (for bindgen) and OpenSSL's headers.
+//!
+//! On Linux every library comes from the system. On Windows there is no system
+//! location, so the build is pointed at them (REMOTE_DESKTOP.md, *Building on
+//! Windows*): `OPENSSL_DIR` (read by `openssl-sys` and passed to CMake here),
+//! `FFMPEG_DIR` (read by `ffmpeg-sys-next`), `LIBCLANG_PATH` (bindgen), and
+//! `SDL3_LIB_DIR` / `OPUS_LIB_DIR`, which this script turns into search paths --
+//! `sdl3-sys` and the Opus extern in `stream/audio.rs` link by name only.
 
 use std::path::PathBuf;
 
@@ -21,23 +28,46 @@ fn main() {
     println!("cargo:rerun-if-changed=third_party/moonlight-common-c/src");
     println!("cargo:rerun-if-changed=build.rs");
 
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    for var in ["OPENSSL_DIR", "SDL3_LIB_DIR", "OPUS_LIB_DIR"] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+
     // The project has no install rule for itself, only for enet, so its
     // target is built directly and linked from CMake's build tree.
-    let out = cmake::Config::new(&src)
+    let mut config = cmake::Config::new(&src);
+    config
         .define("BUILD_SHARED_LIBS", "OFF")
-        // Upstream builds with -Werror; a newer compiler's new warning must
-        // not break this build.
-        .cflag("-Wno-error")
         .build_target("moonlight-common-c")
-        .profile("Release")
-        .build();
+        .profile("Release");
+    if !msvc {
+        // Upstream builds with -Werror; a newer compiler's new warning must
+        // not break this build. (MSVC's cl has no such flag.)
+        config.cflag("-Wno-error");
+    }
+    if let Ok(openssl) = std::env::var("OPENSSL_DIR") {
+        // Its `find_package(OpenSSL)` has no system copy to find on Windows.
+        config.define("OPENSSL_ROOT_DIR", &openssl);
+    }
+    let out = config.build();
     let build = out.join("build");
     println!("cargo:rustc-link-search=native={}", build.display());
     println!("cargo:rustc-link-search=native={}", build.join("enet").display());
+    // The Visual Studio generator is multi-config: one folder per profile.
+    println!("cargo:rustc-link-search=native={}", build.join("Release").display());
+    println!("cargo:rustc-link-search=native={}", build.join("enet/Release").display());
     println!("cargo:rustc-link-lib=static=moonlight-common-c");
     println!("cargo:rustc-link-lib=static=enet");
-    println!("cargo:rustc-link-lib=crypto");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    for var in ["SDL3_LIB_DIR", "OPUS_LIB_DIR"] {
+        if let Ok(dir) = std::env::var(var) {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+    }
+    // OpenSSL's MSVC import library is `libcrypto.lib`; elsewhere `libcrypto.so`
+    // and `-lcrypto`.
+    println!("cargo:rustc-link-lib={}", if msvc { "libcrypto" } else { "crypto" });
+    if windows {
         println!("cargo:rustc-link-lib=ws2_32");
         println!("cargo:rustc-link-lib=winmm");
     }

@@ -1,10 +1,11 @@
 # PulseTerm on Linux
 
-A handover document. Everything needed to port PulseTerm to Linux, written on
-the Windows machine where the app was built and where a Linux build cannot be
-compiled or tested — so **nothing in here has been run**. Treat every code
-sketch as a design that has been reasoned through against the real sources,
-not as code that compiled.
+The Linux port's handover and its status. It began as a plan written on the
+Windows machine, where nothing could be compiled for Linux; the port has since
+been built and tested on Linux. **Status** and **Windows: check this** below
+are the current picture. The numbered sections after them (§0–§8) are the
+original plan, kept for the reasoning and the traps -- where they disagree
+with Status, Status wins.
 
 Read `CLAUDE.md` first; it is the architecture document and it still governs.
 This file only covers what differs.
@@ -83,6 +84,11 @@ guessed differently.
   dispositions survive exec -- so ctrl-c did nothing to `sleep`, and closing a
   tab left it running. `unix_pty::spawn` now resets every signal to its
   default before exec (std only clears the mask). There is a test.
+* **A hangup could be lost.** bash's line editor swaps signal handlers
+  around every prompt, and a SIGHUP landing in that swap is dropped -- the
+  shell stayed alive and orphaned, about one close in seven. A
+  `pulseterm-pty-hangup` thread now repeats SIGHUP after 0.5 s and sends
+  SIGKILL after 3 s, each step checking the reap under the same lock first.
 * **The margin was measured against the wrong size.** On Wayland
   `window_bounds()` is the window *less* the inset, so every zone was shifted
   inward: the cursor hitbox missed the right and bottom margins, and a press in
@@ -116,19 +122,20 @@ guessed differently.
 ## The remote desktop helper
 
 `remote/` (`pulseterm-remote`) is a second program, built only with
-`cargo build -p pulseterm-remote`, and so far **Linux only**: its full
-keyboard takeover is an evdev grab, its font lookup is `fc-match`, and its
-build has only ever run here. Building it needs the moonlight-common-c
+`cargo build -p pulseterm-remote`. It streams from Linux only so far: its
+full keyboard takeover is an evdev grab. It does **build and open on
+Windows** too (2026-11-03; `REMOTE_DESKTOP.md`, *Building on Windows*), with
+a Windows font lookup in place of `fc-match`. Building it needs the moonlight-common-c
 submodule and system packages -- see `REMOTE_DESKTOP.md` (status, packages,
 and the `dnf swap` trap). PulseTerm itself does not depend on it.
 
 ## Windows: check this on the next Windows build
 
-Everything since the Linux port began was compiled and run **only on Linux**
-(Fedora, niri/Wayland). No Windows compiler exists on that machine, and the
-C parts of the build (tree-sitter grammars) need one even to type-check, so
-nothing below has been compiled for Windows. Most of it is shared code that
-behaves the same on both; the list says which parts are not.
+Everything since the Linux port began was written on Linux (Fedora,
+niri/Wayland), where no Windows compiler exists. **It has now been built and
+run on Windows once (2026-11-03)**; the checklist at the end of this section
+records what that run found. Most of it is shared code that behaves the same
+on both; the list says which parts are not.
 
 **Edited Windows-only code, unverified -- check these compile first**
 
@@ -174,22 +181,68 @@ Windows keeps painting the ground there as before).
 * Anything opened with no session starts a local one (ConPTY on Windows).
 * Keyboard focus is pulled back into the workspace whenever it escapes.
 
-**Checklist for the first Windows run**
+**Checklist for the first Windows run** -- run 2026-11-03 on Windows 11
+(MSVC toolchain, see CLAUDE.md), by driving the real app
 
-- [ ] `cargo check` and `cargo build --release` (needs `fxc.exe`, see CLAUDE.md).
-- [ ] `cargo test` -- 38 on Linux; the 6 `unix_pty` tests do not exist on
-      Windows, so expect 32.
-- [ ] Drag the nav bar: the window moves, Aero Snap works; double-click
-      maximises and restores; minimise / maximise / close buttons act.
-- [ ] Exactly one titlebar (ours); the system one stays hidden.
-- [ ] Local terminal opens (ConPTY); `exit` marks the header `-- exited`.
-- [ ] File tree -> terminal icon opens a shell in that folder (`cd` shows it).
-- [ ] Settings -> Appearance -> *System* follows the Windows light/dark mode.
-- [ ] Keys page: record a new chord, it works, restore defaults.
-- [ ] A translucent window (opacity below 100) still has one layer of ground
-      everywhere, and the font list stays opaque.
-- [ ] The remote desktop icon stays hidden (the helper is not ported to
-      Windows yet -- `REMOTE_DESKTOP.md`, *Where it stands*).
+- [x] `cargo check` clean; `cargo build --release` builds (36 MB, ~10 min).
+      Startup to a visible window, release: **~700 ms warm, 1231 ms cold** --
+      the same as before the port (720 / 1258), so nothing added on Linux
+      touched the first frame.
+- [x] `cargo test` -- 37 passed, as predicted (38 after the Windows-path test
+      added in the same run).
+- [x] Drag the nav bar: the window moves by exactly the drag (the OS move
+      loop); minimise / maximise / restore / close buttons act.
+      **Double-click did nothing -- fixed**: the press posted `SC_MAXIMIZE`
+      while gpui still held the mouse capture and Windows dropped it; it now
+      toggles on the release (`window_controls`, `ZOOM_ON_RELEASE`).
+- [x] Exactly one titlebar (ours).
+- [x] Local terminal opens (ConPTY, PowerShell); typing, colour, pty size,
+      Ctrl+C in `ping -t`; `exit` marks the header `-- exited`.
+- [x] File tree -> terminal icon opens a shell in that folder.
+- [x] Settings -> Appearance -> *System* resolves to Ink in Windows dark mode.
+      Live switching was not tried (it means changing the OS setting).
+- [x] Keys page: recorded `^⇧Y` for New column, it worked and `^⇧T` stopped;
+      Restore defaults put it back.
+- [~] Translucent window: the font list stays opaque; the ground looked even,
+      but against a busy desktop one-layer-vs-two could not be judged closely.
+- [ ] The remote desktop icon on an SSH session -- not tried (no host
+      password here). Hidden on local sessions, as designed.
+
+**Found on Windows in that run, and fixed**
+
+* **Paths split on `/` only.** A local Windows path's file name was the whole
+  path: editor windows were titled `D:\Projects\...\build.rs`, and the file
+  tree's **paste pasted beside the original** (`build.rs (1)`) instead of into
+  the folder, because the whole absolute path reached `Path::join`. `editor`,
+  `preview` and `explorer` now split on both separators; a test covers it.
+* **Clicking the caption or the bar took the keyboard from the shell.** The
+  root tracks the workspace focus handle, so a press there focused the root,
+  and the focus keeper accepted that. Keys typed after dragging the window
+  were lost. The keeper now also corrects focus on the bare root. Not
+  Windows-specific.
+* **The overview ignored escape, enter and the arrows.** It focused the root,
+  but its `Overview` key context is on a child, and gpui looks for bindings
+  upward from the focused element. It has its own focus handle now, and
+  `focus_active_item` returns to it while it is open (dismissing the command
+  bar over it used to strand focus on an undrawn terminal). Not
+  Windows-specific.
+* **The close dialog called the local session "still connected".** It now
+  names only the SSH hosts the guard counts (`live_hosts`).
+
+**Found, not fixed**
+
+* `--working-directory` with `-e` fails (`cd '...' && exec ...` is POSIX).
+  `-e` alone and `--working-directory` alone both work. Needs a
+  command-in-a-directory `PtyProgram`.
+* Home's *This computer* says `cmd` while the shell is PowerShell: with no
+  shell set it reads `%ComSpec%`, while `local::default_shell` takes the first
+  of pwsh / powershell / cmd that exists. Matching it costs a few file checks
+  on the first frame.
+* Pressing a partly hidden window's header to drag it focuses it, the strip
+  slides to show it, and the drop lands under a pointer that has moved.
+* Cosmetic: the Plugins folder path runs into `0 INSTALLED`; at 16px the Keys
+  page wraps chord chips; a symbol font (Marlett) is listed and draws its own
+  name as icons; the command bar's password field shows "type to filter".
 
 ---
 
@@ -203,8 +256,10 @@ shipping without Linux support.
    a scan. Work that needs the disk starts on `cx.background_executor()` and
    swaps its result in when it lands. Windows measures **720 ms warm / 1258 ms
    cold** to a visible window in release, of which our own code is under 10 ms.
-   Linux must not be worse. **Section 5 names the one place this is already at
-   risk on Linux** — read it before touching `theme.rs`.
+   Linux must not be worse. Section 5 named font enumeration as the one risk
+   on Linux; Status found it is probably not one (gpui fills the font database
+   before our callback), and debug builds print `[startup] theme::apply` to
+   prove it either way.
 2. **No secret is ever written to disk** — not passwords, not passphrases, not
    in `profiles.json`, `session.json` or anywhere else. The command bar holds a
    secret in memory only until it is handed to `russh`, then clears the field.
@@ -265,9 +320,10 @@ changes): navigation bar `line_height + 26`, window header `line_height + 8`,
 list row `line_height + 10`, hairline 1px, **corner radius 0 — always**,
 **shadow none — ever**, 8px grid rhythm.
 
-**Type scale**: two sizes only — `micro` (`font_size * 0.72`, tracked out at
-0.18em, used for every uppercase label) and the theme's own `font_size` for
-everything else, terminal grid included. gpui has no letter spacing, so the
+**Type scale**: `micro` (`font_size * 0.72`, tracked out at 0.18em, used for
+every uppercase label) and the theme's own `font_size` for everything else,
+terminal grid included -- plus `head()` and `display()`, the heading and
+numeral sizes that only home and Settings use. gpui has no letter spacing, so the
 tracking is spelled into the string (`kit::spaced` / `kit::label`).
 
 Frames worth opening before changing any screen: **05 Overview**,
@@ -672,7 +728,7 @@ Same as on Windows, from `CLAUDE.md`:
 ```bash
 cargo run                  # build and launch; this is how it is normally tested
 cargo check                # after any src/**.rs change
-cargo test                 # 28 unit tests, none of them need a window
+cargo test                 # 43 unit tests on Linux, none of them need a window
 cargo build --release      # target/release/PulseTerm
 ```
 
@@ -732,8 +788,8 @@ What to watch for on Linux specifically:
 ## 6. Test checklist
 
 Unit tests cover the session file, the syntax queries, preview detection, tab
-titles, the plugin catalogue and the motion curves — 28 of them, none needing a
-window. Everything below is by hand, because there is no UI test.
+titles, the plugin catalogue, the motion curves, the pty, the launch
+arguments and more — 43 of them on Linux, none needing a window. Everything below is by hand, because there is no UI test.
 
 **Local terminal (the new code)**
 
@@ -755,7 +811,7 @@ window. Everything below is by hand, because there is no UI test.
 - [ ] Drag the nav bar moves the window; double-click maximises and restores.
 - [ ] Minimise, maximise and close buttons all act.
 - [ ] Resize from every edge and corner.
-- [ ] The nav bar on all four edges (Settings → Window → Navigation).
+- [ ] The nav bar on all four edges (Settings → Interface → Navigation bar edge).
 - [ ] Under both X11 and Wayland.
 
 **The rest**
@@ -763,9 +819,9 @@ window. Everything below is by hand, because there is no UI test.
 - [ ] Home screen: the three dials run at their own rates, space continues the last session.
 - [ ] Command bar: filters saved hosts, parses `user@host:port`, asks for a password inline, `del` forgets a host, and **no secret appears in `~/.local/share/PulseTerm/*.json`**.
 - [ ] SSH connect, an SFTP tree, open/edit/save a remote file, upload and download with progress.
-- [ ] The file tree as a column (`ctrl-shift-b`), its footer reading `N ITEMS` / `LOCAL`.
+- [ ] The file tree docked beside the strip (`ctrl-shift-b`), its footer reading `N ITEMS` / `LOCAL`.
 - [ ] The overview (`ctrl-shift-space`) with terminal thumbnails.
-- [ ] Motion: the strip **slides** when focus moves; a dragged seam stays under the pointer; Settings → Window → Motion switches it off, changes the duration and the curve.
+- [ ] Motion: the strip **slides** when focus moves; a dragged seam stays under the pointer; Settings → Tiling switches it off, changes the duration and the curve.
 - [ ] Session restore: a local workspace comes straight back at launch.
 - [ ] Font size `ctrl-=` / `ctrl--` / `ctrl-0` reflows terminals and the whole UI.
 - [ ] Ink and Paper both look like frames 01 and 10.

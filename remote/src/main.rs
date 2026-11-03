@@ -13,6 +13,13 @@
 //! One window, one toolkit (SDL3): the setup screen before a stream, the
 //! stream with a sidebar during one (`app`).
 
+// A release PulseTerm has no console, and Windows gives a console program
+// started from one a console window of its own -- so without this, every
+// remote desktop opened from a release build came with a black window. The
+// stdin/stdout pipe PulseTerm talks over does not need a console. Debug keeps
+// one for the stderr log, as PulseTerm does.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 mod app;
 mod bridge;
 mod config;
@@ -89,6 +96,12 @@ fn main() {
         #[cfg(target_os = "linux")]
         SDL_SetHint(c"SDL_VIDEO_DRIVER".as_ptr(), c"wayland,x11".as_ptr());
         SDL_SetHint(c"SDL_APP_ID".as_ptr(), c"pulseterm-remote".as_ptr());
+        // On Windows the keyboard grab is a low-level hook, and SDL lets
+        // Alt+Tab through it by default; the full keyboard means the host gets
+        // that too. Ctrl+Alt+Del and Win+L are Windows' own and no program
+        // can take them -- the Ctrl+Alt+Shift hotkeys stay the way back.
+        #[cfg(windows)]
+        SDL_SetHint(c"SDL_ALLOW_ALT_TAB_WHILE_GRABBED".as_ptr(), c"0".as_ptr());
         if !SDL_Init(SDL_INIT_VIDEO) {
             eprintln!("pulseterm-remote: SDL could not start: {}", std::ffi::CStr::from_ptr(SDL_GetError()).to_string_lossy());
             std::process::exit(1);

@@ -45,8 +45,8 @@ pub fn caption_drag(window: &Window, event: &MouseMoveEvent) {
 }
 
 /// The caption button came up without a drag.
-pub fn caption_release() {
-    platform::caption_release();
+pub fn caption_release(window: &Window) {
+    platform::caption_release(window);
 }
 
 /// A completed click on the caption; only a double-click means anything.
@@ -77,11 +77,17 @@ mod platform {
         /// When and where the last caption press landed, for our own
         /// double-click detection. Only touched from the UI thread.
         static LAST_PRESS: Cell<Option<(Instant, POINT)>> = const { Cell::new(None) };
+        /// A double-click seen on the press, waiting for its release.
+        static ZOOM_ON_RELEASE: Cell<bool> = const { Cell::new(false) };
     }
 
     pub fn caption_press(window: &Window) {
+        // The toggle waits for the release. Posted from here, while gpui
+        // still holds the mouse capture it took for this press, Windows
+        // drops `SC_MAXIMIZE` and the double-click does nothing -- the
+        // maximise button works because it acts on click, after release.
         if is_double_click() {
-            toggle_maximize(window);
+            ZOOM_ON_RELEASE.with(|cell| cell.set(true));
             return;
         }
 
@@ -169,11 +175,15 @@ mod platform {
         }
     }
 
-    // The drag, the release and the double-click all happen inside the
-    // `SC_MOVE` loop, so the Linux half of the caption API has nothing to do
-    // here -- and Windows has no window menu worth opening from it.
+    // The drag happens inside the `SC_MOVE` loop, so the Linux half of the
+    // caption API has little to do here: the release finishes a double-click,
+    // and Windows has no window menu worth opening from the caption.
     pub fn caption_drag(_: &Window, _: &gpui::MouseMoveEvent) {}
-    pub fn caption_release() {}
+    pub fn caption_release(window: &Window) {
+        if ZOOM_ON_RELEASE.with(|cell| cell.replace(false)) {
+            toggle_maximize(window);
+        }
+    }
     pub fn caption_click(_: &Window, _: usize) {}
     pub fn caption_menu(_: &Window, _: gpui::Point<gpui::Pixels>) {}
 }
@@ -203,7 +213,7 @@ mod platform {
         }
     }
 
-    pub fn caption_release() {
+    pub fn caption_release(_: &Window) {
         ARMED.store(false, Ordering::Relaxed);
     }
 

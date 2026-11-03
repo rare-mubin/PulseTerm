@@ -467,7 +467,11 @@ impl App {
             self.grab = None;
         }
         let retry = self.grab_denied.is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
-        if want && self.grab.is_none() && retry {
+        // Linux only: on Windows SDL's keyboard grab below is already a
+        // low-level keyboard hook that takes every key a program may take,
+        // with no permission to ask for -- so there is no evdev grab to try,
+        // nothing is ever denied, and the udev notice never shows.
+        if cfg!(target_os = "linux") && want && self.grab.is_none() && retry {
             match Grab::start(self.hotkey_event, self.heartbeat.clone(), self.epoch) {
                 Ok(g) => {
                     self.grab = Some(g);
@@ -478,8 +482,9 @@ impl App {
             }
         }
 
-        // Otherwise the compositor's shortcut inhibit: most keys reach the
-        // host, but niri still sees its Mod (Alt+drag).
+        // Otherwise SDL's own keyboard grab. On Linux that is the
+        // compositor's shortcut inhibit: most keys reach the host, but niri
+        // still sees its Mod (Alt+drag). On Windows it is the whole answer.
         let inhibit = want && self.grab.is_none();
         if inhibit != self.keyboard_grabbed {
             self.keyboard_grabbed = inhibit;

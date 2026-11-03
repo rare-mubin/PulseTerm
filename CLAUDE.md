@@ -4,11 +4,13 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-PulseTerm: a GPU-rendered SSH terminal for Windows, built on [gpui](https://gpui.rs)
+PulseTerm: a GPU-rendered SSH terminal for Windows and Linux, built on [gpui](https://gpui.rs)
 (Zed's UI framework). A Linux port is under way -- `LINUX.md` is its handover
 and status, and every Linux-specific arm is `cfg`'d beside the Windows one.
-**Everything since the port began was built on Linux only; `LINUX.md` ->
-"Windows: check this on the next Windows build" lists what to verify.** It talks to a stock `sshd` — terminal sessions are SSH PTY
+**Everything since the port began was written on Linux and has been
+built and run on Windows once (2026-11-03); `LINUX.md` -> "Windows: check
+this on the next Windows build" has that run's results and what is still
+open.** It talks to a stock `sshd` — terminal sessions are SSH PTY
 channels, so there is no remote-side agent, server, or install step. The UI is
 deliberately TUI-shaped: everything is monospace on a fixed cell grid, hairline
 borders instead of shadows and radii, and one navigation bar along an edge of
@@ -45,9 +47,10 @@ shortcuts.
   unit), so it is much slower to build than debug and rebuilds every crate when
   those settings change. It also needs **`fxc.exe`**: release builds compile
   gpui's HLSL shaders ahead of time (debug compiles them at runtime), and gpui
-  only looks in `GPUI_FXC_PATH`, then `PATH`, then the `10.0.26100.0` kit. Here
-  the compiler is `C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\fxc.exe`,
-  so if the build stops with *Failed to find fxc.exe*, set `GPUI_FXC_PATH` to it.
+  only looks in `GPUI_FXC_PATH`, then `PATH`, then the `10.0.26100.0` kit. That
+  kit is the one installed here now, so it is found with nothing set; on a
+  machine with a different SDK version, if the build stops with *Failed to
+  find fxc.exe*, point `GPUI_FXC_PATH` at that kit's `x64\fxc.exe`.
 - `cargo test` -- unit tests only, for the parts that need no window: the
   session file, the syntax queries, preview detection, tab titles, the plugin
   catalogue. There is no end-to-end or UI test; anything involving a window is
@@ -63,21 +66,22 @@ this crate alone are seconds. `[profile.dev.package."*"] opt-level = 2` in
 
 ## Toolchain (Windows-specific, non-obvious)
 
-Rust here is the **GNU** target (`stable-x86_64-pc-windows-gnu`). There is no
-Visual Studio and no MSVC linker on this machine — the MinGW toolchain from
-`BrechtSanders.WinLibs.POSIX.UCRT` is the whole story for compiling and linking.
-The Windows Kits *bin* tools are present, though, and release builds use one of
-them (`fxc.exe`, see Commands).
+Rust here is now the **MSVC** target (`stable-x86_64-pc-windows-msvc`, 1.98),
+with Visual Studio 2022 **Build Tools** (MSVC 14.44) for the linker and for the
+C compiler the tree-sitter grammars and `ring` need, and Windows SDK
+`10.0.26100.0` for `fxc.exe` and `rc.exe`. Checked 2026-11-03: `cargo check`,
+`cargo test` and a debug build all succeed with it.
 
-Zed's own docs require MSVC for gpui on Windows, but gpui 0.2.2 **does** build,
-link, and run on windows-gnu — this was verified before the project was started,
-with a minimal window under the DirectX renderer. Don't switch the default
-toolchain to MSVC on the assumption that it's required; it isn't, and MSVC isn't
+It used to be the **GNU** target with MinGW (`BrechtSanders.WinLibs`) and no
+Visual Studio at all, and gpui 0.2.2 builds, links and runs on windows-gnu as
+well -- so either works, whatever Zed's docs say about requiring MSVC. MinGW's
+gcc is still on this machine (`D:\Apps\mingw64`), but no GNU Rust toolchain is
 installed. `~/.cargo/bin` is not on `PATH` in a fresh shell here.
 
 `russh` is pinned to `default-features = false, features = ["ring", "flate2",
-"rsa"]` — the `ring` crypto backend is pure Rust; the default `aws-lc-rs` one
-needs a C toolchain that doesn't exist here.
+"rsa"]` — the `ring` crypto backend needs only a C compiler; the default
+`aws-lc-rs` one also wants CMake and NASM, and there is no reason to take that
+on.
 
 ## Architecture
 
@@ -216,7 +220,7 @@ under the pointer. Derived, not stored: a stretched column keeps its own
 width and glides back to it when another column arrives.
 
 **Stacked windows resize at the boundary between them** (`Pane::resize_row`,
-a 7px `RowSeam` band like the column seams). Each window's share is a flex
+an 11px `RowSeam` band like the column seams). Each window's share is a flex
 weight keyed by `ItemId`, so it follows the window through moves and closes;
 the drag is absolute against the two windows' combined span. Weights are not
 saved in the session file -- a restored stack comes back even.
@@ -380,7 +384,7 @@ terminal grid is the content, and content that slides around is content you
 cannot read.
 
 **Off is a setting, not a degraded mode.** `Settings::animations`,
-`animation_ms` and `animation_curve` (Settings -> Window -> Motion) are the
+`animation_ms` and `animation_curve` (Settings -> Tiling) are the
 only inputs; with the switch off every `sample` returns its target and
 `Entrance::progress` returns 1, which is exactly what the app did before this
 module. So a page multiplies by the progress unconditionally and never asks
@@ -401,9 +405,10 @@ strip of its own along an edge is the thing this section exists to refuse.
 `nav_bar::render` is a free function against the workspace, like the old status
 bar: everything it draws already lives on the workspace or in a global, so a
 view of its own would only add a subscription to keep in sync. The order along
-the bar is mark, actions, separator, session state, strip read-out, a gap that
-drags like a caption, clock, window buttons -- identity, then what you can do,
-then where you are, then the window itself.
+the bar is mark, actions, separator, session state (or, from two sessions on,
+one entry per session), strip read-out, a gap that drags like a caption,
+disconnect, clock, window buttons -- identity, then what you can do, then
+where you are, then the window itself.
 
 * **`thickness` is derived from the type, not a constant** (`line_height +
   26px`), so the bar keeps its proportion rather than its pixel size when the
@@ -661,8 +666,8 @@ depth-first at render time.
 chevron) expands a folder in place — it calls `cx.stop_propagation()` or the row
 handler underneath would also fire; single-clicking a row selects; double-clicking
 a folder *navigates*, making it the new root, which is what gives the path bar
-something to say. Double-clicking a file emits `OpenFile`, which nothing consumes
-yet.
+something to say. Double-clicking a file emits `OpenFile`, which the workspace routes
+to an editor or a preview (see *Preview tabs*).
 
 Rename and create share one input (`Editing`): renaming swaps a row's label
 for it, creating inserts a blank row in the target directory. Creating inside a
@@ -725,7 +730,8 @@ boxed-future `Task` alias — `async fn` cannot call itself.
 ### Command bar (`ui/command_bar.rs`)
 
 **One line and a list, and it is the only modal in the app.** `ui/connections.rs`
-is gone: a connect dialog with labelled fields for host, port, username, auth
+is retired -- no longer a module; the file is still in the tree, unreferenced,
+and can be deleted: a connect dialog with labelled fields for host, port, username, auth
 kind, key path and password was a form to fill in before you could reach a
 shell, and four of those six fields were already known from the profile you
 were about to click. The bar replaces it with what every other part of this app
@@ -777,8 +783,11 @@ pane). Connecting is a short modal act and shouldn't cost a permanent tab.
 `SettingsView` needs no events at all: every control writes through
 `Settings::update` (see "Settings and theming" below).
 
-Disconnect closes terminal tabs only (`Pane::close_items_of_kind`); a Settings
-tab is not tied to a session and survives.
+Disconnect with other sessions open drops the whole session and shows its
+neighbour (see *Sessions*). Disconnecting the last one closes its terminals,
+editors and previews (`Pane::close_items_of_kind`) -- an editor left open
+could never save again -- and a Settings tab, which is not tied to a host,
+survives.
 
 ### Overview (`ui/overview.rs`)
 
@@ -849,8 +858,9 @@ Three rules keep a restore from doing harm:
   still `Some`: otherwise the first frame after launch would replace last run's
   layout with the empty workspace that is about to load it.
 
-A saved `SavedItem::Files` window has its directory queued
-(`ExplorerView::restore`) *before* the connection is published, because
+The docked tree's saved directory (`Session::explorer`, or an older file's
+`SavedItem::Files` window) is queued (`ExplorerView::restore`) *before* the
+connection is published, because
 `set_connection` leaves for the home directory the instant it has one.
 
 **The save is driven from `render`, and that is not laziness.** `cx.observe` on
@@ -961,7 +971,7 @@ mode that avoids it, so the fix is structural (`Theme::translucent`):
   window on it already did, and the strip is never left part-empty, so its
   ground was a second layer under every window (74% over 74% reads as 93%:
   windows came out near-solid beside a see-through bar). It keeps one on an
-  opaque window, as the safety net. The 7px seam bands paint nothing — the
+  opaque window, as the safety net. The 11px seam bands paint nothing — the
   columns either side of them already did, and a band with a ground would
   stack over one of them.
 * Anything nested inside those paints no ground: terminal, editor, the Settings
@@ -978,14 +988,15 @@ as a safety net under any region that forgets to. The appearance change is
 `cx.defer`red, because `apply` runs inside a window update and a window can't be
 re-entered from its own update.
 
-Every single-line field (connect form, explorer path bar, rename/create row) is
+Every single-line field (command bar, home's connect field, explorer path bar,
+rename/create row) is
 gpui-component's `Input`, built through `ui::text_field::text_input`, which only
 sets the size. It replaced a hand-rolled field that drew its text as plain
 children — a long value ran out of the box over the buttons beside it, and there
 was no selection or clipboard. Three things differ from what that field did:
 
 * **Escape raises no event.** `InputState` just lets the key propagate. gpui then
-  tries the next matching binding (so the popup's `Connections` Escape still
+  tries the next matching binding (so the `CommandBar` Escape still
   dismisses), and after that runs key-down listeners — which is how the explorer
   catches it, with an `on_key_down` on the div wrapping each field.
 * **`set_value` needs a `&mut Window`.** `ExplorerView::navigate` is reached from
@@ -1012,7 +1023,9 @@ to clear it on.
 under different conditions. Don't assume state set by one is valid to the other.
 
 (This bit the old split tree hardest, where every pane previewed a drop. The
-strip has one drag left — a column seam — and it is the resize case below.)
+strip has it again: dragging a window by its header previews a `DropZone` on
+whichever window it is over, by exactly these rules. The seams are the resize
+case below.)
 
 ## Resize handles: use `on_drag_move`, never `on_mouse_move`
 
@@ -1041,7 +1054,7 @@ Two consequences of that route:
 position.** `DragMoveEvent::bounds` is the handle's bounds as of the *last
 paint*, and several mouse moves can arrive before the next one. Correcting
 against the same stale position each time overshoots, and the handle visibly
-jitters under a fast drag. The one handle left therefore measures against a
+jitters under a fast drag. Every handle therefore measures against a
 fixed reference: a column seam sets its column's width to `cursor.x` less that
 column's own left edge, which `Strip::resize_column` works out from the strip's
 recorded `bounds`, the scroll offset and the widths to the left of it. `canvas`
@@ -1077,7 +1090,7 @@ the mouse-down, and grabbed the focus while the seam started resizing.
 (`Strip::resize_column`): its right edge stays put, its left edge follows the
 pointer, and the left neighbour gives or takes the difference -- the one case
 where a seam changes two widths, because a left edge cannot move otherwise. The window's outer edges come
-from the navigation bar. Over that line sits a 7px
+from the navigation bar. Over that line sits the 11px
 transparent band that is the entire hitbox — the neighbours are mouse-hungry (a
 terminal reports clicks to the remote program, an editor starts a selection), so
 a press a pixel off the seam lands in a column and reads as "it doesn't move".
@@ -1283,7 +1296,7 @@ that fails to load falls through to the built-in instead of leaving the file
 plain.
 
 The folder is `Settings::plugins_dir` (empty, or a path that no longer exists,
-means the default beside the other stores). Settings -> General has the picker.
+means the default beside the other stores). Settings -> Interface -> Plugins folder is the picker.
 
 ## Entity leases: the rule that will bite you
 
@@ -1442,9 +1455,11 @@ docs:
   as our PascalCase, plus `close` → `X`, the one name it spells differently from
   Lucide. Without it the editor's search bar renders blank.
 
-Its `Input` context binds `ctrl-shift-e` (select to end of line), which shadows
-our Split Down while an editor has focus. Deliberately left alone: that's the
-editor doing editor things, and Split Down still works everywhere else.
+Its `Input` context binds `ctrl-shift-e` (select to end of line). That once
+shadowed a Split Down command; stacking is `^⇧D` now and nothing of ours is on
+`ctrl-shift-e`, so the binding takes nothing away. Check any new app shortcut
+against gpui-component's `Input` bindings, which win while an editor has
+focus.
 
 Files load whole and are refused over 5 MB or when not UTF-8 — a binary opened as
 text is destroyed by the first save. Save truncates and rewrites in place: SFTP v3
