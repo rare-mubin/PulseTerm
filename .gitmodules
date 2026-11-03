@@ -1,0 +1,3 @@
+[submodule "remote/third_party/moonlight-common-c"]
+	path = remote/third_party/moonlight-common-c
+	url = https://github.com/moonlight-stream/moonlight-common-c
