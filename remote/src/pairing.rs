@@ -464,7 +464,7 @@ mod tests {
 
         let attempt = |wrong: bool| -> Result<bool, String> {
             let bridge = Bridge::local();
-            let instance = block_on(crate::sunshine::start(
+            let (instance, _displays) = block_on(crate::sunshine::start(
                 &bridge,
                 crate::sunshine::DEFAULT_PORT,
                 Some("kms"),

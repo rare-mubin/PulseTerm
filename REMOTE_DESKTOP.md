@@ -75,12 +75,13 @@ Decided next (2026-11-02), following the recommendations below:
 
 **Next, in the order agreed**
 
-1. **Zero-copy decode** (VA-API surface → dmabuf → EGL texture): decode
-   measured ~10 ms a frame on cachyos with the copy path; the main client-side
-   delay, and what stands between this and 1440p/4K/120 fps.
-2. **Resolution from the window** ("window" and "native" give 1080p today).
-3. **Choosing the host's display** (Sunshine streams the first; cachyos has
-   two).
+1. ~~Zero-copy decode~~ -- **done**: decode 10.4 → 5.3 ms a 1080p HEVC
+   frame against cachyos, colours checked (*Zero-copy display* under
+   Progress).
+2. ~~Resolution from the window~~ -- **done**, checked against cachyos
+   (*Resolution "window"* under Progress).
+3. ~~Choosing the host's display~~ -- **done**, checked against cachyos
+   (*Choosing the display* under Progress).
 4. **Windows port of the helper** (keyboard grab, font lookup, build) -- it
    has only ever been built on Linux.
 
@@ -490,6 +491,76 @@ needs under that cap; a desktop or a still page compresses far below it.
 The sidebar now shows the cap for the picture beside the setting and the
 **received** video bitrate (`decoder::VIDEO_BYTES`, whole frames before
 decoding) beside the frame rate.
+
+**Zero-copy display (2026-11-03).** The copy path downloads each VA-API
+surface to memory, copies it again and uploads it to an SDL texture: ~10 ms a
+1080p frame measured on this client. `stream/zerocopy.rs` keeps the frame on
+the GPU instead: the decoder maps the surface to DRM PRIME
+(`av_hwframe_map`, `extra_hw_frames = 4` so the frame on screen is never
+recycled under it), the window imports the Y and CbCr planes as EGL images
+(`EGL_EXT_image_dma_buf_import`, with the format modifier) bound to two GL
+textures, and SDL draws them as one NV12 texture it was handed
+(`SDL_PROP_TEXTURE_CREATE_OPENGL_TEXTURE_NUMBER` / `_UV_NUMBER`). The window
+asks SDL for OpenGL over EGL (`SDL_VIDEO_FORCE_EGL`, then the `opengl`
+renderer, falling back to SDL's own choice). Any missing piece -- another
+renderer, no dma-buf import, a 10-bit layout, a failed import -- logs why and
+returns to the copy path for the rest of the stream (measured against
+cachyos, 1080p60 HEVC: decode 10.4 → 5.3 ms a frame); stderr says
+`zero-copy display on` or `off (why)`. A frozen picture during a rejoin keeps
+the importer alive with it. SDL's NV12 shader reads chroma as luminance-alpha (Cr from alpha), so the CbCr texture swizzles alpha from green -- without it every picture came out red (seen on the first run). Both paths now draw in BT.709 limited, which is
+what `connect` asks the host for; the copy path used SDL's YUV default
+(BT.601) before, shifting reds and greens slightly.
+
+**Resolution "window" (2026-11-03).** The default resolution now streams at
+the window's own size in real pixels (HiDPI included), so the picture is
+drawn 1:1 instead of a fixed 1080p scaled to fit: sharper, and the host
+encodes no detail the scaling would throw away. `window_resolution` caps it
+at 4K keeping the window's shape, floors it at 640x360, and rounds each side
+down to a multiple of 8 (encoders work in blocks; NVENC refuses odd sizes).
+Sunshine scales the host's desktop into that size and pads the difference
+in shape, so a tall window gets a tall stream with bars, not a stretched
+desktop. A resize or fullscreen mid-stream rejoins at the new size through
+the same debounce as a settings change, so a drag rejoins once, at its end;
+the auto bitrate scales with the pixel count. "native" (never offered in the
+UI) is treated as "window".
+
+**The "network" reading is not the network (2026-11-03).** The sidebar's
+network figure is ENet's round trip on the control channel
+(`LiGetEstimatedRttInfo` → `peer->roundTripTime`): the time until the host's
+Sunshine acknowledges a control message. It read ~40 ms steady against both
+cachyos and orion, while plain pings were 1.9 ms laptop → host *during* the
+stream and 2.5 ms host → laptop (so Wi-Fi power save, ruled out separately by
+switching it off, is not it either). Moving the mouse lifts it 10-20 ms, as
+Sunshine handles input on that same thread (`control_server_t::iterate`, one
+event per call, 150 ms wait). The video and audio travel on their own UDP
+streams with no acknowledgements, so the 40 ms is not in the picture's path.
+Where in the ack path it comes from was not pinned down: ENet acknowledges
+before dispatching on both ends in the code read. `PULSETERM_REMOTE_STATS=1`
+in PulseTerm's environment logs every reading to stderr every two seconds,
+which is how this was measured. The sidebar now labels it "control", not "network".
+
+**Frames skipped while the mouse moved (2026-11-03).** Stats showed 60 frames
+decoded but only 42-55 shown while the mouse moved. The window redrew on every
+event, and with vsync each draw waits for a screen refresh, so motion spent
+refreshes redrawing an unchanged picture while the next video frame replaced
+the one not yet shown. While streaming with the sidebar closed, motion alone
+no longer redraws: a draw happens when a frame is waiting
+(`stream::frame_waiting`), on any other event, and at least every 100 ms (the
+edge arrow).
+
+**Choosing the display (2026-11-03).** Sunshine lists the host's displays in
+its log while starting, before it listens -- KMS as `Monitor 0 is eDP-1: AU
+Optronics - 0xB98C - eDP-1` (read off cachyos), X11 and wlroots as `Detected
+display: HDMI-0 (id: 1) connected: true`. `sunshine::start` greps that list
+once the instance is ready (`parse_displays`: both formats, connected only,
+each name once) and the sidebar's host section offers a **Display** row --
+auto plus each connector -- when there is more than one, with the make and
+model under it. The choice is saved per host as the connector name, which
+Sunshine's docs recommend for `output_name` because the index can change
+between reboots, and it is part of `Tuning`, so it applies through "Apply ·
+restarts Sunshine" like the CPU settings. The name reaches a shell script on
+the host, so only letters, digits and `-_.` pass (`safe_display`); anything
+else is dropped, both on load and when writing the config.
 
 **Where sound plays (2026-11-03).** *Audio: this PC / host / both*
 replaces the on/off switch (`StreamConfig::sound`). It drives two things:

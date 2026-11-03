@@ -34,6 +34,54 @@ pub struct Tuning {
     pub audio: bool,
     /// Every encoder's low-latency settings (only the one in use matters).
     pub low_latency: bool,
+    /// Which of the host's displays to stream (`output_name`, a connector
+    /// name such as `HDMI-A-1`); empty lets Sunshine pick.
+    pub display: String,
+}
+
+/// One of the host's displays, as Sunshine listed it while starting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Display {
+    /// The connector name -- `eDP-1`, `HDMI-A-1`, `DP-0` -- which is what
+    /// `output_name` takes, and stable across reboots, unlike the index.
+    pub name: String,
+    /// What is plugged in there, when Sunshine says (KMS does): make and model.
+    pub model: String,
+}
+
+/// Whether `name` is safe to write into Sunshine's config through a shell
+/// script: connector names are letters, digits and `-_.`; anything else is a
+/// hand-edited settings file and is ignored rather than passed to the host.
+pub fn safe_display(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 32 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// The displays in Sunshine's startup log. Two formats: KMS writes
+/// `Monitor 0 is eDP-1: AU Optronics - 0xB98C - eDP-1`, X11 and wlroots
+/// `Detected display: HDMI-0 (id: 1) connected: true` (only connected ones are
+/// kept). The list is printed more than once per run; each name appears once.
+pub fn parse_displays(log: &str) -> Vec<Display> {
+    let mut found: Vec<Display> = Vec::new();
+    for line in log.lines() {
+        let entry = if let Some(rest) = line.split("Monitor ").nth(1).filter(|r| r.contains(" is ")) {
+            // "0 is eDP-1: AU Optronics - 0xB98C - eDP-1"
+            let after = rest.split_once(" is ").map(|(_, a)| a).unwrap_or("");
+            let (name, model) = after.split_once(':').unwrap_or((after, ""));
+            let model = model.trim().rsplit_once(" - ").map(|(m, _)| m).unwrap_or(model.trim());
+            Some((name.trim().to_string(), model.replace(" - ", " ")))
+        } else if let Some(rest) = line.split("Detected display: ").nth(1) {
+            // "HDMI-0 (id: 1) connected: true"
+            rest.trim_end().ends_with("connected: true").then(|| (rest.split(' ').next().unwrap_or("").to_string(), String::new()))
+        } else {
+            None
+        };
+        if let Some((name, model)) = entry {
+            if safe_display(&name) && !found.iter().any(|d| d.name == name) {
+                found.push(Display { name, model: model.trim().to_string() });
+            }
+        }
+    }
+    found
 }
 
 impl Tuning {
@@ -44,6 +92,7 @@ impl Tuning {
             fec: config.fec,
             audio: config.audio,
             low_latency: config.latency == "low",
+            display: config.display.clone(),
         }
     }
 
@@ -51,7 +100,8 @@ impl Tuning {
     /// not count: it mutes here at once, and the host's capture follows the
     /// next time Sunshine starts anyway.
     pub fn restart_needed(&self, wanted: &Tuning) -> bool {
-        (&self.preset, self.threads, self.fec, self.low_latency) != (&wanted.preset, wanted.threads, wanted.fec, wanted.low_latency)
+        (&self.preset, self.threads, self.fec, self.low_latency, &self.display)
+            != (&wanted.preset, wanted.threads, wanted.fec, wanted.low_latency, &wanted.display)
     }
 
     fn lines(&self) -> String {
@@ -67,7 +117,8 @@ impl Tuning {
             ""
         };
         let preset = if self.low_latency { "ultrafast" } else { self.preset.as_str() };
-        low.to_string() + &format!(
+        let display = if safe_display(&self.display) { format!("output_name = {}\n", self.display) } else { String::new() };
+        low.to_string() + &display + &format!(
             "sw_preset = {}\nsw_tune = zerolatency\nmin_threads = {}\nfec_percentage = {}\nstream_audio = {}\n",
             preset,
             self.threads,
@@ -186,7 +237,7 @@ pub struct Instance {
     pub port: u16,
 }
 
-pub async fn start(bridge: &Bridge, port: u16, capture: Option<&str>, tuning: &Tuning) -> Result<Instance, String> {
+pub async fn start(bridge: &Bridge, port: u16, capture: Option<&str>, tuning: &Tuning) -> Result<(Instance, Vec<Display>), String> {
     let prepared = bridge.exec(&prepare_script(port, capture, tuning)).await?;
     if prepared.status != Some(0) {
         return Err(format!("could not prepare Sunshine's config: {}", prepared.stderr.trim()));
@@ -194,7 +245,15 @@ pub async fn start(bridge: &Bridge, port: u16, capture: Option<&str>, tuning: &T
     let handle = bridge.spawn(&run_script()).await?;
     let ready = bridge.exec(&ready_script(port)).await?;
     if ready.status == Some(0) {
-        Ok(Instance { handle, port })
+        // The display list is in the log by now: Sunshine probes its encoders,
+        // and lists the displays doing it, before it listens.
+        let listed = bridge
+            .exec(&format!(r#"{DIR}
+grep -a -E 'Monitor [0-9]+ is |Detected display:' "$D/sunshine.log" | head -n 64"#))
+            .await
+            .map(|out| parse_displays(&out.stdout))
+            .unwrap_or_default();
+        Ok((Instance { handle, port }, listed))
     } else {
         let _ = bridge.kill(handle).await;
         Err(clean_log(&ready.stdout))
@@ -242,6 +301,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn displays_are_read_from_both_log_formats() {
+        let kms = "[2026-11-03 07:09:14.232]: Info: -------- Start of KMS monitor list --------
+[2026-11-03 07:09:14.232]: Info: Monitor 0 is eDP-1: AU Optronics - 0xB98C - eDP-1
+[2026-11-03 07:09:14.232]: Info: Monitor 1 is HDMI-A-1: LG Electronics - 24GL600F - HDMI-A-1
+[2026-11-03 07:09:20.000]: Info: Monitor 1 is HDMI-A-1: LG Electronics - 24GL600F - HDMI-A-1";
+        let d = parse_displays(kms);
+        assert_eq!(d.len(), 2, "listed twice, kept once");
+        assert_eq!((d[0].name.as_str(), d[0].model.as_str()), ("eDP-1", "AU Optronics 0xB98C"));
+        assert_eq!((d[1].name.as_str(), d[1].model.as_str()), ("HDMI-A-1", "LG Electronics 24GL600F"));
+        let x11 = "Info: Detected display: DVI-D-0 (id: 0) connected: false
+Info: Detected display: HDMI-0 (id: 1) connected: true
+Info: Detected display: DP-0 (id: 2) connected: true";
+        let names: Vec<_> = parse_displays(x11).into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["HDMI-0", "DP-0"], "only connected ones");
+    }
+
+    #[test]
+    fn only_a_plain_connector_name_reaches_the_config() {
+        assert!(safe_display("HDMI-A-1"));
+        assert!(!safe_display("x\noutput_name = 1"));
+        assert!(!safe_display("$(reboot)"));
+        let mut t = Tuning { preset: "superfast".into(), threads: 2, fec: 20, audio: true, low_latency: false, display: "DP-1".into() };
+        assert!(t.lines().contains("output_name = DP-1\n"));
+        t.display = "a;b".into();
+        assert!(!t.lines().contains("output_name"));
+    }
+
+    #[test]
     fn shifts_ports_only_when_the_default_is_taken() {
         let mut f = Facts::default();
         assert_eq!(base_port(&f), DEFAULT_PORT);
@@ -253,7 +340,7 @@ mod tests {
 
     #[test]
     fn the_config_is_ours_alone() {
-        let tuning = Tuning { preset: "ultrafast".into(), threads: 4, fec: 10, audio: false, low_latency: false };
+        let tuning = Tuning { preset: "ultrafast".into(), threads: 4, fec: 10, audio: false, low_latency: false, display: String::new() };
         let low = Tuning { low_latency: true, preset: "veryfast".into(), ..tuning.clone() };
         let l = prepare_script(48089, None, &low);
         assert!(l.contains("nvenc_preset = 1\n") && l.contains("amd_usage = ultralowlatency\n"));

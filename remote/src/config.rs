@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamConfig {
-    /// `window` (match the stream window), `native`, `1080`, `1440`, `2160`.
+    /// `window` (the stream window's own pixels; `native`, from older files,
+    /// means the same), `720`, `1080`, `1440`, `2160`.
     pub resolution: String,
     pub fps: u32,
     /// Megabits per second; 0 picks one from resolution and fps.
@@ -51,6 +52,9 @@ pub struct StreamConfig {
     pub threads: u32,
     /// Error-correction data, percent of each frame (`fec_percentage`, 20).
     pub fec: u32,
+    /// The host display to stream, by connector name (`HDMI-A-1`); empty
+    /// lets Sunshine pick.
+    pub display: String,
     // No "keep Sunshine running": PulseTerm's instance is started with `-1`
     // and forgets its pairings on exit, so one left running would be paired
     // with nothing. It lives exactly as long as this window (sunshine.rs).
@@ -76,6 +80,7 @@ impl Default for StreamConfig {
             sw_preset: "superfast".into(),
             threads: 2,
             fec: 20,
+            display: String::new(),
         }
     }
 }
@@ -112,6 +117,9 @@ impl StreamConfig {
         }
         if ![1, 2, 4, 8].contains(&self.threads) {
             self.threads = 2;
+        }
+        if !self.display.is_empty() && !crate::sunshine::safe_display(&self.display) {
+            self.display.clear();
         }
         if ![5, 10, 20].contains(&self.fec) {
             self.fec = 20;

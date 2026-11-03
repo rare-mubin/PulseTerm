@@ -17,6 +17,7 @@ pub mod grab;
 mod audio;
 mod decoder;
 mod keys;
+mod zerocopy;
 
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
@@ -27,7 +28,8 @@ use sdl3_sys::everything::*;
 use serde::{Deserialize, Serialize};
 
 use crate::ui::Ui;
-use decoder::{Layout, Picture, DECODED, DECODE_US, HOST_FRAMES, HOST_US, LATEST, VIDEO_BYTES};
+use decoder::{Frame, Layout, Picture, DECODED, DECODE_US, HOST_FRAMES, HOST_US, LATEST, VIDEO_BYTES, ZERO_COPY};
+use zerocopy::ZeroCopy;
 
 pub use decoder::WAKE;
 
@@ -67,6 +69,10 @@ pub struct Stream {
     pub started: bool,
     texture: *mut SDL_Texture,
     shape: (i32, i32, Layout),
+    /// Zero-copy display, once set up on this window's renderer; `None` with
+    /// `zero_copy_tried` means the copy path (`texture`) is in use.
+    zero_copy: Option<ZeroCopy>,
+    zero_copy_tried: bool,
     /// The picture's rectangle in window points, for mouse positions.
     video: (f32, f32, f32, f32),
     carry: (f32, f32),
@@ -106,6 +112,7 @@ impl Stream {
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         TERMINATED.store(0, Ordering::Relaxed);
         STAGE_FAILED.store(0, Ordering::Relaxed);
+        ZERO_COPY.store(false, Ordering::Relaxed);
         *LATEST.lock().unwrap() = None;
         let connecting = session.clone();
         std::thread::spawn(move || {
@@ -118,6 +125,8 @@ impl Stream {
             started: false,
             texture: null_mut(),
             shape: (0, 0, Layout::Nv12),
+            zero_copy: None,
+            zero_copy_tried: false,
             video: (0.0, 0.0, 0.0, 0.0),
             carry: (0.0, 0.0),
             pending_rel: (0.0, 0.0),
@@ -137,18 +146,32 @@ impl Stream {
 
     /// Whether a picture has been drawn yet.
     pub fn has_picture(&self) -> bool {
-        !self.texture.is_null()
+        self.picture().is_some()
+    }
+
+    /// The texture on screen and its size, from whichever path drew it.
+    fn picture(&self) -> Option<(*mut SDL_Texture, (i32, i32))> {
+        if let Some(t) = self.zero_copy.as_ref().and_then(|z| z.texture()) {
+            return Some(t);
+        }
+        (!self.texture.is_null()).then_some((self.texture, (self.shape.0, self.shape.1)))
     }
 
     /// Hands over the last picture, to stay on screen while the stream is
     /// replaced -- a settings change rejoins the host, and a black window in
     /// between would read as a disconnect.
     pub fn freeze(&mut self) -> Option<Frozen> {
+        if let Some((texture, (w, h))) = self.zero_copy.as_ref().and_then(|z| z.texture()) {
+            // The importer owns the texture and the frame under it; it goes
+            // along with the picture.
+            let keep = self.zero_copy.take();
+            return Some(Frozen { texture, size: (w as f32, h as f32), _zero_copy: keep });
+        }
         if self.texture.is_null() {
             return None;
         }
         let texture = std::mem::replace(&mut self.texture, null_mut());
-        Some(Frozen { texture, size: (self.shape.0 as f32, self.shape.1 as f32) })
+        Some(Frozen { texture, size: (self.shape.0 as f32, self.shape.1 as f32), _zero_copy: None })
     }
 
     /// A connection event. Returns why the stream ended, if it did.
@@ -166,31 +189,59 @@ impl Stream {
     /// Draws the newest picture letterboxed into the window. Returns whether a
     /// new picture arrived.
     pub fn draw(&mut self, ui: &Ui) -> bool {
-        let picture = LATEST.lock().unwrap().take();
-        let fresh = picture.is_some();
         unsafe {
-            if let Some(p) = picture {
-                if self.texture.is_null() || self.shape != (p.width, p.height, p.layout) {
-                    if !self.texture.is_null() {
-                        SDL_DestroyTexture(self.texture);
+            if !self.zero_copy_tried {
+                self.zero_copy_tried = true;
+                match ZeroCopy::new(ui.r) {
+                    Ok(z) => {
+                        eprintln!("pulseterm-remote: zero-copy display on");
+                        self.zero_copy = Some(z);
+                        ZERO_COPY.store(true, Ordering::Relaxed);
                     }
-                    let format = match p.layout {
-                        Layout::Nv12 => SDL_PIXELFORMAT_NV12,
-                        Layout::I420 => SDL_PIXELFORMAT_IYUV,
-                    };
-                    self.texture = SDL_CreateTexture(ui.r, format, SDL_TEXTUREACCESS_STREAMING, p.width, p.height);
-                    self.shape = (p.width, p.height, p.layout);
+                    Err(why) => eprintln!("pulseterm-remote: zero-copy display off ({why}); copying frames"),
                 }
-                upload(self.texture, &p);
             }
-            if !self.texture.is_null() {
-                let (tw, th) = (self.shape.0 as f32, self.shape.1 as f32);
+        }
+        let frame = LATEST.lock().unwrap().take();
+        let fresh = frame.is_some();
+        unsafe {
+            match frame {
+                Some(Frame::Prime(prime)) => {
+                    let shown = self.zero_copy.as_mut().map(|z| z.show(ui.r, prime));
+                    if let Some(Err(why)) = shown {
+                        // Off for the rest of this stream: the decoder copies
+                        // from its next frame on.
+                        eprintln!("pulseterm-remote: zero-copy display failed ({why}); copying frames");
+                        ZERO_COPY.store(false, Ordering::Relaxed);
+                        self.zero_copy = None;
+                    }
+                }
+                Some(Frame::Copied(p)) => {
+                    if self.texture.is_null() || self.shape != (p.width, p.height, p.layout) {
+                        if !self.texture.is_null() {
+                            SDL_DestroyTexture(self.texture);
+                        }
+                        let format = match p.layout {
+                            Layout::Nv12 => SDL_PIXELFORMAT_NV12,
+                            Layout::I420 => SDL_PIXELFORMAT_IYUV,
+                        };
+                        self.texture = video_texture(ui.r, format, p.width, p.height);
+                        self.shape = (p.width, p.height, p.layout);
+                    }
+                    upload(self.texture, &p);
+                    // Frames come by copy from here on; drop a stale import.
+                    self.zero_copy = None;
+                }
+                None => {}
+            }
+            if let Some((texture, (tw, th))) = self.picture() {
+                let (tw, th) = (tw as f32, th as f32);
                 let scale = (ui.width / tw).min(ui.height / th);
                 let (w, h) = (tw * scale, th * scale);
                 self.video = ((ui.width - w) / 2.0, (ui.height - h) / 2.0, w, h);
                 let s = ui.scale;
                 let dst = SDL_FRect { x: self.video.0 * s, y: self.video.1 * s, w: w * s, h: h * s };
-                SDL_RenderTexture(ui.r, self.texture, null(), &dst);
+                SDL_RenderTexture(ui.r, texture, null(), &dst);
             }
         }
         if fresh {
@@ -213,6 +264,14 @@ impl Stream {
             let bytes = VIDEO_BYTES.load(Ordering::Relaxed);
             self.received_mbps = (bytes - self.video_bytes) as f32 * 8.0 / elapsed / 1_000_000.0;
             self.video_bytes = bytes;
+            if std::env::var_os("PULSETERM_REMOTE_STATS").is_some() {
+                // Opt-in diagnostics: one line per two seconds on stderr.
+                let (q, target, gaps, drops, late) = audio_readings();
+                eprintln!(
+                    "pulseterm-remote: stats rtt {network_ms:.0}±{variance} ms · host {host_ms:.1} · decode {decode_ms:.1} · {:.0}/{:.0} fps · {:.1} Mbps · audio {q}/{target} gaps {gaps} drops {drops} late {late}",
+                    self.fps.0, self.fps.1, self.received_mbps
+                );
+            }
             self.latency_tally = (dec_us, host_us, host_n);
             self.tally = (Instant::now(), decoded, self.shown);
         }
@@ -392,6 +451,11 @@ pub fn audio_readings() -> (i32, i32, u64, u64, f32) {
 }
 
 /// Mutes or unmutes the stream's sound here, at once.
+/// Whether a decoded frame is waiting to be drawn.
+pub fn frame_waiting() -> bool {
+    LATEST.lock().unwrap().is_some()
+}
+
 pub fn set_muted(muted: bool) {
     audio::MUTED.store(muted, Ordering::Relaxed);
 }
@@ -400,6 +464,8 @@ pub fn set_muted(muted: bool) {
 pub struct Frozen {
     texture: *mut SDL_Texture,
     size: (f32, f32),
+    /// Set when the picture is a zero-copy import, which owns `texture`.
+    _zero_copy: Option<ZeroCopy>,
 }
 
 impl Frozen {
@@ -415,8 +481,25 @@ impl Frozen {
 
 impl Drop for Frozen {
     fn drop(&mut self) {
-        unsafe { SDL_DestroyTexture(self.texture) };
+        if self._zero_copy.is_none() {
+            unsafe { SDL_DestroyTexture(self.texture) };
+        }
     }
+}
+
+/// A streaming texture for copied frames, in the stream's colour space:
+/// BT.709, limited range, as `connect` asks the host for. SDL's default for
+/// YUV is BT.601, which shifted reds and greens slightly.
+unsafe fn video_texture(r: *mut SDL_Renderer, format: SDL_PixelFormat, w: i32, h: i32) -> *mut SDL_Texture {
+    let props = SDL_CreateProperties();
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, format.0 as i64);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING.0 as i64);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, w as i64);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, h as i64);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, SDL_COLORSPACE_BT709_LIMITED.0 as i64);
+    let texture = SDL_CreateTextureWithProperties(r, props);
+    SDL_DestroyProperties(props);
+    texture
 }
 
 fn post(generation: u64, code: i32) {

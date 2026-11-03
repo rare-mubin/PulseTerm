@@ -101,7 +101,7 @@ impl Sun {
 
 enum Msg {
     Probed(Result<Facts, String>),
-    Started(Result<Instance, String>),
+    Started(Result<(Instance, Vec<sunshine::Display>), String>),
     Paired(Instance, Result<Paired, String>),
     Launched(Result<Session, String>),
     Stopped,
@@ -156,6 +156,8 @@ pub struct App {
     /// The host-side settings the running Sunshine was started with; Connect
     /// restarts it when they have changed since.
     running_tuning: Option<Tuning>,
+    /// The host's displays, as its Sunshine listed them when it started.
+    displays: Vec<sunshine::Display>,
     /// Stopping in order to start again with new host settings.
     restart: bool,
     /// The last picture of a stream being replaced, shown until the new one
@@ -216,6 +218,7 @@ impl App {
             side_scroll: 0.0,
             settings_scroll: 0.0,
             running_tuning: None,
+            displays: Vec::new(),
             restart: false,
             frozen: None,
             apply_at: None,
@@ -289,7 +292,7 @@ impl App {
 
     fn launch(&mut self) {
         let (Sun::Paired(_, paired), Probe::Done(facts)) = (&self.sun, &self.probe) else { return };
-        let plan = StreamPlan::new(&self.config, facts);
+        let plan = StreamPlan::new(&self.config, facts, self.window_pixels());
         self.notice = Some(format!("Starting the desktop at {}x{} {} fps…", plan.width, plan.height, plan.fps));
         self.launching = true;
         let (paired, address) = ((**paired).clone(), self.address.clone());
@@ -502,7 +505,10 @@ impl App {
                     Err(e) => Probe::Failed(e),
                 }
             }
-            Msg::Started(Ok(instance)) => self.pair(instance),
+            Msg::Started(Ok((instance, displays))) => {
+                self.displays = displays;
+                self.pair(instance);
+            }
             Msg::Started(Err(e)) => {
                 self.frozen = None;
                 self.sun = Sun::Failed(e);
@@ -553,6 +559,7 @@ impl App {
 
     pub fn run(&mut self) {
         let mut dirty = true;
+        let mut drawn = Instant::now();
         'run: loop {
             let mut event: SDL_Event = unsafe { std::mem::zeroed() };
             let timeout = if self.stream.is_some() || self.frozen.is_some() || self.apply_at.is_some() { 16 } else { 250 };
@@ -567,7 +574,16 @@ impl App {
             self.ui.click = false;
             self.ui.wheel = 0.0;
             for ev in &pending {
-                dirty = true;
+                // While streaming, mouse motion over the picture redraws
+                // nothing: with vsync every draw waits for a screen refresh,
+                // and drawing on each motion spent refreshes on unchanged
+                // pictures while the next video frame overwrote the last --
+                // 42-55 of 60 frames shown while the mouse moved. The edge
+                // arrow is caught by the redraw at least every 100 ms.
+                let motion = unsafe { ev.r#type } == SDL_EVENT_MOUSE_MOTION.0;
+                if !(motion && self.stream.is_some() && !self.sidebar) {
+                    dirty = true;
+                }
                 if !self.event(ev) {
                     break 'run;
                 }
@@ -600,9 +616,12 @@ impl App {
                 self.apply_at = None;
                 self.rejoin();
             }
-            if self.stream.is_some() || self.frozen.is_some() || dirty {
+            let due = drawn.elapsed() >= Duration::from_millis(100);
+            let streaming = self.stream.is_some() && (crate::stream::frame_waiting() || due);
+            if streaming || self.frozen.is_some() || dirty {
                 self.frame();
                 dirty = false;
+                drawn = Instant::now();
             }
         }
         // Leaving: end the stream; PulseTerm closing our pipe closes the
@@ -722,10 +741,33 @@ impl App {
                 }
             } else if kind == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED.0 || kind == SDL_EVENT_WINDOW_RESIZED.0 {
                 self.measure();
+                self.follow_window();
             }
         }
         let _ = ui_scale;
         true
+    }
+
+    /// The window's size in real pixels (HiDPI included).
+    fn window_pixels(&self) -> (u32, u32) {
+        let (mut w, mut h) = (0, 0);
+        unsafe { SDL_GetWindowSizeInPixels(self.window, &mut w, &mut h) };
+        (w.max(1) as u32, h.max(1) as u32)
+    }
+
+    /// Resolution "window": a resized (or fullscreened) window rejoins the
+    /// host at its new size once the resizing settles -- each resize event
+    /// pushes the rejoin back (`stream_setting_changed`), so a drag rejoins
+    /// once, at the end.
+    fn follow_window(&mut self) {
+        if !matches!(self.config.resolution.as_str(), "window" | "native") {
+            return;
+        }
+        let Some(s) = &self.stream else { return };
+        let (w, h) = window_resolution(self.window_pixels());
+        if (s.session.width, s.session.height) != (w as i32, h as i32) {
+            self.stream_setting_changed();
+        }
     }
 
     /// Window size and pixel density, read from SDL.
@@ -886,7 +928,7 @@ impl App {
             );
             y += self.ui.paragraph(x0 + pad, y, inner, &asked, t.fg_muted);
             let (decoded, shown) = s.fps;
-            let reading = format!("{decoded:.0} fps decoded · {shown:.0} shown · {:.1} Mbps received", s.received_mbps);
+            let reading = format!("{decoded:.0} fps · {shown:.0} shown · {:.1} Mbps in", s.received_mbps);
             y += 4.0;
             self.ui.micro(x0 + pad, y, &reading, if decoded > 0.0 { t.success } else { t.fg_subtle });
             y += self.ui.line(t.micro()) + 6.0;
@@ -894,7 +936,7 @@ impl App {
             // work per frame, and decoding here.
             let (net, host, decode) = s.latency;
             let host = if host > 0.0 { format!("{host:.1} ms") } else { "--".into() };
-            let lat = format!("network {net:.0} ms · host {host} · decode {decode:.1} ms");
+            let lat = format!("control {net:.0} ms · host {host} · decode {decode:.1} ms");
             self.ui.text(x0 + pad, y, &lat, t.micro(), false, t.fg_muted);
             y += self.ui.line(t.micro()) + 6.0;
             // Audio: what the queue is doing, and the longest wait between two
@@ -1050,6 +1092,29 @@ impl App {
         y += self.ui.line(t.micro()) + 6.0;
         let note = "Without a hardware encoder the host encodes on its CPU. 720p, 30 fps, H.264 and the fastest encoder save the most; audio off stops it capturing sound.";
         y += self.ui.paragraph(x, y, 330.0, note, t.fg_subtle) + 12.0;
+        // Which display: offered once the host's Sunshine has listed them,
+        // and only when there is a choice to make.
+        if self.displays.len() > 1 {
+            const SLOTS: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
+            let mut options: Vec<(&'static str, &str)> = vec![("auto", "auto")];
+            for (i, d) in self.displays.iter().take(SLOTS.len()).enumerate() {
+                options.push((SLOTS[i], d.name.as_str()));
+            }
+            let current = self.displays.iter().position(|d| d.name == c.display).map(|i| SLOTS[i]).unwrap_or("auto");
+            let options: Vec<(&'static str, String)> = options.into_iter().map(|(v, t)| (v, t.to_string())).collect();
+            let borrowed: Vec<(&'static str, &str)> = options.iter().map(|(v, t)| (*v, t.as_str())).collect();
+            if let Some(v) = row(self, "Display", &mut y, &borrowed, current) {
+                let name = v.parse::<usize>().ok().and_then(|i| self.displays.get(i)).map(|d| d.name.clone()).unwrap_or_default();
+                self.set(|c| c.display = name);
+            }
+            let models: Vec<String> = self
+                .displays
+                .iter()
+                .map(|d| if d.model.is_empty() { d.name.clone() } else { format!("{}: {}", d.name, d.model) })
+                .collect();
+            let note = format!("{}. Auto lets Sunshine pick.", models.join(" · "));
+            y += self.ui.paragraph(x, y - 8.0, 330.0, &note, t.fg_subtle) + 6.0;
+        }
         if let Some(v) = row(self, "Encoder speed", &mut y, &[("ultrafast", "fastest"), ("superfast", "fast"), ("veryfast", "better")], &c.sw_preset) {
             self.set(|c| c.sw_preset = v.into());
         }
@@ -1300,15 +1365,17 @@ struct StreamPlan {
 }
 
 impl StreamPlan {
-    fn new(config: &StreamConfig, facts: &Facts) -> Self {
+    fn new(config: &StreamConfig, facts: &Facts, window: (u32, u32)) -> Self {
         use crate::stream::ffi;
         let (width, height) = match config.resolution.as_str() {
             "720" => (1280, 720),
+            "1080" => (1920, 1080),
             "1440" => (2560, 1440),
             "2160" => (3840, 2160),
-            // "window" and "native" need the window's size and the host's
-            // display; until then, 1080p.
-            _ => (1920, 1080),
+            // "window" (and the older "native"): the window's own pixels, so
+            // the picture is drawn 1:1 -- sharp, and no encoding of detail
+            // that scaling would throw away.
+            _ => window_resolution(window),
         };
         let fps = config.fps;
         let bitrate = if config.bitrate > 0 {
@@ -1332,6 +1399,15 @@ impl StreamPlan {
         };
         Self { width, height, fps, bitrate, formats }
     }
+}
+
+/// The stream size for a window of `pixels`: capped at 4K (keeping its
+/// shape), at least 640x360, and a multiple of 8 each way -- encoders work in
+/// blocks, and NVENC refuses odd sizes.
+fn window_resolution((w, h): (u32, u32)) -> (u32, u32) {
+    let scale = (3840.0 / w as f64).min(2160.0 / h as f64).min(1.0);
+    let fit = |v: u32, least: u32| (((v as f64 * scale) as u32) / 8 * 8).max(least);
+    (fit(w, 640), fit(h, 360))
 }
 
 /// Pairs with a freshly started instance: forwards Sunshine's two pairing
@@ -1406,4 +1482,17 @@ fn launch(paired: &Paired, plan: &StreamPlan, address: String, audio: bool, on_h
         input_key_id: key.key_id,
         audio,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_resolution;
+
+    #[test]
+    fn the_window_resolution_is_its_pixels_in_encoder_blocks() {
+        assert_eq!(window_resolution((1920, 1080)), (1920, 1080));
+        assert_eq!(window_resolution((943, 1028)), (936, 1024), "rounded down to multiples of 8");
+        assert_eq!(window_resolution((5120, 2880)), (3840, 2160), "capped at 4K, shape kept");
+        assert_eq!(window_resolution((300, 200)), (640, 360), "never below 640x360");
+    }
 }

@@ -95,7 +95,14 @@ fn main() {
         }
         let title = CString::new(format!("PulseTerm Remote — {}", args.label)).unwrap_or_default();
         let window = SDL_CreateWindow(title.as_ptr(), 1100, 760, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-        let renderer = SDL_CreateRenderer(window, std::ptr::null());
+        // OpenGL over EGL first: it is what zero-copy display imports decoded
+        // frames into (stream/zerocopy.rs). Anything else still works, by
+        // copying frames.
+        SDL_SetHint(c"SDL_VIDEO_FORCE_EGL".as_ptr(), c"1".as_ptr());
+        let mut renderer = SDL_CreateRenderer(window, c"opengl".as_ptr());
+        if renderer.is_null() {
+            renderer = SDL_CreateRenderer(window, std::ptr::null());
+        }
         if window.is_null() || renderer.is_null() {
             eprintln!("pulseterm-remote: no window: {}", std::ffi::CStr::from_ptr(SDL_GetError()).to_string_lossy());
             std::process::exit(1);
