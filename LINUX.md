@@ -119,6 +119,55 @@ guessed differently.
 
 ---
 
+## Linux: check this on the next Linux build
+
+The reverse of the Windows list below. Everything from 2026-11-03 to
+2026-11-05 was written and tested on **Windows only** (commits `fcb3498`
+through `94e2d42`). The Linux-only files were edited without a Linux
+compiler, so they come first.
+
+**Edited Linux-side code, never compiled -- check these build first**
+
+* `src/local/unix_pty.rs` -- two match arms gained `PtyProgram::CommandIn`
+  (`--working-directory` with `-e`): the directory becomes `current_dir`,
+  the command goes to `/bin/sh -c`.
+* `remote/build.rs` -- the non-MSVC path is meant to be unchanged (`-Wno-error`,
+  `-lcrypto`), but it now also adds `Release` search paths and reads
+  `OPENSSL_DIR` / `SDL3_LIB_DIR` / `OPUS_LIB_DIR` when set. Unset on Linux.
+* `remote/src/stream/decoder.rs` -- the hardware decoder is a per-platform
+  const `HW`; on Linux it must still be VA-API. Check the log says
+  `VA-API: true`.
+* `remote/src/stream/mod.rs` -- zero-copy is skipped with `cfg!(not(windows))`;
+  on Linux it must still be tried (`zero-copy display on`).
+* `remote/src/app.rs` -- the evdev keyboard grab now runs only under
+  `cfg!(target_os = "linux")`. On Linux the full keyboard and its udev notice
+  must behave exactly as before.
+* `remote/src/stream/grab.rs` -- `use super::ffi` is now Linux-only.
+* `remote/src/chrome.rs` -- new; a no-op off Windows (`OWN_CAPTION`). The
+  helper window must look as it did on niri, with no buttons drawn.
+
+**Shared changes made on Windows -- check they behave the same on Linux**
+
+* Window headers top/bottom and show/auto-hide/hide (Settings -> Tiling);
+  navigation bar show/auto-hide/hide and optional window buttons
+  (Settings -> Interface). Auto-hide must reveal from the edge strip, and the
+  hidden bar's strip must still move the window with the compositor's move.
+  The strip sits inside `ui::decorations`' resize margin -- check they don't
+  fight.
+* File tree: a double-click replaces the open file window, a middle-click or
+  "Open in New Window" opens another, never over unsaved changes.
+* `pulseterm PATH` (a file opens in the editor, a folder in a shell) -- and the
+  `.desktop` file could offer a file `MimeType` to match File Explorer's menu.
+* Focus: a click on the bar or the caption must not take the keys from the
+  shell (the focus keeper now corrects focus sitting on the workspace root).
+* The overview's Escape / Enter / arrows (its own focus handle now).
+* A pressed window header must not slide the strip (`Strip::hold_scroll`).
+* Close dialog: a local session is not "still connected"; only SSH hosts
+  are named.
+* `cargo test` -- 42 on Windows. On Linux, expect the Windows-only ones out
+  (the CreateProcess quoting test and the two drive-letter tests) and the
+  Linux-only ones in (4 `unix_pty`, 2 `decorations`): 42 - 3 + 6 = 45.
+
 ## The remote desktop helper
 
 `remote/` (`pulseterm-remote`) is a second program, built only with

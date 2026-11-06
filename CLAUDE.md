@@ -44,6 +44,9 @@ shortcuts.
   is quoted for the platform -- `/bin/sh` on Unix, CreateProcess's double
   quotes on Windows -- and a directory travels apart from it
   (`PtyProgram::CommandIn`), so both work together on Windows too.
+- `pulseterm PATH` — a bare path: a file opens in the editor (no terminal
+  beside it), a folder opens a shell there (`launch::Start`). It is what File
+  Explorer's "Open with PulseTerm" runs; see that section.
 - `cargo build --release` — optimised standalone `target/release/PulseTerm.exe`.
   Release is tuned for size (`[profile.release]`: strip, fat LTO, one codegen
   unit), so it is much slower to build than debug and rebuilds every crate when

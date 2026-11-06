@@ -272,10 +272,10 @@ Not yet built:
 - The TTY1–4 `conspy` console shortcuts (the backend path is wired; the UI isn't)
 - Restoring every session at launch — only the one on screen when you quit
   comes back
-- `pulseterm -e` and the menu-entry install are Linux-only so far
-- The remote desktop helper streams from Linux; on Windows it builds and
-  opens, but has not streamed yet ([REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md),
-  *Building on Windows*)
+- No installer or Start-menu entry on Windows yet: the build is a folder of
+  files you copy (Linux has `packaging/linux/install.sh`)
+- The remote desktop helper streams on both; on Windows it needs its DLLs
+  beside it ([REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md), *Building on Windows*)
 - No end-to-end or UI tests (there are unit tests for the parts that can be
   checked without a window)
 
