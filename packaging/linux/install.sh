@@ -57,7 +57,12 @@ if [ -x "$repo/target/$profile/pulseterm-remote" ]; then
   install -m 755 "$repo/target/$profile/pulseterm-remote" "$bin/pulseterm-remote"
 fi
 install -m 644 "$repo/assets/logo.svg" "$icons/pulseterm.svg"
-install -m 644 "$repo/packaging/linux/pulseterm.desktop" "$apps/pulseterm.desktop"
+# Exec and TryExec get the full path: a desktop session's PATH is not your
+# shell's, and ~/.local/bin is often only added by ~/.bashrc. A bare
+# `pulseterm` then makes launchers hide the entry (TryExec) or fail to start it.
+sed -e "s|^Exec=pulseterm|Exec=$bin/pulseterm|" -e "s|^TryExec=pulseterm|TryExec=$bin/pulseterm|" \
+  "$repo/packaging/linux/pulseterm.desktop" > "$apps/pulseterm.desktop"
+chmod 644 "$apps/pulseterm.desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" || true
 
@@ -75,4 +80,12 @@ case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "Note: $bin is not on your PATH; the menu entry works, the 'pulseterm' command will not." ;;
 esac
+# The compositor's PATH is the one a keyboard shortcut (niri's `spawn`, sway's
+# `exec`) searches, and it usually comes from the systemd user session.
+if command -v systemctl >/dev/null; then
+  case ":$(systemctl --user show-environment 2>/dev/null | sed -n 's/^PATH=//p'):" in
+    *":$bin:"*|"::") ;;
+    *) echo "Note: your desktop session's PATH lacks $bin; bind shortcuts to $bin/pulseterm, not pulseterm." ;;
+  esac
+fi
 echo "PulseTerm ($profile build) installed. Find it in your applications menu, or run: pulseterm"

@@ -60,6 +60,26 @@ guessed differently.
   window ground there -- it would fill the resize margin. On Linux
   `apply_component_theme` clears `Root`'s background and `ui::decorations`
   paints the ground inside the margin instead, once, and only when opaque.
+* **The window froze after its first frames until resized** (2026-11-06,
+  Arch/CachyOS, niri 26.04, Intel + NVIDIA laptop; on either GPU). Once the
+  window is on screen niri sends it new dmabuf feedback with a scanout
+  tranche, the Vulkan driver then reports the swapchain *out of date*, and
+  blade-graphics 0.7.1 answered every acquire after that with a frame it
+  never presents, leaving the rebuild to gpui -- which 0.2.2 does only on a
+  size change. gpui went on drawing at full rate and nothing reached the
+  screen. Found with gdb breakpoints on blade's out-of-date branch (3 good
+  acquires, then every one stale) and `WAYLAND_DEBUG=1` (the feedback lands
+  right after the third `attach`). Fixed by a patched copy of blade in
+  `patches/blade-graphics` (`[patch.crates-io]`): `Surface::acquire_frame`
+  rebuilds the swapchain from the settings it was last built with and
+  acquires again. Windows draws with DirectX and never builds blade's Vulkan
+  path, so it is unaffected.
+* **A compositor shortcut finds nothing at `pulseterm`** when `~/.local/bin`
+  is added to `PATH` only by `~/.bashrc`: niri's `spawn` searches the
+  session's PATH (the systemd user environment), not an interactive
+  shell's. `install.sh` now writes the full path into the desktop entry's
+  `Exec`/`TryExec` and warns when the session PATH lacks it; bind shortcuts
+  to `~/.local/bin/pulseterm` in full.
 
 **Tested by driving the real app** (niri on Wayland, input injected with
 `ydotool`, checked with niri screenshots and `ps`/`/proc`):

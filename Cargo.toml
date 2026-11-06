@@ -159,3 +159,14 @@ codegen-units = 1
 # faster too.
 [profile.release.build-override]
 opt-level = 3
+
+# gpui's Vulkan backend (Linux only; Windows draws with DirectX), patched.
+# Upstream blade-graphics hands back an undrawable frame when the driver says
+# the swapchain is out of date and leaves the rebuild to gpui, which 0.2.2 only
+# does on a size change. On Wayland a compositor's new dmabuf feedback makes it
+# out of date too -- niri sends some as soon as the window is on screen -- so
+# the window froze after its third frame until it was resized. The patch
+# (`patches/blade-graphics/src/vulkan/surface.rs`, `acquire_frame`) rebuilds it
+# there. 0.7.1 is the last 0.7 release, so nothing upstream will replace it.
+[patch.crates-io]
+blade-graphics = { path = "patches/blade-graphics" }

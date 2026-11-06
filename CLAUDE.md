@@ -88,6 +88,12 @@ installed. `~/.cargo/bin` is not on `PATH` in a fresh shell here.
 `aws-lc-rs` one also wants CMake and NASM, and there is no reason to take that
 on.
 
+`blade-graphics` (gpui's Vulkan renderer, Linux only) is a **patched copy** in
+`patches/blade-graphics`, through `[patch.crates-io]`: it rebuilds an
+out-of-date swapchain itself, without which a Wayland window froze after its
+third frame until resized (see `LINUX.md`). Keep the patch when touching gpui;
+the change is marked `PulseTerm patch` in `src/vulkan/surface.rs` and `mod.rs`.
+
 ## Architecture
 
 ### `src/runtime.rs`, `src/pty.rs` — shared by both backends
