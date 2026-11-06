@@ -21,10 +21,22 @@ use crate::ui::Ui;
 /// Whether the window draws its own caption: Windows only.
 pub const OWN_CAPTION: bool = cfg!(windows);
 
+/// How far in from the right edge the pointer reveals the sidebar's arrow.
+/// Elsewhere the last few pixels do; on Windows those are the resize border
+/// (`EDGE`), which Windows keeps for itself -- the app never sees the pointer
+/// there -- so the zone is the strip just inside it instead.
+pub fn reveal_zone() -> (f32, f32) {
+    if OWN_CAPTION {
+        (EDGE + 10.0, EDGE)
+    } else {
+        (4.0, 0.0)
+    }
+}
+
 /// How far in from a free edge a press resizes rather than reaching the
 /// content. The design's seams are 7px for the same reason: a hairline is too
 /// thin to hit.
-const EDGE: f32 = 7.0;
+pub const EDGE: f32 = 7.0;
 
 type Rect = (f32, f32, f32, f32);
 

@@ -186,9 +186,10 @@ impl Stream {
         Some(end_reason(event.code))
     }
 
-    /// Draws the newest picture letterboxed into the window. Returns whether a
-    /// new picture arrived.
-    pub fn draw(&mut self, ui: &Ui) -> bool {
+    /// Draws the newest picture letterboxed into `area` (window points): the
+    /// whole window, or what the docked sidebar leaves of it. Returns whether
+    /// a new picture arrived.
+    pub fn draw(&mut self, ui: &Ui, area: (f32, f32, f32, f32)) -> bool {
         unsafe {
             // Zero-copy is VA-API surfaces mapped to DRM PRIME and imported
             // through EGL -- a Linux path end to end. On Windows the D3D11
@@ -239,9 +240,12 @@ impl Stream {
             }
             if let Some((texture, (tw, th))) = self.picture() {
                 let (tw, th) = (tw as f32, th as f32);
-                let scale = (ui.width / tw).min(ui.height / th);
+                let (ax, ay, aw, ah) = area;
+                let scale = (aw / tw).min(ah / th);
                 let (w, h) = (tw * scale, th * scale);
-                self.video = ((ui.width - w) / 2.0, (ui.height - h) / 2.0, w, h);
+                // `video` is in window points, so pointer positions map
+                // through it however the area is offset.
+                self.video = (ax + (aw - w) / 2.0, ay + (ah - h) / 2.0, w, h);
                 let s = ui.scale;
                 let dst = SDL_FRect { x: self.video.0 * s, y: self.video.1 * s, w: w * s, h: h * s };
                 SDL_RenderTexture(ui.r, texture, null(), &dst);
@@ -472,12 +476,13 @@ pub struct Frozen {
 }
 
 impl Frozen {
-    pub fn draw(&self, ui: &Ui) {
+    pub fn draw(&self, ui: &Ui, area: (f32, f32, f32, f32)) {
         let (tw, th) = self.size;
-        let scale = (ui.width / tw).min(ui.height / th);
+        let (ax, ay, aw, ah) = area;
+        let scale = (aw / tw).min(ah / th);
         let (w, h) = (tw * scale, th * scale);
         let s = ui.scale;
-        let dst = SDL_FRect { x: (ui.width - w) / 2.0 * s, y: (ui.height - h) / 2.0 * s, w: w * s, h: h * s };
+        let dst = SDL_FRect { x: (ax + (aw - w) / 2.0) * s, y: (ay + (ah - h) / 2.0) * s, w: w * s, h: h * s };
         unsafe { SDL_RenderTexture(ui.r, self.texture, null(), &dst) };
     }
 }

@@ -124,7 +124,8 @@ a fresh install opens on.
   starts PulseTerm's own [Sunshine](https://github.com/LizardByte/Sunshine)
   instance on the host, pairs with it (nothing to type, nothing stored) and
   streams it with hardware decoding, audio and full keyboard and mouse.
-  Settings change live in a sidebar behind an edge arrow.
+  Settings change live in a sidebar: in a window it opens beside the picture
+  from a strip on the left; in full screen it slides over from the right.
 - It is a **separate program** (`pulseterm-remote`, GPL-3.0) that PulseTerm
   finds at run time; built without it, PulseTerm simply has no remote icon. See
   [REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md) for the design, the host
@@ -173,14 +174,91 @@ PulseTerm opens on its home screen: pick **SSH** for a saved host or a new one,
 or **this computer** for a local shell. `ctrl-shift-k` opens the command bar
 from anywhere.
 
-Build a standalone executable:
+## Building
+
+The repository holds two programs: **PulseTerm** itself, and the optional
+remote desktop helper **`pulseterm-remote`** (`remote/`, GPL-3.0). A plain
+`cargo` command builds PulseTerm only; the helper is built when you name it
+(`-p pulseterm-remote`) or ask for both (`--workspace`). PulseTerm finds the
+helper beside its own exe at run time, so build both in the **same** profile
+(dev with dev, release with release) to get the remote desktop icon.
+
+| What | Dev build (fast to build, debug info) | Release build (optimised, small) |
+|---|---|---|
+| PulseTerm | `cargo build` | `cargo build --release` |
+| Remote desktop helper | `cargo build -p pulseterm-remote` | `cargo build --release -p pulseterm-remote` |
+| Both together | `cargo build --workspace` | `cargo build --release --workspace` |
+
+Run straight from the source tree:
 
 ```bash
-cargo build --release
+cargo run                                                   # PulseTerm, dev
+cargo run --release                                         # PulseTerm, release
+cargo run -p pulseterm-remote -- --local --label test       # the helper alone, against this machine
 ```
 
+The output lands in `target/debug/` (dev) or `target/release/` (release):
+`PulseTerm` (`PulseTerm.exe` on Windows) and `pulseterm-remote`
+(`pulseterm-remote.exe`). Tests: `cargo test` for PulseTerm,
+`cargo test -p pulseterm-remote` for the helper, `cargo test --workspace` for both.
+
+Building both together merges the two programs' dependency features, so the
+first `--workspace` build -- and the first single-program build after one --
+recompiles the shared dependencies once (minutes, not seconds).
+
 > The first build compiles roughly 1400 crates and takes 15–25 minutes.
-> Incremental rebuilds after that are a few seconds.
+> Incremental rebuilds after that are a few seconds. A release build is slower
+> (fat LTO, one codegen unit): about 10 minutes for PulseTerm from scratch.
+
+### What the remote desktop helper needs first
+
+PulseTerm needs only Rust and a C compiler. The helper also needs the
+moonlight-common-c submodule and a few native libraries:
+
+```bash
+git submodule update --init --recursive
+```
+
+- **Linux:** CMake, clang, and the FFmpeg, SDL3, libva, OpenSSL and Opus
+  development packages. The exact package list (and a Fedora trap that removes
+  the graphics driver) is in [REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md).
+- **Windows:** Visual Studio 2022 Build Tools, LLVM (`winget install
+  LLVM.LLVM`), OpenSSL (`winget install ShiningLight.OpenSSL.Dev`), and the SDL3,
+  FFmpeg and Opus development files. Windows has no system location for them,
+  so tell the build where they are -- in the same PowerShell window you build
+  from (paths are examples; full details in REMOTE_DESKTOP.md, *Building on
+  Windows*):
+
+  ```powershell
+  $deps = "D:\Apps\pulseterm-remote-deps"
+  $env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"
+  $env:OPENSSL_DIR         = "C:\Program Files\OpenSSL-Win64"
+  $env:OPENSSL_LIB_DIR     = "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
+  $env:OPENSSL_INCLUDE_DIR = "C:\Program Files\OpenSSL-Win64\include"
+  $env:FFMPEG_DIR          = "$deps\ffmpeg\ffmpeg-n9.0-latest-win64-gpl-shared-9.0"
+  $env:SDL3_LIB_DIR        = "$deps\sdl3\SDL3-3.4.18\lib\x64"
+  $env:OPUS_LIB_DIR        = "$deps\opus\install\lib"
+  ```
+
+  On Windows the helper also needs its DLLs **beside** `pulseterm-remote.exe`.
+  After a build, copy them into the folder you built (`target\release` here;
+  `target\debug` for a dev build):
+
+  ```powershell
+  $out = "target\release"
+  Copy-Item "$deps\sdl3\SDL3-3.4.18\lib\x64\SDL3.dll",
+            "$env:FFMPEG_DIR\bin\avcodec-*.dll",
+            "$env:FFMPEG_DIR\bin\avutil-*.dll",
+            "$env:FFMPEG_DIR\bin\swresample-*.dll",
+            "$deps\opus\install\bin\opus.dll",
+            "C:\Program Files\OpenSSL-Win64\bin\libcrypto-4-x64.dll",
+            "C:\Program Files\OpenSSL-Win64\bin\libssl-4-x64.dll" $out
+  ```
+
+  To copy the release build elsewhere, take `PulseTerm.exe`,
+  `pulseterm-remote.exe` and those seven DLLs together. `PulseTerm.exe` alone
+  is the whole terminal; without the helper beside it, the remote desktop icon
+  simply doesn't appear.
 
 ### Windows
 

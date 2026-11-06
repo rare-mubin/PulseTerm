@@ -148,3 +148,14 @@ opt-level = 2
 strip = true
 lto = "fat"
 codegen-units = 1
+
+# Build scripts and their dependencies (bindgen, cmake, cc) run during the
+# build; Cargo builds them at opt-level 0 in release unless told otherwise.
+# Unoptimised bindgen is stack-hungry, and `cargo build --release --workspace`
+# -- both programs at once, features unified across them -- overflowed the
+# 1 MB main-thread stack Windows gives `ffmpeg-sys-next`'s build script
+# (STATUS_STACK_OVERFLOW) while `-p pulseterm-remote` alone did not.
+# Optimising them changes nothing that ships, and makes the bindgen runs
+# faster too.
+[profile.release.build-override]
+opt-level = 3

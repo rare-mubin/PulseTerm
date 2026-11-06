@@ -390,8 +390,9 @@ impl App {
     /// showing.
     fn sync_cursor(&mut self) {
         let over = !self.captured
-            && !self.sidebar
+            && !self.sidebar_covers()
             && !self.over_tab()
+            && !self.over_panel(self.ui.mouse.0)
             && self.stream.as_ref().is_some_and(|s| s.started && s.over_picture(self.ui.mouse.0, self.ui.mouse.1));
         let want = match (over, self.config.pointer.as_str()) {
             (false, _) => CursorState::Normal,
@@ -460,7 +461,14 @@ impl App {
             "captured" => self.captured,
             _ => false,
         };
-        let want = streaming && !self.sidebar && mode && focused && (pointer_inside || self.captured);
+        // Not while a sidebar covers the picture, nor while the pointer is on
+        // the docked strip or sidebar beside it.
+        let want = streaming
+            && !self.sidebar_covers()
+            && !self.over_panel(self.ui.mouse.0)
+            && mode
+            && focused
+            && (pointer_inside || self.captured);
 
         // The keyboards themselves, when this computer may claim them.
         if self.grab.as_ref().is_some_and(|g| !want || g.ended()) {
@@ -664,21 +672,25 @@ impl App {
             let streaming = self.stream.as_ref().map(|s| s.started).unwrap_or(false);
             // The host gets the pointer when the sidebar is shut and the
             // pointer is not on the arrow -- always, while captured.
-            let to_host = streaming && (self.captured || (!self.sidebar && !self.over_tab()));
+            let to_host = streaming && (self.captured || self.pointer_free(self.ui.mouse.0));
             if kind == SDL_EVENT_MOUSE_MOTION.0 {
                 let m = ev.motion;
                 self.ui.mouse = (m.x, m.y);
                 // Resting on the right edge reveals the arrow; leaving both
                 // the edge and the arrow hides it again.
-                if !self.captured && !self.sidebar {
-                    let at_edge = m.x >= self.ui.width - 4.0;
+                if !self.captured && !self.sidebar && !self.docked() {
+                    // The last few pixels -- or, on Windows, the strip just
+                    // inside the resize border, which the app never sees
+                    // (`chrome::reveal_zone`).
+                    let (outer, inner) = crate::chrome::reveal_zone();
+                    let at_edge = m.x >= self.ui.width - outer && m.x < self.ui.width - inner;
                     if at_edge {
                         self.edge_since.get_or_insert_with(Instant::now);
                     } else if !self.over_tab() {
                         self.edge_since = None;
                     }
                 }
-                let to_host = streaming && (self.captured || (!self.sidebar && !self.over_tab()));
+                let to_host = streaming && (self.captured || self.pointer_free(m.x));
                 if to_host {
                     if let Some(s) = &mut self.stream {
                         s.motion(&m, self.captured);
@@ -686,6 +698,7 @@ impl App {
                 }
             } else if kind == SDL_EVENT_MOUSE_BUTTON_DOWN.0 || kind == SDL_EVENT_MOUSE_BUTTON_UP.0 {
                 let b = ev.button;
+                let to_host = streaming && (self.captured || self.pointer_free(b.x));
                 let over_picture = self.stream.as_ref().is_some_and(|s| s.over_picture(b.x, b.y));
                 if to_host && b.down && !self.captured && self.config.mouse == "game" && over_picture {
                     // Game mouse: the first click takes the pointer (and, by
@@ -736,8 +749,10 @@ impl App {
                         _ => {}
                     }
                 }
-                // Escape shuts the sidebar; with it open no key reaches the host.
-                if self.sidebar {
+                // Escape shuts a sidebar laid over the picture; with one up no
+                // key reaches the host. A docked one is beside the picture, so
+                // the keys go on reaching it.
+                if self.sidebar_covers() {
                     if key.down && key.scancode.0 == 41 {
                         self.set_sidebar(false);
                     }
@@ -810,6 +825,50 @@ impl App {
 
     const TAB: (f32, f32) = (22.0, 72.0);
     const SIDEBAR: f32 = 380.0;
+    /// The docked sidebar's strip: always there in a window, the arrow on it.
+    const STRIP: f32 = 16.0;
+
+    /// Whether the sidebar sits *beside* the picture -- in a window -- rather
+    /// than over it. In a window it docks on the left, behind an always-there
+    /// strip, and the picture moves over; full screen keeps the whole screen
+    /// for the picture, with the arrow at the right edge and the sidebar laid
+    /// over it.
+    fn docked(&self) -> bool {
+        !self.fullscreen
+    }
+
+    /// How much of the window's left side the docked strip and sidebar take.
+    fn panel_width(&self) -> f32 {
+        match (self.docked(), self.sidebar) {
+            (false, _) => 0.0,
+            (true, false) => Self::STRIP,
+            (true, true) => Self::SIDEBAR + Self::STRIP,
+        }
+    }
+
+    /// Where the picture goes: the whole window, or what the docked panel
+    /// leaves of it.
+    fn picture_area(&self) -> (f32, f32, f32, f32) {
+        let x = self.panel_width();
+        (x, 0.0, (self.ui.width - x).max(1.0), self.ui.height)
+    }
+
+    /// Whether a point is over the docked strip or sidebar.
+    fn over_panel(&self, x: f32) -> bool {
+        x < self.panel_width()
+    }
+
+    /// Whether the sidebar is laid over the picture (full screen), which takes
+    /// the pointer and the keys from the host while it is up.
+    fn sidebar_covers(&self) -> bool {
+        self.sidebar && !self.docked()
+    }
+
+    /// Whether the pointer at `x` belongs to the host: not under a covering
+    /// sidebar, not on the arrow, not on the docked panel.
+    fn pointer_free(&self, x: f32) -> bool {
+        !self.sidebar_covers() && !self.over_tab() && !self.over_panel(x)
+    }
 
     fn tab_rect(&self) -> (f32, f32, f32, f32) {
         let x = if self.sidebar { self.ui.width - Self::SIDEBAR - Self::TAB.0 } else { self.ui.width - Self::TAB.0 };
@@ -820,7 +879,7 @@ impl App {
     /// rested a moment on the right edge -- not otherwise, so the host gets the
     /// whole picture.
     fn tab_visible(&self) -> bool {
-        self.sidebar || self.edge_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(300))
+        !self.docked() && (self.sidebar || self.edge_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(300)))
     }
 
     fn over_tab(&self) -> bool {
@@ -833,31 +892,40 @@ impl App {
         // The old picture holds the window until the new stream draws one.
         let mut new_picture = false;
         let mut started = false;
+        let area = self.picture_area();
         if let Some(stream) = self.stream.as_mut() {
             // Draws nothing until its first picture; the frozen one shows then.
-            stream.draw(&self.ui);
+            stream.draw(&self.ui, area);
             new_picture = stream.has_picture();
             started = stream.started;
         }
         if new_picture {
             self.frozen = None;
         }
+        let (ax, _, aw, _) = self.picture_area();
         if let Some(f) = &self.frozen {
-            f.draw(&self.ui);
+            f.draw(&self.ui, self.picture_area());
             // What is happening, small, over the held picture.
             let msg = self.notice.clone().unwrap_or_else(|| "applying settings…".into());
             let w = self.ui.micro_width(&msg) + 28.0;
-            let x = (self.ui.width - w) / 2.0;
+            let x = ax + (aw - w) / 2.0;
             self.ui.fill(x, 16.0, w, t.row(), t.surface, 230);
             self.ui.outline(x, 16.0, w, t.row(), t.border);
             self.ui.micro(x + 14.0, 16.0 + (t.row() - self.ui.line(t.micro())) / 2.0, &msg, t.warning);
         } else if !started {
             let msg = "connecting…";
             let w = self.ui.measure(msg, t.font_size, false);
-            self.ui.text((self.ui.width - w) / 2.0, self.ui.height / 2.0 - 10.0, msg, t.font_size, false, t.fg_muted);
+            self.ui.text(ax + (aw - w) / 2.0, self.ui.height / 2.0 - 10.0, msg, t.font_size, false, t.fg_muted);
         }
         if self.stream.is_none() {
             return; // between streams: nothing to steer yet
+        }
+        if self.docked() {
+            self.draw_strip();
+            if self.sidebar {
+                self.draw_sidebar(0.0);
+            }
+            return;
         }
         if self.captured || !self.tab_visible() {
             return; // nothing over the host's picture
@@ -878,16 +946,40 @@ impl App {
             self.ui.click = false;
         }
         if self.sidebar {
-            self.draw_sidebar();
+            let x0 = self.ui.width - Self::SIDEBAR;
+            self.draw_sidebar(x0);
         }
     }
 
-    fn draw_sidebar(&mut self) {
+    /// The docked sidebar's strip, the whole height of the window beside the
+    /// picture: an arrow in the middle, and all of it the click target -- a
+    /// strip that only took clicks on its arrow would be a 16px target.
+    fn draw_strip(&mut self) {
+        let t = self.ui.t.clone();
+        let x = if self.sidebar { Self::SIDEBAR } else { 0.0 };
+        let (w, h) = (Self::STRIP, self.ui.height);
+        let hover = self.ui.hover(x, 0.0, w, h);
+        self.ui.fill(x, 0.0, w, h, if hover { t.raised } else { t.surface }, 255);
+        self.ui.vline(x + w - 1.0, 0.0, h, t.border);
+        // Points the way it will move: open to the right, shut to the left.
+        let glyph = if self.sidebar { "‹" } else { "›" };
+        let gw = self.ui.measure(glyph, t.head(), true);
+        let colour = if hover { t.fg } else { t.fg_muted };
+        self.ui.text(x + (w - gw) / 2.0, (h - self.ui.line(t.head())) / 2.0, glyph, t.head(), true, colour);
+        if self.ui.clicked(x, 0.0, w, h) {
+            self.set_sidebar(!self.sidebar);
+            self.ui.click = false;
+        }
+    }
+
+    /// The sidebar, `SIDEBAR` wide from `x0`: on the left when docked, over the
+    /// picture's right edge in full screen.
+    fn draw_sidebar(&mut self, x0: f32) {
         let t = self.ui.t.clone();
         let (sw, wh) = (Self::SIDEBAR, self.ui.height);
-        let x0 = self.ui.width - sw;
-        // A click outside the sidebar and its arrow shuts it.
-        if self.ui.click && !self.ui.hover(x0, 0.0, sw, wh) && !self.over_tab() {
+        // Over the picture, a click outside the sidebar and its arrow shuts
+        // it. Docked beside the picture, a click there is the host's.
+        if self.sidebar_covers() && self.ui.click && !self.ui.hover(x0, 0.0, sw, wh) && !self.over_tab() {
             self.set_sidebar(false);
             self.ui.click = false;
             return;

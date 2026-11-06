@@ -60,10 +60,19 @@ Decided next (2026-11-02), following the recommendations below:
   stored, a wrong PIN refused (an opt-in test against real Sunshine).
 * **Streaming**: moonlight-common-c (git submodule), FFmpeg VA-API decode,
   SDL3 window, Opus audio with an adaptive, rate-steered buffer.
-* **One window**: setup screen; while streaming the picture fills it, an arrow
-  revealed at the right edge (or `Ctrl+Alt+Shift+S`) opens a sidebar with
-  readings (fps, received Mbps, network/host/decode ms, audio queue), the
-  controls and the settings.
+* **One window**: setup screen, then the stream, with a sidebar of readings
+  (fps, received Mbps, network/host/decode ms, audio queue), the controls and
+  the settings (`Ctrl+Alt+Shift+S` toggles it anywhere). **In a window** it
+  docks on the left: a strip the window's full height, its arrow in the
+  middle and all of it clickable, opens it *beside* the picture, which moves
+  over and letterboxes into what is left (`App::picture_area`; `Stream::draw`
+  takes the area and maps the pointer through it). The host keeps the
+  pointer and keys whenever they are over the picture, so the stream stays
+  usable with the sidebar open. **In full screen** the picture keeps the whole
+  screen: an arrow revealed by resting on the right edge opens the sidebar
+  over it, and a click outside shuts it. On Windows that edge is the resize
+  border, which the app never sees, so the reveal zone is the strip just
+  inside it (`chrome::reveal_zone`).
 * **Settings, mostly live**: resolution, fps, codec, bitrate (rejoin in a
   second or so); audio here/host/both; full keyboard; mouse desktop/game;
   pointer host's/both; scroll as here/reversed; latency normal/low; host CPU
