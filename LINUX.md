@@ -168,6 +168,43 @@ compiler, so they come first.
   (the CreateProcess quoting test and the two drive-letter tests) and the
   Linux-only ones in (4 `unix_pty`, 2 `decorations`): 42 - 3 + 6 = 45.
 
+**Checked on Linux, 2026-11-06** (Fedora, niri; test instances with their
+own `XDG_DATA_HOME`, so no real settings were touched)
+
+* [x] Everything above **compiles** -- PulseTerm and the helper, no warnings.
+* [x] `cargo test`: **45** (PulseTerm) and 32 (helper), exactly as predicted.
+* [x] `--working-directory` with `-e` (`CommandIn` through `unix_pty`): starts
+      in the directory and runs the command.
+* [x] `pulseterm PATH`: a file opens in the editor with no terminal beside it,
+      a folder opens a shell there.
+* [x] Bar hidden, window buttons off, headers at the bottom: drawn as set.
+* [x] **Auto-hide bar -- was broken, fixed.** It revealed from the edge strip
+      and drew over the body, but could stay out for good: it let go on the
+      overlay's `on_hover(false)`, and gpui only reports that after it has
+      seen the pointer *inside* -- a pointer leaving the 4px strip faster than
+      the 44px bar never was. Now the revealed bar registers a window-wide
+      `on_mouse_event` from its paint and hides on any move outside its bounds
+      (`Workspace::with_bar`). Not Linux-specific; a quick flick on Windows
+      could do the same.
+* [x] Auto-hide headers: invisible until hovered, no reflow. (One shows at
+      launch until the first pointer move: gpui's pointer starts at the
+      window's top-left, over the header. Harmless.)
+* [x] The overview's own focus: arrows, Enter, Escape; keys reach the column
+      picked afterwards.
+* [x] Close with only a local session: closes at once, nothing asked.
+* [x] Remote helper streaming this machine to itself: `VA-API: true`,
+      `zero-copy display on`, 60/60 fps, audio clean; no window buttons drawn
+      (`chrome.rs` a no-op); the docked sidebar strip and its arrow at the
+      right edge; Sunshine gone after the window closed.
+
+Not checked yet on Linux: the file tree's double-click-replaces /
+middle-click-opens, a pressed header holding the strip still, the hidden
+bar's strip starting a compositor move, and the helper's evdev keyboard grab
+(it would take this machine's own keyboard while testing against itself --
+check it against a second machine). The `.desktop` `MimeType` idea is left
+alone on purpose: claiming `inode/directory` can make PulseTerm the default
+folder opener on desktops with none set.
+
 ## The remote desktop helper
 
 `remote/` (`pulseterm-remote`) is a second program, built only with
@@ -895,14 +932,11 @@ arguments and more — 43 of them on Linux, none needing a window. Everything be
       bar (the strip paints no ground of its own when translucent).
 - [ ] Throughput: `seq 1 2000000` in well under a second; normal output still
       drawn at full frame rate (`PULSETERM_TRACE=1` prints the numbers).
-- [ ] **`-e` is POSIX-only as written.** `launch.rs` quotes the command for
-      `/bin/sh` and turns `--working-directory` plus `-e` into
-      `cd '<dir>' && exec <cmd>`, which ConPTY's command line will not
-      understand. On Windows, join the words with Windows quoting and pass the
-      directory as ConPTY's working directory instead. `--working-directory`
-      alone (a shell in that folder) should already work.
-- [ ] No `.desktop` or install script equivalent exists for Windows; the
-      Start-menu entry and "open terminal here" registration are still to do.
+- [x] **`-e` on Windows** -- done (`94e2d42`): CreateProcess quoting, and the
+      directory travels apart as `PtyProgram::CommandIn`.
+- [x] **"Open terminal here" on Windows** -- done (`94e2d42`): File Explorer's
+      "Open with PulseTerm" (`src/shell_menu.rs`). A Start-menu entry or
+      installer is still to do (README, *Status*).
 
 ---
 

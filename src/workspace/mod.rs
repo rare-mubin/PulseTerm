@@ -1073,15 +1073,36 @@ impl Workspace {
             });
         let overlay = (auto && self.nav_revealed).then(|| {
             let bar = nav_bar::render(self, window, cx);
+            // Letting go is judged on every pointer move in the window, not by
+            // the bar's own hover: gpui only reports "no longer hovered" after
+            // it has seen the pointer *inside*, and a pointer that left the
+            // 4px strip faster than the 44px bar (a flick, or a coarse move)
+            // never was -- the bar then stayed out for good. Registered from
+            // the bar's paint, so it lives exactly while the bar is drawn.
+            let workspace = cx.entity().downgrade();
+            let leave = gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let workspace = workspace.clone();
+                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                        if phase != gpui::DispatchPhase::Bubble || bounds.contains(&event.position) {
+                            return;
+                        }
+                        let _ = workspace.update(cx, |this, cx| {
+                            if this.nav_revealed {
+                                this.nav_revealed = false;
+                                cx.notify();
+                            }
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_full();
             at_edge(div().id("nav-overlay").absolute())
                 .flex()
                 .when(!edge.is_vertical(), |this| this.flex_col())
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    if !*hovered && this.nav_revealed {
-                        this.nav_revealed = false;
-                        cx.notify();
-                    }
-                }))
+                .child(leave)
                 .child(bar)
         });
         sized(div().relative().flex())

@@ -131,8 +131,8 @@ on.
   what makes some TUI programs hang waiting for a reply.
 - `element.rs` — a hand-written gpui `Element`, not a tree of divs. An 80x24 grid
   is ~2000 cells and a div per cell would rebuild that many taffy nodes per frame.
-  Each frame walks the grid once and emits one shaped line per row plus one quad
-  per run of same-coloured background. **The grid is resized from `prepaint`**,
+  Each frame walks the grid once and emits one quad per run of same-coloured
+  background and **one glyph per non-blank cell from a glyph cache** (`GLYPHS`). **The grid is resized from `prepaint`**,
   before content is read out — doing it after layout makes a full-screen TUI paint
   one garbled frame at the old size on every resize.
 - `keymap.rs` — keystroke to pty bytes. Cursor keys switch between CSI (`ESC [`)
@@ -153,20 +153,35 @@ on.
   otherwise; the legacy one can't express coordinates past 223, so those events
   are dropped rather than reported at a wrong cell.
 - `view.rs` — focus, key handling, scrollback, and the task pumping pty events
-  into the emulator. **The pump takes everything already queued per wake**
+  into the emulator. Its padding is `Settings::terminal_padding` (Settings ->
+  Terminal, 0-48 px, default 4 -- what the fixed `p_1` gave), in plain pixels
+  so it does not scale with the font; the grid fits what is left in prepaint,
+  and mouse positions are taken against the grid, so a change reflows open
+  terminals and nothing else. **The pump takes everything already queued per wake**
   (up to 1 MB) and asks for a frame when the queue runs dry or 16 ms have
   passed -- `seq` on a terminal writes a line at a time, ~100,000 events a
   second, and one trip into the view per event was the cost.
   `PULSETERM_TRACE=1` prints frames drawn, frames asked for, MB parsed and
   the element's prepaint/paint cost per frame, once a second.
-- **Trailing blanks are never shaped** (`RowBuilder::trim_trailing_blanks`).
-  A row is built across the whole width, so `1234567` went to the shaper as
-  7 characters and ~190 spaces; during a flood every row is fresh text, and
-  that was ~30 ms a frame -- the release build drew more frames than debug and
-  ended up 3-5x *slower* at `seq 1 2000000`. Blanks draw nothing (backgrounds
-  are their own quads), so they are cut unless an underline or strikethrough
-  runs under them. Measured after: 0.9 ms a frame, `seq` 2M lines in ~0.7 s
-  (Alacritty 0.65 s), coloured `ls` level with Alacritty.
+- **Glyphs are shaped once, not every frame** (`GLYPHS`, `GlyphCache`). Each
+  distinct character -- with its combining marks, in bold or italic -- goes
+  through gpui's `layout_line` once (so font fallback for braille, emoji and
+  CJK resolves as before), and every frame after that only paints cached
+  glyph ids at `column x cell width` on the base font's baseline with
+  `paint_glyph` / `paint_emoji`, plus underline and strikethrough where gpui's
+  own line painter puts them. Whole rows used to be shaped every frame, and
+  a TUI that redraws the screen in colour was bound by it: `lite-eq` (56 rows,
+  ~1,300 colour runs, ~6,400 characters a frame) cost ~15 ms a frame in the
+  shaper and 65% of a core, against Alacritty's 5%. After: 0.7 ms a frame and
+  under 9% of a core. The cache is shared by all terminals and empties itself
+  when the font, size or weight changes, or past 10,000 entries. It also
+  fixed two things row shaping got wrong: combining accents and italic.
+- **With ligatures on, rows are still shaped whole** -- a ligature depends on
+  its neighbours -- and there **trailing blanks are never shaped**
+  (`RowBuilder::trim_trailing_blanks`): `1234567` used to reach the shaper as
+  7 characters and ~190 spaces, ~30 ms a frame under a flood, which made the
+  release build 3-5x *slower* than debug at `seq 1 2000000`. Throughput now:
+  `seq` 2M lines in ~0.68 s (Alacritty 0.63 s), coloured `ls` level with it.
 
 ### `src/workspace/` — the scrollable strip
 
@@ -431,7 +446,11 @@ Hidden, the body takes the whole window, but a 4px `drag_region` strip stays
 along the bar's edge: a window with no caption at all could not be moved.
 Auto-hide uses the same strip to reveal the bar (`nav_revealed`), drawn *over*
 the body -- in the flow, every reveal would resize every terminal -- and lets
-it go when the pointer leaves the bar. **The window buttons are optional**
+it go on the first pointer move outside it. That is a window-wide
+`on_mouse_event` registered from the bar's paint, **not** the bar's own
+`on_hover(false)`: gpui only reports leaving after it has seen the pointer
+inside, so a pointer that crossed the 44px bar in one move (a flick) left it
+out for good. **The window buttons are optional**
 (`Settings::window_buttons`): off, the separator before them goes too, and the
 OS still closes the window through the same close guard.
 

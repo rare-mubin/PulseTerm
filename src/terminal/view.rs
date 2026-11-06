@@ -667,6 +667,11 @@ impl Render for TerminalView {
         let theme = cx.global::<Theme>();
         let font = theme.font.clone();
         let font_size = theme.font_size;
+        // The setting, in plain pixels. The grid fits itself to what is left
+        // (the element measures its own bounds in prepaint and resizes the
+        // pty), and mouse positions are taken against the grid, not this
+        // box, so a change reflows open terminals and nothing else.
+        let padding = gpui::px(cx.global::<Settings>().terminal_padding);
 
         div()
             .id("terminal")
@@ -675,7 +680,7 @@ impl Render for TerminalView {
             .size_full()
             // No background: `Root` paints the window ground once, and a second
             // layer here would double up the opacity of a translucent window.
-            .p_1()
+            .p(padding)
             .font_family(font)
             .text_size(font_size)
             // Plain arrow, always. An I-beam is the convention for a text field

@@ -841,6 +841,18 @@ impl SettingsView {
                 ),
             ),
             row(
+                "Padding",
+                "Space between a terminal's edge and its text, on every side. Open terminals reflow.",
+                stepper(
+                    "terminal-padding",
+                    s.terminal_padding,
+                    2.,
+                    "px",
+                    |s, v| s.terminal_padding = v,
+                    ink,
+                ),
+            ),
+            row(
                 "Copy on select",
                 "Copy to the clipboard the moment a selection ends.",
                 toggle("copy-on-select", s.copy_on_select, |s, v| s.copy_on_select = v, ink),

@@ -3,10 +3,14 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use gpui::{
-    fill, point, px, size, App, Bounds, Element, ElementId, Entity, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Pixels, ShapedLine, StrikethroughStyle, Style,
-    TextRun, UnderlineStyle, Window,
+    fill, point, px, size, App, Bounds, Element, ElementId, Entity, FontId, GlobalElementId,
+    GlyphId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, ShapedLine,
+    SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
 };
 
 use super::emulator::{Emulator, TermSize};
@@ -20,7 +24,9 @@ use crate::theme::Theme;
 /// A hand-written `Element` rather than a tree of divs for the obvious reason:
 /// an 80x24 grid is ~2000 cells, and a div per cell would rebuild that many
 /// taffy nodes every frame. Here each frame walks the grid once and emits one
-/// shaped line per row plus one quad per run of same-coloured background.
+/// quad per run of same-coloured background and, for the text, either one
+/// glyph per cell from `GLYPHS` (the normal path) or one shaped line per row
+/// (ligatures on, which need a row's characters shaped together).
 pub struct TerminalElement {
     view: Entity<TerminalView>,
 }
@@ -35,7 +41,129 @@ pub struct LayoutState {
     cell: CellMetrics,
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     rows: Vec<PositionedRow>,
+    /// The glyph path's output: every visible glyph, placed.
+    glyphs: Vec<GlyphPaint>,
+    decorations: Vec<Decoration>,
+    font_size: Pixels,
     cursor: Option<CursorLayout>,
+}
+
+/// One glyph to paint, already at its pixel position (baseline included).
+struct GlyphPaint {
+    origin: gpui::Point<Pixels>,
+    font_id: FontId,
+    glyph: GlyphId,
+    color: Hsla,
+    emoji: bool,
+}
+
+/// An underline or strikethrough across one cell.
+struct Decoration {
+    origin: gpui::Point<Pixels>,
+    width: Pixels,
+    color: Hsla,
+    strike: bool,
+}
+
+// Each distinct character (with any combining marks, in bold or italic) shaped
+// once and remembered: a terminal is a grid of a monospace font, so a glyph's
+// shape never depends on its neighbours unless ligatures are on.
+//
+// Shaping whole rows every frame was the cost. A TUI that redraws braille or
+// colour across the screen (measured with `lite-eq`: 56 rows, 1,300 colour
+// runs, 6,400 characters a frame) spent ~15 ms a frame in the shaper -- about
+// 2.4 µs a character, font fallback included -- and drew at 30 fps where
+// Alacritty, which caches glyphs, is smooth. Shaping goes through gpui's own
+// path, so fallback fonts for braille, emoji and CJK resolve as before.
+//
+// Shared by every terminal (one font for all of them); it empties itself when
+// the font, size or weight changes, and if it ever grows past `LIMIT`.
+thread_local! {
+    static GLYPHS: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
+}
+
+#[derive(Default)]
+struct GlyphCache {
+    font: Option<(SharedString, u32, u32)>,
+    ascent: Pixels,
+    descent: Pixels,
+    map: HashMap<GlyphKey, Rc<[CachedGlyph]>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    c: char,
+    marks: Option<Box<[char]>>,
+    bold: bool,
+    italic: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CachedGlyph {
+    font_id: FontId,
+    glyph: GlyphId,
+    x: Pixels,
+    emoji: bool,
+}
+
+impl GlyphCache {
+    const LIMIT: usize = 10_000;
+
+    /// Empties the cache when the font changed, and keeps the base font's
+    /// ascent and descent for placing every glyph on one baseline.
+    fn sync(&mut self, theme: &Theme, window: &mut Window) {
+        let sig = (theme.font.clone(), f32::from(theme.font_size).to_bits(), theme.font_weight.0.to_bits());
+        if self.font.as_ref() == Some(&sig) && self.map.len() < Self::LIMIT {
+            return;
+        }
+        self.map.clear();
+        let run = TextRun {
+            len: 1,
+            font: theme.text_font(),
+            color: theme.fg,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let layout = window.text_system().layout_line("M", theme.font_size, &[run], None);
+        self.ascent = layout.ascent;
+        self.descent = layout.descent;
+        self.font = Some(sig);
+    }
+
+    fn glyphs(&mut self, key: GlyphKey, font: gpui::Font, theme: &Theme, window: &mut Window) -> Rc<[CachedGlyph]> {
+        if let Some(found) = self.map.get(&key) {
+            return found.clone();
+        }
+        let mut text = String::new();
+        text.push(key.c);
+        if let Some(marks) = &key.marks {
+            text.extend(marks.iter());
+        }
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: theme.fg,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let layout = window.text_system().layout_line(&text, theme.font_size, &[run], None);
+        let shaped: Rc<[CachedGlyph]> = layout
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs.iter().map(move |g| CachedGlyph {
+                    font_id: run.font_id,
+                    glyph: g.id,
+                    x: g.position.x,
+                    emoji: g.is_emoji,
+                })
+            })
+            .collect();
+        self.map.insert(key, shaped.clone());
+        shaped
+    }
 }
 
 struct PositionedRow {
@@ -160,6 +288,11 @@ impl Element for TerminalElement {
         let mut backgrounds = Vec::new();
         let mut rows = Vec::new();
         let mut row = RowBuilder::new(theme, cell, bounds.origin);
+        let mut glyphs = Vec::new();
+        let mut decorations = Vec::new();
+        if row.glyph_mode {
+            GLYPHS.with(|cache| cache.borrow_mut().sync(theme, window));
+        }
         let mut current_row: Option<i32> = None;
 
         for indexed in content.display_iter {
@@ -168,13 +301,13 @@ impl Element for TerminalElement {
             // this and scrollback renders above the top of the pane.
             let viewport_row = indexed.point.line.0 + display_offset;
             if current_row != Some(viewport_row) {
-                row.flush(window, &mut backgrounds, &mut rows);
+                row.flush(window, &mut backgrounds, &mut rows, &mut glyphs, &mut decorations);
                 row.start(viewport_row);
                 current_row = Some(viewport_row);
             }
             row.push(indexed.point, indexed.cell, colors, selection.as_ref());
         }
-        row.flush(window, &mut backgrounds, &mut rows);
+        row.flush(window, &mut backgrounds, &mut rows, &mut glyphs, &mut decorations);
 
         let cursor = layout_cursor(
             &content.cursor,
@@ -191,6 +324,9 @@ impl Element for TerminalElement {
             cell,
             backgrounds,
             rows,
+            glyphs,
+            decorations,
+            font_size: theme.font_size,
             cursor,
         }
     }
@@ -223,6 +359,41 @@ impl Element for TerminalElement {
                 // A paint failure here means one row's glyphs could not be
                 // rasterised; skipping it keeps the rest of the frame intact.
                 let _ = row.line.paint(row.origin, line_height, window, cx);
+            }
+
+            // The glyph path: each glyph straight from the cache to the GPU,
+            // skipped when it lies outside what is visible (a column scrolled
+            // off the strip still lays out, but need not paint).
+            let visible = window.content_mask().bounds;
+            let margin = layout.cell.height * 2.;
+            for g in &layout.glyphs {
+                if g.origin.y < visible.top() - margin
+                    || g.origin.y > visible.bottom() + margin
+                    || g.origin.x < visible.left() - margin
+                    || g.origin.x > visible.right() + margin
+                {
+                    continue;
+                }
+                let _ = if g.emoji {
+                    window.paint_emoji(g.origin, g.font_id, g.glyph, layout.font_size)
+                } else {
+                    window.paint_glyph(g.origin, g.font_id, g.glyph, layout.font_size, g.color)
+                };
+            }
+            for d in &layout.decorations {
+                if d.strike {
+                    window.paint_strikethrough(
+                        d.origin,
+                        d.width,
+                        &StrikethroughStyle { thickness: px(1.), color: Some(d.color) },
+                    );
+                } else {
+                    window.paint_underline(
+                        d.origin,
+                        d.width,
+                        &UnderlineStyle { thickness: px(1.), color: Some(d.color), wavy: false },
+                    );
+                }
             }
 
             if let Some(cursor) = &layout.cursor {
@@ -396,6 +567,11 @@ struct RowBuilder<'a> {
     origin: gpui::Point<Pixels>,
     line: i32,
 
+    /// Ligatures off (the default): cells are painted glyph by glyph from the
+    /// cache, and `cells` collects them instead of `text`/`runs`.
+    glyph_mode: bool,
+    cells: Vec<(usize, char, Option<Box<[char]>>, CellStyle)>,
+
     text: String,
     runs: Vec<TextRun>,
     open_style: Option<CellStyle>,
@@ -413,6 +589,8 @@ impl<'a> RowBuilder<'a> {
             cell,
             origin,
             line: 0,
+            glyph_mode: !theme.ligatures,
+            cells: Vec::new(),
             text: String::new(),
             runs: Vec::new(),
             open_style: None,
@@ -479,6 +657,13 @@ impl<'a> RowBuilder<'a> {
         };
 
         let c = if cell.c == '\0' { ' ' } else { cell.c };
+        if self.glyph_mode {
+            // A blank draws nothing unless a line runs under it.
+            if c != ' ' || style.underline || style.strikeout {
+                self.cells.push((col, c, cell.zerowidth().map(Box::from), style));
+            }
+            return;
+        }
         let len = c.len_utf8();
         self.text.push(c);
 
@@ -537,6 +722,60 @@ impl<'a> RowBuilder<'a> {
         }
     }
 
+    /// The glyph path for one row: each collected cell's glyphs from the
+    /// cache, at its column, on the base font's baseline; underline and
+    /// strikethrough where gpui's own line painter puts them.
+    fn emit_glyphs(
+        &mut self,
+        y: Pixels,
+        window: &mut Window,
+        glyphs: &mut Vec<GlyphPaint>,
+        decorations: &mut Vec<Decoration>,
+    ) {
+        let theme = self.theme;
+        GLYPHS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let (ascent, descent) = (cache.ascent, cache.descent);
+            let baseline = (self.cell.height - ascent - descent) / 2. + ascent;
+            let cells = std::mem::take(&mut self.cells);
+            for (col, c, marks, style) in cells {
+                let x = self.origin.x + self.cell.width * col as f32;
+                if c != ' ' {
+                    let font = self.text_run(style, 1).font;
+                    let key = GlyphKey { c, marks, bold: style.bold, italic: style.italic };
+                    for g in cache.glyphs(key, font, theme, window).iter() {
+                        glyphs.push(GlyphPaint {
+                            origin: point(x + g.x, y + baseline),
+                            font_id: g.font_id,
+                            glyph: g.glyph,
+                            color: style.fg,
+                            emoji: g.emoji,
+                        });
+                    }
+                }
+                if style.underline {
+                    decorations.push(Decoration {
+                        origin: point(x, y + baseline + descent * 0.618),
+                        width: self.cell.width,
+                        color: style.fg,
+                        strike: false,
+                    });
+                }
+                if style.strikeout {
+                    decorations.push(Decoration {
+                        origin: point(x, y + (ascent * 0.5 + baseline) * 0.5),
+                        width: self.cell.width,
+                        color: style.fg,
+                        strike: true,
+                    });
+                }
+            }
+        });
+        self.text.clear();
+        self.runs.clear();
+        self.open_style = None;
+    }
+
     fn trim_trailing_blanks(&mut self) {
         let keep = self.text.trim_end_matches(' ').len();
         if keep == self.text.len() {
@@ -566,8 +805,14 @@ impl<'a> RowBuilder<'a> {
         window: &mut Window,
         backgrounds: &mut Vec<(Bounds<Pixels>, Hsla)>,
         rows: &mut Vec<PositionedRow>,
+        glyphs: &mut Vec<GlyphPaint>,
+        decorations: &mut Vec<Decoration>,
     ) {
-        if self.text.is_empty() && self.backgrounds.is_empty() && self.open_bg.is_none() {
+        if self.text.is_empty()
+            && self.cells.is_empty()
+            && self.backgrounds.is_empty()
+            && self.open_bg.is_none()
+        {
             return;
         }
         self.commit_background();
@@ -582,6 +827,11 @@ impl<'a> RowBuilder<'a> {
                 },
                 color,
             ));
+        }
+
+        if self.glyph_mode {
+            self.emit_glyphs(y, window, glyphs, decorations);
+            return;
         }
 
         // Trailing blanks are not shaped. A row is built cell by cell across

@@ -168,6 +168,8 @@ pub struct Settings {
     /// Outline the focused pane and text field in the focus-ring colour.
     pub focus_ring: bool,
     pub scrollback: usize,
+    /// Space between a terminal's edge and its text, in pixels, on every side.
+    pub terminal_padding: f32,
     /// `block`, `bar` or `underline`.
     pub cursor_shape: String,
     pub copy_on_select: bool,
@@ -219,8 +221,8 @@ pub struct Settings {
     pub window_buttons: bool,
     /// Where each window's header sits: `top` or `bottom`.
     pub header_position: String,
-    /// The window headers: `show`, `hide` or `auto` (shown while the pointer
-    /// is over that window's header edge, or the window has the focus).
+    /// The window headers: `show`, `hide` or `auto` (laid over the content,
+    /// invisible until the pointer is over it -- `Pane::render`'s overlay).
     pub header_mode: String,
     /// Windows: "Open with PulseTerm" in File Explorer's right-click menu,
     /// for folders and files, registered for this user only (`shell_menu`).
@@ -248,6 +250,8 @@ impl Default for Settings {
             blur: false,
             focus_ring: true,
             scrollback: 10_000,
+            // What the fixed `p_1` used to give at the default font size.
+            terminal_padding: 4.,
             cursor_shape: "block".into(),
             copy_on_select: false,
             show_hidden: true,
@@ -291,6 +295,7 @@ impl Settings {
         self.font_weight = self.font_weight.clamp(100, 900);
         self.opacity = self.opacity.clamp(30., 100.);
         self.scrollback = self.scrollback.min(200_000);
+        self.terminal_padding = self.terminal_padding.clamp(0., 48.).round();
         self.editor_tab_size = self.editor_tab_size.clamp(1, 16);
         if !matches!(self.startup.as_str(), "home" | "resume" | "local") {
             self.startup = "home".into();
