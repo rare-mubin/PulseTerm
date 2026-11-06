@@ -62,17 +62,19 @@ Decided next (2026-11-02), following the recommendations below:
   SDL3 window, Opus audio with an adaptive, rate-steered buffer.
 * **One window**: setup screen, then the stream, with a sidebar of readings
   (fps, received Mbps, network/host/decode ms, audio queue), the controls and
-  the settings (`Ctrl+Alt+Shift+S` toggles it anywhere). **In a window** it
-  docks on the left: a strip the window's full height, its arrow in the
+  the settings (`Ctrl+Alt+Shift+S` toggles it anywhere). It sits on the
+  side the *Sidebar* setting picks (right by default). **In a window** it
+  docks there: a strip the window's full height, its arrow in the
   middle and all of it clickable, opens it *beside* the picture, which moves
   over and letterboxes into what is left (`App::picture_area`; `Stream::draw`
   takes the area and maps the pointer through it). The host keeps the
   pointer and keys whenever they are over the picture, so the stream stays
   usable with the sidebar open. **In full screen** the picture keeps the whole
-  screen: an arrow revealed by resting on the right edge opens the sidebar
-  over it, and a click outside shuts it. On Windows that edge is the resize
-  border, which the app never sees, so the reveal zone is the strip just
-  inside it (`chrome::reveal_zone`).
+  screen: an arrow revealed by resting on that edge opens the sidebar
+  over it, and a click outside shuts it. In full screen (or maximised) the
+  zone is the outermost few pixels, where the pointer stops; in a normal
+  window on Windows that edge is the resize border, which the app never
+  sees, so the zone is the strip just inside it (`chrome::reveal_zone`).
 * **Settings, mostly live**: resolution, fps, codec, bitrate (rejoin in a
   second or so); audio here/host/both; full keyboard; mouse desktop/game;
   pointer host's/both; scroll as here/reversed; latency normal/low; host CPU

@@ -55,6 +55,9 @@ pub struct StreamConfig {
     /// The host display to stream, by connector name (`HDMI-A-1`); empty
     /// lets Sunshine pick.
     pub display: String,
+    /// Which edge the sidebar lives on: `left` or `right`. In a window it docks
+    /// there beside the picture; in full screen it slides over from there.
+    pub sidebar: String,
     // No "keep Sunshine running": PulseTerm's instance is started with `-1`
     // and forgets its pairings on exit, so one left running would be paired
     // with nothing. It lives exactly as long as this window (sunshine.rs).
@@ -81,6 +84,7 @@ impl Default for StreamConfig {
             threads: 2,
             fec: 20,
             display: String::new(),
+            sidebar: "right".into(),
         }
     }
 }
@@ -123,6 +127,9 @@ impl StreamConfig {
         }
         if ![5, 10, 20].contains(&self.fec) {
             self.fec = 20;
+        }
+        if !["left", "right"].contains(&self.sidebar.as_str()) {
+            self.sidebar = "right".into();
         }
         if !["window", "native", "720", "1080", "1440", "2160"].contains(&self.resolution.as_str()) {
             self.resolution = "window".into();

@@ -1586,8 +1586,8 @@ bytes become one texture.
 `REMOTE_DESKTOP.md` is the design and the log; its *Where it stands* section
 is the current picture. In short: an SSH-only nav icon (`Ctrl+Shift+M`)
 starts **`pulseterm-remote`**, a separate GPL-3.0 program -- one SDL3 window
-(a setup screen, then the stream with a sidebar -- docked on the left behind
-a strip in a window, laid over the picture from the right in full screen) built
+(a setup screen, then the stream with a sidebar on the side its setting picks, right by default -- docked
+behind a strip in a window, laid over the picture in full screen) built
 on moonlight-common-c and FFmpeg, streaming from **PulseTerm's own Sunshine**
 on the host. Things to know before touching it:
 

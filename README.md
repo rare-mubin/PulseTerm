@@ -124,8 +124,9 @@ a fresh install opens on.
   starts PulseTerm's own [Sunshine](https://github.com/LizardByte/Sunshine)
   instance on the host, pairs with it (nothing to type, nothing stored) and
   streams it with hardware decoding, audio and full keyboard and mouse.
-  Settings change live in a sidebar: in a window it opens beside the picture
-  from a strip on the left; in full screen it slides over from the right.
+  Settings change live in a sidebar on the side you choose (right by
+  default): in a window it opens beside the picture from a strip on that
+  edge; in full screen it slides over the picture from that edge.
 - It is a **separate program** (`pulseterm-remote`, GPL-3.0) that PulseTerm
   finds at run time; built without it, PulseTerm simply has no remote icon. See
   [REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md) for the design, the host

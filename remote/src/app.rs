@@ -36,6 +36,15 @@ enum CursorState {
 
 /// A small dot cursor -- the theme's ink with a ground-coloured ring, so it
 /// shows on any picture -- sized for the screen's density, hot spot centred.
+/// The arrow's glyph: it points the way the sidebar will move -- out from its
+/// edge to open, back towards it to shut.
+fn arrow(left: bool, open: bool) -> &'static str {
+    match (left, open) {
+        (true, false) | (false, true) => "›",
+        (true, true) | (false, false) => "‹",
+    }
+}
+
 fn dot_cursor(t: &crate::theme::Theme, scale: f32) -> *mut SDL_Cursor {
     let size = (11.0 * scale).round().max(7.0) as i32;
     let c = (size - 1) as f32 / 2.0;
@@ -682,8 +691,12 @@ impl App {
                     // The last few pixels -- or, on Windows, the strip just
                     // inside the resize border, which the app never sees
                     // (`chrome::reveal_zone`).
-                    let (outer, inner) = crate::chrome::reveal_zone();
-                    let at_edge = m.x >= self.ui.width - outer && m.x < self.ui.width - inner;
+                    let (outer, inner) = crate::chrome::reveal_zone(self.window);
+                    let at_edge = if self.sidebar_left() {
+                        m.x < outer && m.x >= inner
+                    } else {
+                        m.x >= self.ui.width - outer && m.x < self.ui.width - inner
+                    };
                     if at_edge {
                         self.edge_since.get_or_insert_with(Instant::now);
                     } else if !self.over_tab() {
@@ -846,16 +859,36 @@ impl App {
         }
     }
 
+    /// Whether the sidebar lives on the left edge (`StreamConfig::sidebar`).
+    fn sidebar_left(&self) -> bool {
+        self.config.sidebar == "left"
+    }
+
     /// Where the picture goes: the whole window, or what the docked panel
-    /// leaves of it.
+    /// leaves of it, on whichever side the panel is not.
     fn picture_area(&self) -> (f32, f32, f32, f32) {
-        let x = self.panel_width();
-        (x, 0.0, (self.ui.width - x).max(1.0), self.ui.height)
+        let panel = self.panel_width();
+        let x = if self.sidebar_left() { panel } else { 0.0 };
+        (x, 0.0, (self.ui.width - panel).max(1.0), self.ui.height)
     }
 
     /// Whether a point is over the docked strip or sidebar.
     fn over_panel(&self, x: f32) -> bool {
-        x < self.panel_width()
+        let panel = self.panel_width();
+        if self.sidebar_left() {
+            x < panel
+        } else {
+            x >= self.ui.width - panel
+        }
+    }
+
+    /// Where the sidebar's left edge goes, open: against its window edge.
+    fn sidebar_x(&self) -> f32 {
+        if self.sidebar_left() {
+            0.0
+        } else {
+            self.ui.width - Self::SIDEBAR
+        }
     }
 
     /// Whether the sidebar is laid over the picture (full screen), which takes
@@ -871,13 +904,14 @@ impl App {
     }
 
     fn tab_rect(&self) -> (f32, f32, f32, f32) {
-        let x = if self.sidebar { self.ui.width - Self::SIDEBAR - Self::TAB.0 } else { self.ui.width - Self::TAB.0 };
+        let open = if self.sidebar { Self::SIDEBAR } else { 0.0 };
+        let x = if self.sidebar_left() { open } else { self.ui.width - open - Self::TAB.0 };
         (x, (self.ui.height - Self::TAB.1) / 2.0, Self::TAB.0, Self::TAB.1)
     }
 
     /// The arrow shows while the sidebar is open, and after the pointer has
-    /// rested a moment on the right edge -- not otherwise, so the host gets the
-    /// whole picture.
+    /// rested a moment on the sidebar's edge -- not otherwise, so the host gets
+    /// the whole picture. Full screen only; a window has the docked strip.
     fn tab_visible(&self) -> bool {
         !self.docked() && (self.sidebar || self.edge_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(300)))
     }
@@ -923,7 +957,8 @@ impl App {
         if self.docked() {
             self.draw_strip();
             if self.sidebar {
-                self.draw_sidebar(0.0);
+                let x0 = self.sidebar_x();
+                self.draw_sidebar(x0);
             }
             return;
         }
@@ -937,7 +972,7 @@ impl App {
         self.ui.vline(x, y, h, t.border);
         self.ui.hline(x, y, w, t.border);
         self.ui.hline(x, y + h - 1.0, w, t.border);
-        let glyph = if self.sidebar { "›" } else { "‹" };
+        let glyph = arrow(self.sidebar_left(), self.sidebar);
         let gw = self.ui.measure(glyph, t.head(), true);
         let colour = if hover { t.fg } else { t.fg_muted };
         self.ui.text(x + (w - gw) / 2.0, y + (h - self.ui.line(t.head())) / 2.0, glyph, t.head(), true, colour);
@@ -946,7 +981,7 @@ impl App {
             self.ui.click = false;
         }
         if self.sidebar {
-            let x0 = self.ui.width - Self::SIDEBAR;
+            let x0 = self.sidebar_x();
             self.draw_sidebar(x0);
         }
     }
@@ -956,13 +991,15 @@ impl App {
     /// strip that only took clicks on its arrow would be a 16px target.
     fn draw_strip(&mut self) {
         let t = self.ui.t.clone();
-        let x = if self.sidebar { Self::SIDEBAR } else { 0.0 };
+        let open = if self.sidebar { Self::SIDEBAR } else { 0.0 };
+        let left = self.sidebar_left();
+        let x = if left { open } else { self.ui.width - open - Self::STRIP };
         let (w, h) = (Self::STRIP, self.ui.height);
         let hover = self.ui.hover(x, 0.0, w, h);
         self.ui.fill(x, 0.0, w, h, if hover { t.raised } else { t.surface }, 255);
-        self.ui.vline(x + w - 1.0, 0.0, h, t.border);
-        // Points the way it will move: open to the right, shut to the left.
-        let glyph = if self.sidebar { "‹" } else { "›" };
+        // The hairline on the side that faces the picture.
+        self.ui.vline(if left { x + w - 1.0 } else { x }, 0.0, h, t.border);
+        let glyph = arrow(left, self.sidebar);
         let gw = self.ui.measure(glyph, t.head(), true);
         let colour = if hover { t.fg } else { t.fg_muted };
         self.ui.text(x + (w - gw) / 2.0, (h - self.ui.line(t.head())) / 2.0, glyph, t.head(), true, colour);
@@ -985,7 +1022,9 @@ impl App {
             return;
         }
         self.ui.fill(x0, 0.0, sw, wh, t.surface, 240);
-        self.ui.vline(x0, 0.0, wh, t.border);
+        // The hairline on the side that faces the picture.
+        let edge = if self.sidebar_left() { x0 + sw - 1.0 } else { x0 };
+        self.ui.vline(edge, 0.0, wh, t.border);
 
         // Header, like the setup screen's bar.
         let bar = t.bar();
@@ -1183,6 +1222,12 @@ impl App {
         if let Some(v) = row(self, "Latency", &mut y, &[("normal", "normal"), ("low", "low")], &c.latency) {
             self.set(|c| c.latency = v.into());
             self.sync_latency();
+        }
+        // Where this very sidebar lives: beside the picture in a window, over
+        // it in full screen. Moves at once.
+        if let Some(v) = row(self, "Sidebar", &mut y, &[("left", "left"), ("right", "right")], &c.sidebar) {
+            self.set(|c| c.sidebar = v.into());
+            self.edge_since = None;
         }
         let lat = "Low: frames show the moment they are decoded (the picture may tear), a shorter audio buffer, and the host's encoder in its low-latency mode -- that part applies when Sunshine restarts.";
         y += self.ui.paragraph(x, y - 8.0, 330.0, lat, t.fg_subtle) + 6.0;

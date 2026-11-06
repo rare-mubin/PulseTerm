@@ -21,12 +21,16 @@ use crate::ui::Ui;
 /// Whether the window draws its own caption: Windows only.
 pub const OWN_CAPTION: bool = cfg!(windows);
 
-/// How far in from the right edge the pointer reveals the sidebar's arrow.
-/// Elsewhere the last few pixels do; on Windows those are the resize border
-/// (`EDGE`), which Windows keeps for itself -- the app never sees the pointer
-/// there -- so the zone is the strip just inside it instead.
-pub fn reveal_zone() -> (f32, f32) {
-    if OWN_CAPTION {
+/// How far in from the window's edge the pointer reveals the sidebar's arrow,
+/// as (outer, inner) distances. Normally the last few pixels. On Windows, a
+/// window with free edges has them as its resize border (`EDGE`), which
+/// Windows keeps for itself -- the app never sees the pointer there -- so the
+/// zone is the strip just inside it. Full screen and maximised have no
+/// resize border, and the pointer stops on the screen's last pixel: there
+/// the zone has to be the outermost pixels again, or it can never be reached.
+pub fn reveal_zone(window: *mut SDL_Window) -> (f32, f32) {
+    let free = unsafe { SDL_GetWindowFlags(window) } & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN) == 0;
+    if OWN_CAPTION && free {
         (EDGE + 10.0, EDGE)
     } else {
         (4.0, 0.0)
