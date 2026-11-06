@@ -790,6 +790,9 @@ impl App {
 
     fn frame(&mut self) {
         let t = self.ui.t.clone();
+        // No caption unless a bar below claims one this frame: with the
+        // sidebar shut, the stream picture is the host's, every pixel of it.
+        crate::chrome::set_caption(None, (0.0, 0.0, 0.0, 0.0));
         unsafe {
             SDL_SetRenderDrawBlendMode(self.ui.r, SDL_BLENDMODE_BLEND);
             SDL_SetRenderDrawColor(self.ui.r, t.bg.0, t.bg.1, t.bg.2, 255);
@@ -900,6 +903,10 @@ impl App {
         let started = self.stream.as_ref().map(|s| s.started).unwrap_or(false);
         let (word, tint) = if started { ("streaming", t.accent) } else { ("connecting", t.warning) };
         self.ui.micro(x, ty, word, tint);
+        // While streaming this header is the only bar on screen, so on Windows
+        // it is the caption and carries the window's buttons.
+        let buttons = crate::chrome::buttons(&mut self.ui, self.window, x0 + sw, bar);
+        crate::chrome::set_caption(Some((x0, 0.0, sw, bar)), (buttons, 0.0, x0 + sw - buttons, bar));
         self.ui.hline(x0, bar, sw, t.border);
 
         let pad = 20.0;
@@ -1186,10 +1193,14 @@ impl App {
         let host = self.host.clone();
         x += self.ui.text(x, (bar - t.line_height) / 2.0, &host, t.font_size, false, t.fg) + 16.0;
         self.ui.micro(x, ty, word, tint);
+        // The bar is the window's caption on Windows, with its buttons at the
+        // right end (`chrome`); elsewhere `buttons` takes no room.
+        let buttons = crate::chrome::buttons(&mut self.ui, self.window, w, bar);
+        crate::chrome::set_caption(Some((0.0, 0.0, w, bar)), (buttons, 0.0, w - buttons, bar));
         // An address is not a label: small, but not spaced out in capitals.
         let address = self.address.clone();
         let aw = self.ui.measure(&address, t.micro(), false);
-        self.ui.text(w - 16.0 - aw, ty, &address, t.micro(), false, t.fg_subtle);
+        self.ui.text(buttons - 16.0 - aw, ty, &address, t.micro(), false, t.fg_subtle);
 
         // The footer.
         let footer = t.bar();

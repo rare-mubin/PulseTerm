@@ -846,12 +846,37 @@ fn keycap(text: &str, ink: Ink) -> AnyElement {
 fn shell_name(cx: &Context<Workspace>) -> String {
     let configured = cx.global::<Settings>().local_shell.clone();
     let path = if configured.is_empty() {
+        #[cfg(windows)]
+        if let Some(shell) = windows_default_shell() {
+            return label_of(&shell);
+        }
         std::env::var("SHELL")
             .or_else(|_| std::env::var("ComSpec"))
             .unwrap_or_default()
     } else {
         configured
     };
+    label_of(&path)
+}
+
+/// What "best installed" resolves to on Windows -- pwsh before powershell
+/// before cmd -- which `%ComSpec%` (always cmd) does not say. Finding it
+/// means a few file checks, which the first frame may not wait on, so the
+/// first call starts them on a thread and answers `None`; home redraws every
+/// frame and picks the result up a frame or two later.
+#[cfg(windows)]
+fn windows_default_shell() -> Option<String> {
+    static FOUND: OnceLock<String> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let _ = FOUND.set(crate::local::default_shell());
+        });
+    });
+    FOUND.get().cloned()
+}
+
+fn label_of(path: &str) -> String {
     path.rsplit(['/', '\\'])
         .next()
         .map(|name| name.trim_end_matches(".exe").to_string())

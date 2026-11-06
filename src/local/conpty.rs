@@ -85,7 +85,7 @@ impl Drop for Console {
 /// everything that can fail does so before the first byte moves.
 pub fn open(cols: u32, rows: u32, program: PtyProgram, shell: String) -> Result<Pty, String> {
     let start_in = match &program {
-        PtyProgram::ShellIn(path) => Some(path.clone()),
+        PtyProgram::ShellIn(path) | PtyProgram::CommandIn { dir: path, .. } => Some(path.clone()),
         _ => None,
     };
     let command = match program {
@@ -93,7 +93,7 @@ pub fn open(cols: u32, rows: u32, program: PtyProgram, shell: String) -> Result<
         // A command replaces the shell rather than being fed to it: quoting a
         // command line through an unknown shell is a guess, and the caller
         // already knows exactly what it wants run.
-        PtyProgram::Command(command) => command,
+        PtyProgram::Command(command) | PtyProgram::CommandIn { command, .. } => command,
     };
 
     let console = spawn(cols.max(1) as i16, rows.max(1) as i16, &command, start_in)?;

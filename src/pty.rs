@@ -59,4 +59,11 @@ pub enum PtyProgram {
     /// The login shell, started in this directory -- the file tree's "open
     /// in terminal". A path on the host the terminal runs on.
     ShellIn(String),
+    /// A command line, started in this directory: `pulseterm
+    /// --working-directory DIR -e CMD`. The directory travels apart from the
+    /// command so each backend can use its own way in -- a working directory
+    /// for ConPTY and the Unix pty, `cd` for a POSIX shell over SSH. Baked
+    /// into a `cd '...' && exec` string, as it once was, it ran nowhere but
+    /// under `/bin/sh`.
+    CommandIn { command: String, dir: String },
 }

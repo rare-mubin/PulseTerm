@@ -146,6 +146,13 @@ a fresh install opens on.
   monospace font with size, line height, weight and ligatures, window
   transparency, rebindable keys, and terminal, file tree and editor options.
   Everything applies live, including to open terminals.
+- **As much chrome as you want** — the navigation bar and every window header
+  can each be shown, auto-hidden (they appear when the pointer reaches them,
+  drawn over the content so nothing resizes) or hidden; headers go top or
+  bottom; the minimise / maximise / close buttons are optional.
+- **"Open with PulseTerm" in File Explorer** (Windows, optional) — on a file it
+  opens in the editor, on a folder a shell opens there. Per user, no admin;
+  `PulseTerm.exe PATH` does the same from the command line.
 - **Native window chrome** — the navigation bar is the window's caption: on
   Windows with the real OS move loop (Snap, Snap Assist, Aero Shake); on Linux
   with client-side decorations and the compositor's own move, resize and menu.

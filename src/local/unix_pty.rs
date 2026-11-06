@@ -133,7 +133,9 @@ fn spawn(master: &OwnedFd, program: PtyProgram, shell: &str) -> Result<Child, St
 
     // Where the shell starts: home, unless it was asked to start somewhere.
     let start_in = match &program {
-        PtyProgram::ShellIn(path) => Some(std::path::PathBuf::from(path)),
+        PtyProgram::ShellIn(path) | PtyProgram::CommandIn { dir: path, .. } => {
+            Some(std::path::PathBuf::from(path))
+        }
         _ => dirs::home_dir(),
     };
     let mut command = match program {
@@ -141,7 +143,7 @@ fn spawn(master: &OwnedFd, program: PtyProgram, shell: &str) -> Result<Child, St
         PtyProgram::LoginShell | PtyProgram::ShellIn(_) => Command::new(shell),
         // Unlike Windows, Linux always has /bin/sh, so a command line is handed
         // to it to parse rather than split here with a guess at the quoting.
-        PtyProgram::Command(line) => {
+        PtyProgram::Command(line) | PtyProgram::CommandIn { command: line, .. } => {
             let mut command = Command::new("/bin/sh");
             command.arg("-c").arg(line);
             command

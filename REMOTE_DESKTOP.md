@@ -89,8 +89,13 @@ Decided next (2026-11-02), following the recommendations below:
    keyboard there is SDL's keyboard grab -- a low-level keyboard hook, so
    no permission step and no udev notice -- with Alt+Tab sent to the host
    too (`SDL_ALLOW_ALT_TAB_WHILE_GRABBED=0`); Ctrl+Alt+Del and Win+L stay
-   Windows'. Still to do: the system titlebar SDL adds above the window's
-   own bar.
+   Windows'. **One caption on Windows** (`remote/src/chrome.rs`): the window
+   is borderless and its own bar -- the setup screen's, or the sidebar's
+   header while streaming -- is the caption through `SDL_SetWindowHitTest`,
+   so Windows runs the real move loop (Aero Snap, double-click to maximise)
+   and edge resizing; minimise / maximise / close are drawn in the bar. With
+   the sidebar shut the picture is the host's and only the edges answer.
+   Linux is unchanged: the compositor decides about decorations.
 
 Smaller: live theme updates (the theme is handed over once, at launch); the
 shifted-port case (written, untested); the pointer lock on GNOME/KDE/X11

@@ -54,6 +54,15 @@ pub async fn open(
                     .await
                     .map_err(|e| format!("Failed to start shell: {e}"))?
             }
+            // The same `cd` for a command: the remote shell is POSIX, so the
+            // command line is run there as given.
+            PtyProgram::CommandIn { command, dir } => {
+                let quoted = format!("'{}'", dir.replace('\'', "'\\''"));
+                channel
+                    .exec(true, format!("cd {quoted} && exec {command}"))
+                    .await
+                    .map_err(|e| format!("Failed to run command: {e}"))?
+            }
         }
 
         runtime::detach(pump(channel, rx, event_tx));

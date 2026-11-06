@@ -189,6 +189,13 @@ pub struct Strip {
     /// The widest a column may be drawn beside others, as a share of the
     /// viewport (`Settings::max_column_width`). Set by the workspace.
     pub max_share: f32,
+    /// Set while a window header is pressed, cleared on the release. A press
+    /// focuses its window at once, and focusing a column that is partly off
+    /// screen scrolls the strip to show it -- which, at the start of a drag
+    /// by that header, slid every window under the pointer before gpui had
+    /// even decided it was a drag, and the drop landed somewhere else. So the
+    /// scroll waits for the button to come up; by then any drop is done.
+    pub hold_scroll: bool,
     /// The strip's laid-out bounds, recorded each frame by a `canvas`. Keeping
     /// the focus on screen needs the viewport's width, and nothing else in the
     /// layout pass can report it.
@@ -204,6 +211,7 @@ impl Strip {
             shown_scroll: Glide::new(0.),
             last_viewport: 0.,
             max_share: 0.9,
+            hold_scroll: false,
             bounds: Rc::new(Cell::new(Bounds::default())),
         }
     }
@@ -222,6 +230,7 @@ impl Strip {
             shown_scroll: Glide::new(0.),
             last_viewport: 0.,
             max_share: 0.9,
+            hold_scroll: false,
             bounds: Rc::new(Cell::new(Bounds::default())),
         }
     }
@@ -523,7 +532,9 @@ impl Strip {
         let bg = (!theme.translucent()).then_some(theme.bg);
 
         let viewport = f32::from(self.bounds.get().size.width);
-        self.scroll_to_focus(viewport);
+        if !self.hold_scroll {
+            self.scroll_to_focus(viewport);
+        }
 
         let measured = self.bounds.clone();
         let mut container = div()

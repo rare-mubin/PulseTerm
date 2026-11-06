@@ -210,6 +210,23 @@ pub struct Settings {
     /// percentage of the strip. Below 100 the neighbours always peek in at the
     /// edge, so there is a seam to grab and somewhere to scroll to.
     pub max_column_width: f32,
+    /// The navigation bar: `show`, `hide` or `auto` (slides in while the
+    /// pointer is at its edge). Hidden, the window has no caption of its own
+    /// -- see `ui::nav_bar` for what keeps it movable.
+    pub nav_mode: String,
+    /// Whether the bar carries minimise / maximise / close. Off, the window
+    /// still closes through the OS (Alt-F4, the taskbar) and the close guard.
+    pub window_buttons: bool,
+    /// Where each window's header sits: `top` or `bottom`.
+    pub header_position: String,
+    /// The window headers: `show`, `hide` or `auto` (shown while the pointer
+    /// is over that window's header edge, or the window has the focus).
+    pub header_mode: String,
+    /// Windows: "Open with PulseTerm" in File Explorer's right-click menu,
+    /// for folders and files, registered for this user only (`shell_menu`).
+    /// Mirrors what the registry says rather than being trusted blindly: the
+    /// Settings page re-reads it.
+    pub explorer_menu: bool,
 }
 
 impl Global for Settings {}
@@ -250,6 +267,11 @@ impl Default for Settings {
             animation_curve: "ease".into(),
             default_width: "half".into(),
             max_column_width: 90.,
+            nav_mode: "show".into(),
+            window_buttons: true,
+            header_position: "top".into(),
+            header_mode: "show".into(),
+            explorer_menu: false,
         }
     }
 }
@@ -288,6 +310,14 @@ impl Settings {
         self.max_column_width = self.max_column_width.clamp(50., 100.);
         if !matches!(self.default_width.as_str(), "third" | "half" | "two_thirds" | "full") {
             self.default_width = "half".into();
+        }
+        for mode in [&mut self.nav_mode, &mut self.header_mode] {
+            if !matches!(mode.as_str(), "show" | "hide" | "auto") {
+                *mode = "show".into();
+            }
+        }
+        if !matches!(self.header_position.as_str(), "top" | "bottom") {
+            self.header_position = "top".into();
         }
     }
 

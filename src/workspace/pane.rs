@@ -32,6 +32,23 @@ pub struct WindowDrag {
 /// bottom. Sides are the narrower target on purpose -- stacking is the gesture
 /// that keeps you where you are, a new column is the one that reshapes the
 /// strip, and the bigger target should be the cheaper mistake.
+/// `Settings::header_mode`, read once per render.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderMode {
+    Show,
+    Hide,
+    Auto,
+}
+
+/// Where a window's header can go: in the column's flow above or below the
+/// content, or laid over it (auto-hide).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderSlot {
+    Before,
+    After,
+    Overlay,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropZone {
     Above,
@@ -117,6 +134,9 @@ impl Render for DragGhost {
 /// thing allowed to restructure it.
 pub enum PaneEvent {
     Focused,
+    /// A window header was pressed: the strip holds its scroll until the
+    /// button comes up (`Strip::hold_scroll`), in case this is a drag.
+    HoldScroll,
     /// Every item is gone; the workspace should collapse this pane out of the
     /// tree (unless it is the last one left).
     Empty,
@@ -234,6 +254,31 @@ impl Pane {
         if focus {
             self.focus_active_item(window, cx);
         }
+        cx.notify();
+    }
+
+    /// Swaps the window at `ix` for `item` in place: same slot in the stack,
+    /// same share of the column's height, and focused. The old window is
+    /// dropped. Not `take_item` + `insert_item`: taking the only window out of
+    /// a column empties it, and the workspace collapses an empty column off
+    /// the strip before the new one could go in.
+    pub fn replace_item(
+        &mut self,
+        ix: usize,
+        item: PaneItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.items.len() {
+            return;
+        }
+        let old = self.items[ix].id(cx);
+        if let Some(weight) = self.row_weights.remove(&old) {
+            self.row_weights.insert(item.id(cx), weight);
+        }
+        self.items[ix] = item;
+        self.active_ix = ix;
+        self.focus_active_item(window, cx);
         cx.notify();
     }
 
@@ -410,6 +455,16 @@ impl Render for Pane {
         // 26px at the default font, and it grows with the type like
         // everything else.
         let header_height = crate::ui::kit::header(theme);
+        // Opaque: an auto-hidden header is drawn over the content, and a
+        // translucent one would show the terminal's text through its labels.
+        let header_ground = theme.palette.bg;
+        let settings = cx.global::<crate::store::Settings>();
+        let header_bottom = settings.header_position == "bottom";
+        let header_mode = match settings.header_mode.as_str() {
+            "hide" => HeaderMode::Hide,
+            "auto" => HeaderMode::Auto,
+            _ => HeaderMode::Show,
+        };
         let micro = crate::ui::kit::micro(theme);
         let width_label = self.width_label.clone();
 
@@ -476,72 +531,11 @@ impl Render for Pane {
                     fg_muted
                 };
 
-                let mut frame = div()
-                    .id(("window", ix))
-                    .relative()
-                    // The ground, once, behind header and content alike: the
-                    // header is part of the window, not a band laid over it,
-                    // so it blends -- only a hairline divides them.
-                    .bg(bg)
-                    .flex()
-                    .flex_col()
-                    .flex_basis(relative(0.))
-                    .min_h_0();
-                // Its share of the column, set by dragging the boundary under
-                // it. gpui's `flex_grow()` only ever means 1, so the weight
-                // goes into the style directly.
-                frame.style().flex_grow = Some(weight);
-                frame
-                    .child(
-                        canvas(
-                            move |bounds, _, _| {
-                                if let Some(slot) = measured.borrow_mut().get_mut(ix) {
-                                    *slot = bounds;
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    // Window-wide, like every `on_drag_move`: work out whether
-                    // the drag is over *this* window before claiming it, and
-                    // let go of the claim when it moves elsewhere.
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<WindowDrag>, _window, cx| {
-                            let here = DropZone::locate(event.event.position, event.bounds);
-                            let next = match here {
-                                Some(zone) => Some((ix, zone)),
-                                None if this.drop_hover.is_some_and(|(at, _)| at == ix) => None,
-                                None => return,
-                            };
-                            if this.drop_hover != next {
-                                this.drop_hover = next;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .on_drop(cx.listener(move |this, drag: &WindowDrag, _window, cx| {
-                        let zone = match this.drop_hover.take() {
-                            Some((at, zone)) if at == ix => zone,
-                            // The hover is a frame behind the pointer at worst;
-                            // a drop with no zone yet stacks underneath.
-                            _ => DropZone::Below,
-                        };
-                        cx.emit(PaneEvent::DropWindow {
-                            from: drag.from.clone(),
-                            item: drag.item,
-                            target: ix,
-                            zone,
-                        });
-                        cx.notify();
-                    }))
-                    // One hairline between stacked windows, drawn by every
-                    // window but the first. The column's outer edges belong to
-                    // the strip, which draws the seam between columns.
-                    .when(ix > 0, |this| this.border_t_1().border_color(border))
-                    .child(
-                        div()
+                // The header, built once and put where the settings say: above
+                // or below the content, drawn over it (auto-hide: invisible
+                // until the pointer reaches it, so the content never reflows),
+                // or not at all.
+                let header = div()
                             .id(("header", ix))
                             .flex()
                             .items_center()
@@ -660,11 +654,108 @@ impl Render for Pane {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    // First, so the scroll is held before the
+                                    // focus change below would move it.
+                                    cx.emit(PaneEvent::HoldScroll);
                                     this.activate_item(ix, window, cx);
                                     cx.emit(PaneEvent::Focused);
                                 }),
-                            ),
+                            )
+                .into_any_element();
+                let mut header = Some(header);
+                let mut header_at = |slot: HeaderSlot| {
+                    let wanted = match (header_mode, header_bottom) {
+                        (HeaderMode::Hide, _) => None,
+                        (HeaderMode::Show, false) => Some(HeaderSlot::Before),
+                        (HeaderMode::Show, true) => Some(HeaderSlot::After),
+                        (HeaderMode::Auto, _) => Some(HeaderSlot::Overlay),
+                    };
+                    if wanted != Some(slot) {
+                        return None;
+                    }
+                    let header = header.take()?;
+                    Some(match slot {
+                        HeaderSlot::Overlay => div()
+                            .id(("header-auto", ix))
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .when(!header_bottom, |this| this.top_0())
+                            .when(header_bottom, |this| this.bottom_0())
+                            .bg(header_ground)
+                            .opacity(0.)
+                            .hover(|this| this.opacity(1.))
+                            .child(header)
+                            .into_any_element(),
+                        _ => header,
+                    })
+                };
+
+                let mut frame = div()
+                    .id(("window", ix))
+                    .relative()
+                    // The ground, once, behind header and content alike: the
+                    // header is part of the window, not a band laid over it,
+                    // so it blends -- only a hairline divides them.
+                    .bg(bg)
+                    .flex()
+                    .flex_col()
+                    .flex_basis(relative(0.))
+                    .min_h_0();
+                // Its share of the column, set by dragging the boundary under
+                // it. gpui's `flex_grow()` only ever means 1, so the weight
+                // goes into the style directly.
+                frame.style().flex_grow = Some(weight);
+                frame
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                if let Some(slot) = measured.borrow_mut().get_mut(ix) {
+                                    *slot = bounds;
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
                     )
+                    // Window-wide, like every `on_drag_move`: work out whether
+                    // the drag is over *this* window before claiming it, and
+                    // let go of the claim when it moves elsewhere.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<WindowDrag>, _window, cx| {
+                            let here = DropZone::locate(event.event.position, event.bounds);
+                            let next = match here {
+                                Some(zone) => Some((ix, zone)),
+                                None if this.drop_hover.is_some_and(|(at, _)| at == ix) => None,
+                                None => return,
+                            };
+                            if this.drop_hover != next {
+                                this.drop_hover = next;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, drag: &WindowDrag, _window, cx| {
+                        let zone = match this.drop_hover.take() {
+                            Some((at, zone)) if at == ix => zone,
+                            // The hover is a frame behind the pointer at worst;
+                            // a drop with no zone yet stacks underneath.
+                            _ => DropZone::Below,
+                        };
+                        cx.emit(PaneEvent::DropWindow {
+                            from: drag.from.clone(),
+                            item: drag.item,
+                            target: ix,
+                            zone,
+                        });
+                        cx.notify();
+                    }))
+                    // One hairline between stacked windows, drawn by every
+                    // window but the first. The column's outer edges belong to
+                    // the strip, which draws the seam between columns.
+                    .when(ix > 0, |this| this.border_t_1().border_color(border))
+                    .children(header_at(HeaderSlot::Before))
                     .child(
                         div()
                             .flex_1()
@@ -672,12 +763,15 @@ impl Render for Pane {
                             .overflow_hidden()
                             .child(item.to_any_view().into_any_element()),
                     )
+                    .children(header_at(HeaderSlot::After))
+                    .children(header_at(HeaderSlot::Overlay))
                     // The content's own divider, carried up through the
                     // header so it runs to the top of the window.
-                    .children(divider.map(|x| {
+                    .children(divider.filter(|_| header_mode == HeaderMode::Show).map(|x| {
                         div()
                             .absolute()
-                            .top_0()
+                            .when(!header_bottom, |this| this.top_0())
+                            .when(header_bottom, |this| this.bottom_0())
                             .left(px(x - 1.))
                             .w(px(1.))
                             .h(header_height)

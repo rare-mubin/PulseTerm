@@ -186,7 +186,11 @@ fn horizontal(
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_home(window, cx)))
                 .child(clock()),
         )
-        .child(window_buttons(false, size, fg, fg_subtle, danger, window, cx))
+        // Settings -> Interface can leave them off; the OS still closes the
+        // window (Alt-F4, the taskbar) through the same close guard.
+        .when(cx.global::<crate::store::Settings>().window_buttons, |this| {
+            this.child(window_buttons(false, size, fg, fg_subtle, danger, window, cx))
+        })
         .into_any_element()
 }
 
@@ -263,8 +267,10 @@ fn vertical(
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.show_home(window, cx)))
                 .child(icon(Icon::Clock, px(14.), fg_subtle)),
         )
-        .child(separator(true, size, border))
-        .child(window_buttons(true, size, fg, fg_subtle, danger, window, cx))
+        .when(cx.global::<crate::store::Settings>().window_buttons, |this| {
+            this.child(separator(true, size, border))
+                .child(window_buttons(true, size, fg, fg_subtle, danger, window, cx))
+        })
         .into_any_element()
 }
 

@@ -22,6 +22,7 @@
 
 mod app;
 mod bridge;
+mod chrome;
 mod config;
 mod pairing;
 mod probe;
@@ -107,7 +108,16 @@ fn main() {
             std::process::exit(1);
         }
         let title = CString::new(format!("PulseTerm Remote — {}", args.label)).unwrap_or_default();
-        let window = SDL_CreateWindow(title.as_ptr(), 1100, 760, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        let window = SDL_CreateWindow(
+            title.as_ptr(),
+            1100,
+            760,
+            SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | chrome::window_flags(),
+        );
+        // Windows: the window's own bar is the caption (`chrome`).
+        if !window.is_null() {
+            chrome::install(window);
+        }
         // OpenGL over EGL first: it is what zero-copy display imports decoded
         // frames into (stream/zerocopy.rs). Anything else still works, by
         // copying frames.

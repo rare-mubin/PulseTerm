@@ -94,6 +94,17 @@ pub enum ConnectionState {
     Failed(SharedString),
 }
 
+/// Where a file opened from the file tree goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Place {
+    /// Over the file window already open (see `file_window_to_reuse`), so
+    /// browsing a tree file by file does not leave a window behind per file.
+    Reuse,
+    /// A window of its own: a middle-click, "Open in New Window", a preview
+    /// asked for beside its source.
+    New,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     /// The remote desktop helper for this connection, while it runs. Dropped
@@ -145,6 +156,12 @@ pub struct Workspace {
     /// focused element upward, so with the workspace root focused (as it once
     /// was) escape, enter and the arrows never reached the overview at all.
     overview_focus: FocusHandle,
+    /// The file window opened last, for `Place::Reuse` when the focus is not
+    /// on one. An id, not an index: windows move, and it may be closed.
+    last_file: Option<ItemId>,
+    /// Auto-hide: whether the navigation bar is showing right now, from the
+    /// pointer touching its edge until it leaves the bar (`with_bar`).
+    nav_revealed: bool,
     /// A single *tab* close waiting on an answer, because it would lose work.
     confirm_tab: Option<PendingClose>,
     /// Last run's layout, waiting for a connection it belongs to. Taken at the
@@ -262,7 +279,7 @@ struct PendingClose {
 impl Workspace {
     /// `launch` is a program from the command line (`launch`): a local tab
     /// running it replaces whatever the startup setting would have opened.
-    pub fn new(launch: Option<PtyProgram>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(launch: Option<crate::launch::Start>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pane = cx.new(|cx| Pane::new(next_pane_id(), cx));
         let pane_id = pane.read(cx).id;
         let subscription = Self::subscribe_to_pane(&pane, window, cx);
@@ -296,6 +313,8 @@ impl Workspace {
             closing: false,
             close_focus: cx.focus_handle(),
             overview_focus: cx.focus_handle(),
+            last_file: None,
+            nav_revealed: false,
             confirm_tab: None,
             pending_session: Some(session),
             target: None,
@@ -340,9 +359,20 @@ impl Workspace {
         // What the window opens on is a setting. Every branch of it has to
         // reach the first frame without waiting on anything: none of them dial,
         // read a file or spawn a shell before returning.
-        if let Some(program) = launch {
-            this.start_local_running(false, program, window, cx);
-            return this;
+        match launch {
+            Some(crate::launch::Start::Program(program)) => {
+                this.start_local_running(false, Some(program), window, cx);
+                return this;
+            }
+            // Just the file: a shell beside it is not what "open this file"
+            // asked for. The local session connects synchronously, so the
+            // editor can be opened straight after.
+            Some(crate::launch::Start::File(path)) => {
+                this.start_local_running(false, None, window, cx);
+                this.open_file(path.into(), Place::New, window, cx);
+                return this;
+            }
+            None => {}
         }
         match cx.global::<crate::store::Settings>().startup.as_str() {
             "local" => this.start_local(false, window, cx),
@@ -366,11 +396,17 @@ impl Workspace {
                 // double-click on one opens the viewer instead. Everything
                 // else, Markdown included, opens to be edited; the explorer's
                 // "Preview" entry is how you ask for the rendered version.
+                // A plain double-click reuses the file window you have; a
+                // middle-click or "Open in New Window" keeps it and opens
+                // another beside it.
                 crate::ui::explorer::ExplorerEvent::OpenFile(path) => {
-                    this.open_file(path.clone().into(), window, cx)
+                    this.open_file(path.clone().into(), Place::Reuse, window, cx)
+                }
+                crate::ui::explorer::ExplorerEvent::OpenFileNew(path) => {
+                    this.open_file(path.clone().into(), Place::New, window, cx)
                 }
                 crate::ui::explorer::ExplorerEvent::PreviewFile(path) => {
-                    this.open_preview(path.clone(), window, cx)
+                    this.open_preview(path.clone(), Place::New, window, cx)
                 }
                 crate::ui::explorer::ExplorerEvent::OpenTerminal(path) => {
                     this.open_terminal_column_with(PtyProgram::ShellIn(path.clone()), window, cx)
@@ -791,7 +827,7 @@ impl Workspace {
     /// Opens a remote file in an editor tab, or raises the tab it is already
     /// open in -- the same file in two tabs would be two diverging copies of
     /// it, and whichever saved last would silently win.
-    pub fn open_editor(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_editor(&mut self, path: String, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         let ConnectionState::Connected(connection) = &self.connection else {
             return;
         };
@@ -810,7 +846,7 @@ impl Workspace {
         }
 
         let item = self.new_editor(connection, path, window, cx);
-        self.add_item(item, window, cx);
+        self.place_file_item(item, place, window, cx);
     }
 
     /// Builds an editor tab and wires its events up. Both `open_editor` and the
@@ -835,7 +871,7 @@ impl Workspace {
                 match event {
                     crate::ui::editor::EditorEvent::Preview => {
                         let path = editor.read(cx).path.clone();
-                        this.open_preview(path, window, cx);
+                        this.open_preview(path, Place::New, window, cx);
                     }
                     // Both of these only matter while "save and close" is
                     // waiting on this very tab; `tab_save_finished` checks that
@@ -857,7 +893,7 @@ impl Workspace {
     /// raises the tab already showing that file. Deduplicated by path like an
     /// editor, though a preview and an editor of the same file coexist: they
     /// are different kinds, which is the point of being able to split them.
-    pub fn open_preview(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_preview(&mut self, path: String, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         let ConnectionState::Connected(connection) = &self.connection else {
             return;
         };
@@ -876,7 +912,7 @@ impl Workspace {
         }
 
         let view = cx.new(|cx| crate::ui::preview::PreviewView::new(connection, path, cx));
-        self.add_item(PaneItem::Preview(view), window, cx);
+        self.place_file_item(PaneItem::Preview(view), place, window, cx);
     }
 
     /// Raises an existing singleton tab if there is one, and reports whether it
@@ -941,7 +977,7 @@ impl Workspace {
                 CommandEvent::OpenPath(path) => {
                     let path = path.clone();
                     this.close_connections(window, cx);
-                    this.open_file(path, window, cx);
+                    this.open_file(path, Place::New, window, cx);
                 }
             },
         ));
@@ -979,6 +1015,88 @@ impl Workspace {
     fn close_connections_quietly(&mut self) {
         self.connections = None;
         self.connections_subscription = None;
+    }
+
+    /// The navigation bar and `body`, laid out as `Settings::nav_mode` says.
+    ///
+    /// * Shown: the bar along its edge and the body beside it, in whichever
+    ///   order and along whichever axis the edge implies.
+    /// * Hidden: the body takes the whole window. A thin strip stays along the
+    ///   bar's edge and works as a caption, because a window with no caption
+    ///   at all could not be moved.
+    /// * Auto-hide: the same strip reveals the bar while the pointer is on it,
+    ///   drawn *over* the body -- in the flow, every reveal would resize every
+    ///   terminal -- and it goes again when the pointer leaves the bar.
+    fn with_bar(&mut self, body: gpui::AnyElement, grow: bool, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let edge = nav_bar::Edge::from_settings(cx);
+        let mode = cx.global::<crate::store::Settings>().nav_mode.clone();
+        let sized = |this: gpui::Div| {
+            if grow {
+                this.flex_1().min_w_0().min_h_0()
+            } else {
+                this.size_full()
+            }
+        };
+        if mode == "show" {
+            let bar = nav_bar::render(self, window, cx);
+            let frame = sized(div().flex())
+                .when(edge.is_vertical(), |this| this.flex_row())
+                .when(!edge.is_vertical(), |this| this.flex_col());
+            return match edge {
+                nav_bar::Edge::Left | nav_bar::Edge::Top => frame.child(bar).child(body),
+                nav_bar::Edge::Right | nav_bar::Edge::Bottom => frame.child(body).child(bar),
+            }
+            .into_any_element();
+        }
+
+        let auto = mode == "auto";
+        if !auto {
+            self.nav_revealed = false;
+        }
+        let at_edge = move |this: gpui::Stateful<gpui::Div>| match edge {
+            nav_bar::Edge::Left => this.left_0().top_0().bottom_0(),
+            nav_bar::Edge::Right => this.right_0().top_0().bottom_0(),
+            nav_bar::Edge::Top => this.top_0().left_0().right_0(),
+            nav_bar::Edge::Bottom => this.bottom_0().left_0().right_0(),
+        };
+        let strip_px = gpui::px(4.);
+        let strip = at_edge(nav_bar::drag_region("nav-edge-strip").absolute())
+            .when(edge.is_vertical(), |this| this.w(strip_px))
+            .when(!edge.is_vertical(), |this| this.h(strip_px))
+            .when(auto, |this| {
+                this.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if *hovered && !this.nav_revealed {
+                        this.nav_revealed = true;
+                        cx.notify();
+                    }
+                }))
+            });
+        let overlay = (auto && self.nav_revealed).then(|| {
+            let bar = nav_bar::render(self, window, cx);
+            at_edge(div().id("nav-overlay").absolute())
+                .flex()
+                .when(!edge.is_vertical(), |this| this.flex_col())
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if !*hovered && this.nav_revealed {
+                        this.nav_revealed = false;
+                        cx.notify();
+                    }
+                }))
+                .child(bar)
+        });
+        sized(div().relative().flex())
+            .child(body)
+            .child(strip)
+            .children(overlay)
+            .into_any_element()
+    }
+
+    /// Lets the strip scroll to its focus again once a header press is over.
+    fn release_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.strip.hold_scroll {
+            self.strip.hold_scroll = false;
+            cx.notify();
+        }
     }
 
     fn focus_active_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1943,6 +2061,7 @@ impl Workspace {
                 // Only the session on screen is drawn, so only its panes can
                 // be clicked; anything from a parked one is stale.
                 _ if !this.strip.panes().contains(pane) => {}
+                PaneEvent::HoldScroll => this.strip.hold_scroll = true,
                 PaneEvent::Focused => {
                     if this.active_pane != *pane {
                         this.focus_pane(pane.clone());
@@ -2548,15 +2667,16 @@ impl Workspace {
     }
 
     fn start_local(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_local_running(restore, PtyProgram::LoginShell, window, cx);
+        self.start_local_running(restore, Some(PtyProgram::LoginShell), window, cx);
     }
 
     /// `start_local`, with the first tab running `program` when nothing is
-    /// restored -- the command line's `-e` and `--working-directory`.
+    /// restored -- the command line's `-e` and `--working-directory` -- or no
+    /// first tab at all (`None`), when the launch opens a file instead.
     fn start_local_running(
         &mut self,
         restore: bool,
-        program: PtyProgram,
+        program: Option<PtyProgram>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2598,7 +2718,11 @@ impl Workspace {
         self.home_open = false;
         match layout {
             Some(layout) => self.restore_layout(layout, &host, window, cx),
-            None => self.open_terminal(program, window, cx),
+            None => {
+                if let Some(program) = program {
+                    self.open_terminal(program, window, cx);
+                }
+            }
         }
         if open_explorer {
             self.toggle_explorer(&ToggleExplorer, window, cx);
@@ -2624,7 +2748,9 @@ impl Workspace {
         let connection = connection.clone();
         let label: SharedString = match &program {
             PtyProgram::LoginShell => connection.label.clone().into(),
-            PtyProgram::Command(cmd) => cmd.clone().into(),
+            PtyProgram::Command(cmd) | PtyProgram::CommandIn { command: cmd, .. } => {
+                cmd.clone().into()
+            }
             PtyProgram::ShellIn(_) => connection.label.clone().into(),
         };
 
@@ -2724,12 +2850,55 @@ impl Workspace {
     /// Opens a path the way a double-click in the explorer does -- images to
     /// the viewer, everything else to the editor. One rule, in one place, so
     /// the command bar and the explorer cannot disagree about what a file is.
-    pub fn open_file(&mut self, path: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_file(
+        &mut self,
+        path: SharedString,
+        place: Place,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let path = path.to_string();
         if crate::ui::preview::image_format(&path).is_some() {
-            self.open_preview(path, window, cx);
+            self.open_preview(path, place, window, cx);
         } else {
-            self.open_editor(path, window, cx);
+            self.open_editor(path, place, window, cx);
+        }
+    }
+
+    /// The file window a `Place::Reuse` open replaces: the focused window if
+    /// it is a file (an editor or a preview), else the file window opened
+    /// last -- never one with unsaved changes, which would lose them. `None`
+    /// means there is nothing to reuse and a new window opens instead.
+    fn file_window_to_reuse(&self, cx: &App) -> Option<(Entity<Pane>, usize)> {
+        let reusable = |item: &PaneItem| {
+            matches!(item, PaneItem::Editor(_) | PaneItem::Preview(_)) && !item.is_dirty(cx)
+        };
+        let active = self.active_pane.read(cx);
+        if active.active_item().is_some_and(|item| reusable(item)) {
+            return Some((self.active_pane.clone(), active.active_ix()));
+        }
+        let last = self.last_file?;
+        self.strip.panes().into_iter().find_map(|pane| {
+            let ix = pane.read(cx).index_of(last, cx)?;
+            reusable(&pane.read(cx).items()[ix]).then_some((pane, ix))
+        })
+    }
+
+    /// Puts a newly built file window where `place` says: over the file
+    /// window being reused, or in a new window as before.
+    fn place_file_item(&mut self, item: PaneItem, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        self.last_file = Some(item.id(cx));
+        let target = match place {
+            Place::Reuse => self.file_window_to_reuse(cx),
+            Place::New => None,
+        };
+        match target {
+            Some((pane, ix)) => {
+                pane.update(cx, |pane, cx| pane.replace_item(ix, item, window, cx));
+                self.focus_pane(pane);
+                cx.notify();
+            }
+            None => self.add_item(item, window, cx),
         }
     }
 
@@ -2863,24 +3032,15 @@ impl Render for Workspace {
                 .child({
                     let theme = cx.global::<Theme>();
                     let font = theme.font.clone();
-                    let edge = nav_bar::Edge::from_settings(cx);
-                    let bar = nav_bar::render(self, window, cx);
                     let body = div()
                         .flex()
                         .flex_1()
                         .min_w_0()
                         .min_h_0()
                         .font_family(font)
-                        .child(crate::ui::home::render(self, window, cx));
-                    let frame = div()
-                        .flex()
-                        .size_full()
-                        .when(edge.is_vertical(), |this| this.flex_row())
-                        .when(!edge.is_vertical(), |this| this.flex_col());
-                    match edge {
-                        nav_bar::Edge::Left | nav_bar::Edge::Top => frame.child(bar).child(body),
-                        nav_bar::Edge::Right | nav_bar::Edge::Bottom => frame.child(body).child(bar),
-                    }
+                        .child(crate::ui::home::render(self, window, cx))
+                        .into_any_element();
+                    self.with_bar(body, false, window, cx)
                 })
                 .into_any_element();
             return crate::ui::decorations::wrap(home, window, cx);
@@ -2894,8 +3054,6 @@ impl Render for Workspace {
 
         // One bar, on whichever edge the setting names. There is deliberately
         // no second: see `ui::nav_bar`.
-        let edge = nav_bar::Edge::from_settings(cx);
-        let bar = nav_bar::render(self, window, cx);
         // The overview takes the body and leaves the bar: it is a way of
         // looking at the strip, not a way of leaving the window.
         // Sampled before the overview is drawn, because the workspace owns
@@ -2926,6 +3084,17 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
+            // The release that lets a held strip scroll again (see
+            // `Strip::hold_scroll`): inside the window or, past its edge,
+            // outside it -- a drag can end anywhere.
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.release_scroll(cx)),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.release_scroll(cx)),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -3041,21 +3210,9 @@ impl Render for Workspace {
                             // and its mouse blocking live.
                             .children(self.connections.clone()),
                     );
-                // The bar and the rest of the window, in whichever order and
-                // along whichever axis the chosen edge implies. Four cases,
-                // written out, because two of them also flip the bar's own
-                // border to its inner side.
-                let frame = div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .when(edge.is_vertical(), |this| this.flex_row())
-                    .when(!edge.is_vertical(), |this| this.flex_col());
-                match edge {
-                    nav_bar::Edge::Left | nav_bar::Edge::Top => frame.child(bar).child(body),
-                    nav_bar::Edge::Right | nav_bar::Edge::Bottom => frame.child(body).child(bar),
-                }
+                // The bar and the rest of the window, as the edge and the
+                // bar's mode (shown, hidden, auto-hide) say.
+                self.with_bar(body.into_any_element(), true, window, cx)
             })
             .children(self.confirm_close.then(|| self.render_close_confirm(window, cx)))
             // Never both at once: they share a focus handle and a key context,

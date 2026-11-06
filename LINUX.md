@@ -229,20 +229,25 @@ Windows keeps painting the ground there as before).
 * **The close dialog called the local session "still connected".** It now
   names only the SSH hosts the guard counts (`live_hosts`).
 
-**Found, not fixed**
+**Found, then fixed in a follow-up pass (2026-11-04)**
 
-* `--working-directory` with `-e` fails (`cd '...' && exec ...` is POSIX).
-  `-e` alone and `--working-directory` alone both work. Needs a
-  command-in-a-directory `PtyProgram`.
-* Home's *This computer* says `cmd` while the shell is PowerShell: with no
-  shell set it reads `%ComSpec%`, while `local::default_shell` takes the first
-  of pwsh / powershell / cmd that exists. Matching it costs a few file checks
-  on the first frame.
-* Pressing a partly hidden window's header to drag it focuses it, the strip
-  slides to show it, and the drop lands under a pointer that has moved.
-* Cosmetic: the Plugins folder path runs into `0 INSTALLED`; at 16px the Keys
-  page wraps chord chips; a symbol font (Marlett) is listed and draws its own
-  name as icons; the command bar's password field shows "type to filter".
+* `--working-directory` with `-e` failed (`cd '...' && exec ...` is POSIX).
+  The directory now travels apart from the command
+  (`PtyProgram::CommandIn`): ConPTY's working directory on Windows, `cd` over
+  SSH. `-e` also quotes for CreateProcess on Windows, not `/bin/sh`.
+* Home's *This computer* said `cmd` while the shell was PowerShell. With no
+  shell set it now asks `local::default_shell` -- on a thread, so the first
+  frame waits on no file check -- and shows the answer a frame later.
+* Pressing a partly hidden window's header to drag it slid the strip under
+  the pointer. The strip holds its scroll while a header is pressed
+  (`Strip::hold_scroll`) and catches up on the release.
+* Cosmetic: the plugins path and the sidebar's config path are shortened from
+  the left, so they end in the folder's name; chord chips wrap a whole chord
+  at a time; symbol fonts (Marlett and friends) are left out of the font list;
+  the password prompt has no "type to filter", and its footer names the host.
+* Also found and fixed on Windows: PowerShell 7 from the Microsoft Store was
+  not offered (only an app alias in `WindowsApps`), and the file tree could
+  not leave its drive (now "This PC" above every drive root).
 
 ---
 

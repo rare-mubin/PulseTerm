@@ -41,7 +41,9 @@ shortcuts.
   managers pass a terminal (`src/launch.rs`): the first window opens a local
   tab running that instead of what the startup setting says. Every launch is
   its own process and window; nothing looks for a running copy. The command
-  is quoted for `/bin/sh` -- POSIX only so far (`LINUX.md`, Windows checklist).
+  is quoted for the platform -- `/bin/sh` on Unix, CreateProcess's double
+  quotes on Windows -- and a directory travels apart from it
+  (`PtyProgram::CommandIn`), so both work together on Windows too.
 - `cargo build --release` — optimised standalone `target/release/PulseTerm.exe`.
   Release is tuned for size (`[profile.release]`: strip, fat LTO, one codegen
   unit), so it is much slower to build than debug and rebuilds every crate when
@@ -256,6 +258,16 @@ terminal, the file tree or Settings asked for with nothing connected starts a
 local session first (restoring last run's local layout if there is one),
 rather than opening onto a workspace with no host behind it.
 
+**Headers go top or bottom, and show, auto-hide or hide**
+(`Settings::header_position`, `header_mode`). `Pane::render` builds a
+window's header once and puts it in one of three slots (`HeaderSlot`): before
+the content, after it, or laid over it. Auto-hide is the overlay -- opaque
+(`palette.bg`), invisible until hovered (`opacity` 0, `hover` 1) -- so a
+header appearing never reflows the terminal under it. The content divider
+carried through the header follows it to the bottom, and is dropped when the
+header is not in the flow. Hidden, a window is closed and moved from the
+keyboard.
+
 **Keyboard focus is kept inside the workspace.** Every app shortcut lives in
 the `Workspace` context, so focus that escapes it -- onto nothing, or onto a
 closed view -- kills them all. `render` puts it back on the active window
@@ -409,6 +421,16 @@ the bar is mark, actions, separator, session state (or, from two sessions on,
 one entry per session), strip read-out, a gap that drags like a caption,
 disconnect, clock, window buttons -- identity, then what you can do, then
 where you are, then the window itself.
+
+**Shown, auto-hide or hidden** (`Settings::nav_mode`, laid out by
+`Workspace::with_bar`, the one place both home and the workspace go through).
+Hidden, the body takes the whole window, but a 4px `drag_region` strip stays
+along the bar's edge: a window with no caption at all could not be moved.
+Auto-hide uses the same strip to reveal the bar (`nav_revealed`), drawn *over*
+the body -- in the flow, every reveal would resize every terminal -- and lets
+it go when the pointer leaves the bar. **The window buttons are optional**
+(`Settings::window_buttons`): off, the separator before them goes too, and the
+OS still closes the window through the same close guard.
 
 * **`thickness` is derived from the type, not a constant** (`line_height +
   26px`), so the bar keeps its proportion rather than its pixel size when the
@@ -567,7 +589,10 @@ right (target, columns and windows, "closed HH:MM", the strip drawn small,
 * **Startup budget:** the SSH entry's host is `Profiles::latest` (already in
   memory); the local entry's shell is the setting or `$SHELL`, and `user@host`
   is environment variables plus `gethostname` -- no file is read and no shell
-  probed on the first frame.
+  probed on the first frame. On Windows, with no shell set, the name comes
+  from `local::default_shell` (pwsh before powershell before cmd), probed on
+  a thread the first time home draws and picked up a frame or two later --
+  `%ComSpec%` alone always said `cmd`.
 * Space and Escape are bound in the `Home` key context, never `Workspace`, so
   they are not taken from a shell.
 * **Connecting from home happens in place** (`Workspace::home_pick`,
@@ -730,8 +755,7 @@ boxed-future `Task` alias — `async fn` cannot call itself.
 ### Command bar (`ui/command_bar.rs`)
 
 **One line and a list, and it is the only modal in the app.** `ui/connections.rs`
-is retired -- no longer a module; the file is still in the tree, unreferenced,
-and can be deleted: a connect dialog with labelled fields for host, port, username, auth
+is gone: a connect dialog with labelled fields for host, port, username, auth
 kind, key path and password was a form to fill in before you could reach a
 shell, and four of those six fields were already known from the profile you
 were about to click. The bar replaces it with what every other part of this app
@@ -1097,6 +1121,21 @@ a press a pixel off the seam lands in a column and reads as "it doesn't move".
 The bands are painted after every column, or the column drawn next would cover
 them.
 
+## File Explorer's "Open with PulseTerm" (`src/shell_menu.rs`, Windows)
+
+Settings -> Files -> *File Explorer menu*. Three verbs under
+`HKEY_CURRENT_USER\Software\Classes` -- `*\shell` (a file), `Directory\shell`
+and `Directory\Background\shell` (a folder, and the inside of one) -- so it
+needs no administrator and touches no other account. Each runs this very exe
+(`current_exe`) with the path as a bare argument, which `launch` reads as
+"a file opens in the editor, a folder in a shell there" (`launch::Start`);
+opening a file starts the local session *without* a terminal, since a shell
+beside it is not what was asked. The switch shows `shell_menu::is_registered`
+-- the registry, not the saved setting -- and `set` runs for off as well as on
+(an `&&` the other way round once skipped the removal). Moving the exe means
+switching it off and on to re-point it. On Windows 11 the verbs sit under
+"Show more options": the new menu only takes packaged apps' handlers.
+
 ## Local mode: the same app pointed at this machine
 
 `src/host.rs` is the seam. A `Host` is either an SSH connection or this
@@ -1114,6 +1153,16 @@ not a second UI; it is the same one pointed somewhere else.
   and `Files::parent` dispatch, and `ExplorerView` has its own thin wrappers --
   the free `sftp::join` it used to call would emit forward slashes into
   `C:\Users`.
+* **Above a drive root is "This PC"** (`local::fs::THIS_PC`), a virtual folder
+  whose entries are the drives (`GetLogicalDrives`, which touches no drive).
+  Without it, Up stopped at `C:\` and the tree could only leave the drive by
+  typing a whole path. A typed bare `D:` is normalised to `D:\`
+  (`Files::normalize`, called from `navigate`): Windows reads `D:` as "the
+  current folder on D", so it listed the wrong place and joined names on as
+  `D:name`. Because the drives are listed as folders, the context menu offers
+  Delete and Rename on them, so **every mutating `LocalFs` call refuses a
+  drive root or anything under This PC** (`refuse_roots`) -- a recursive
+  delete of `C:\` must not be one confirmation away.
 * `src/pty.rs` holds `Pty`, `PtyEvent` and `PtyProgram`, which were under `ssh`
   and belonged to neither side; `src/runtime.rs` (the tokio bridge) moved up for
   the same reason -- local file IO uses it too.
@@ -1168,6 +1217,13 @@ produces a tab that opens and immediately dies. Empty means "best installed",
 which is also the fallback when a configured path has since been uninstalled.
 Read when a terminal is created, so a change reaches the next tab and leaves
 running ones alone.
+
+**A Microsoft Store PowerShell 7 lives nowhere in Program Files.** All it
+leaves on disk is an app execution alias, `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`,
+which CreateProcess runs like any exe -- so it is a candidate after the MSI
+path, and the probe (`local::installed`) also accepts a successful
+`symlink_metadata`, because `Path::exists` follows the alias and fails on it.
+Without both, PowerShell 7 installed from the Store was simply not offered.
 
 **No disconnect while it is the only session.** There is nothing to hang up:
 local shells are this machine's own processes and die with their tabs. So the
@@ -1506,6 +1562,18 @@ bytes become one texture.
   editor refuses non-UTF-8 anyway) and everything else, Markdown included, to
   the editor. `PreviewFile` is the explicit ask from the context menu, whose
   "Preview" entry appears only when `preview::can_preview` says so.
+* **A double-click replaces the file window you have; a middle-click opens
+  another** (`workspace::Place`). `OpenFile` is `Place::Reuse`: the new file
+  takes the place of the focused window if that is an editor or a preview,
+  else of the file window opened last (`last_file`), through
+  `Pane::replace_item` -- in place, because taking the only window out of a
+  column would collapse it. Browsing a tree file by file no longer leaves a
+  window behind per file. `OpenFileNew` (middle-click on a row, or "Open in
+  New Window" at the top of a file's menu) is `Place::New`, as are the
+  command bar, "Preview" and the editor's Preview button -- each a deliberate
+  "beside this". **An editor with unsaved changes is never the one
+  replaced**; the file opens in a new window instead. A file already open is
+  still just focused.
 * Extensions are read from the **last path segment**: a directory called
   `site.png` must not make every file inside it look like an image. There's a
   test for exactly that.

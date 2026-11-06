@@ -109,6 +109,8 @@ features = [
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    # File Explorer's "Open with PulseTerm", registered per user (`shell_menu`).
+    "Win32_System_Registry",
 ]
 
 # Linux local terminals: the Unix pty in `local::unix_pty` (posix_openpt,

@@ -50,6 +50,14 @@ fn candidates() -> Vec<(PathBuf, &'static str)> {
             PathBuf::from(&program_files).join("PowerShell\\7\\pwsh.exe"),
             "PowerShell 7",
         ),
+        // The Microsoft Store install puts nothing in Program Files: all it
+        // leaves on disk is this app execution alias, which CreateProcess runs
+        // like any exe. Checked second so an MSI install, if both exist, wins.
+        (
+            PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+                .join("Microsoft\\WindowsApps\\pwsh.exe"),
+            "PowerShell 7",
+        ),
         (
             root.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
             "Windows PowerShell",
@@ -71,14 +79,23 @@ fn candidates() -> Vec<(PathBuf, &'static str)> {
 /// this runs when the Settings page opens, not per frame.
 #[cfg(target_os = "windows")]
 pub fn shells() -> Vec<Shell> {
-    candidates()
-        .into_iter()
-        .filter(|(path, _)| path.exists())
-        .map(|(path, label)| Shell {
-            command: path.to_string_lossy().to_string(),
-            label: label.to_string(),
-        })
-        .collect()
+    let mut found: Vec<Shell> = Vec::new();
+    for (path, label) in candidates() {
+        // One entry per shell: an MSI and a Store PowerShell 7 are the same
+        // choice, and the first (the MSI) is the one kept.
+        if installed(&path) && !found.iter().any(|shell| shell.label == label) {
+            found.push(Shell { command: path.to_string_lossy().to_string(), label: label.to_string() });
+        }
+    }
+    found
+}
+
+/// Whether a shell is on disk. `Path::exists` follows links, and on a
+/// Microsoft Store app execution alias (`WindowsApps\pwsh.exe`) following it
+/// fails -- the alias is a reparse point only CreateProcess resolves -- so the
+/// link itself being there counts too.
+fn installed(path: &std::path::Path) -> bool {
+    path.exists() || std::fs::symlink_metadata(path).is_ok()
 }
 
 /// What to run when Settings names nothing, or names something no longer here.
@@ -176,7 +193,7 @@ pub fn default_shell() -> String {
 /// installed, and otherwise the default. A stale path would open a tab that
 /// dies on arrival.
 pub fn resolve_shell(configured: &str) -> String {
-    if !configured.is_empty() && PathBuf::from(configured).exists() {
+    if !configured.is_empty() && installed(std::path::Path::new(configured)) {
         return configured.to_string();
     }
     default_shell()

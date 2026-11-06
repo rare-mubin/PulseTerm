@@ -121,7 +121,28 @@ impl Ask {
     fn masked(self) -> bool {
         self != Ask::KeyPath
     }
+
+    /// The field's own hint. Empty for a secret -- the label beside the field
+    /// already says what goes in it -- where it used to keep saying "type to
+    /// filter" while it asked for a password.
+    fn placeholder(self) -> &'static str {
+        match self {
+            Ask::KeyPath => "path to the key file",
+            Ask::Password | Ask::Passphrase => "",
+        }
+    }
 }
+
+/// Switches the one field between the query (`None`) and a prompt: masking
+/// and hint together, so the two cannot disagree. The value is cleared too --
+/// whatever was typed belonged to the other mode.
+fn set_mode(state: &mut InputState, ask: Option<Ask>, window: &mut Window, cx: &mut Context<InputState>) {
+    state.set_masked(ask.is_some_and(Ask::masked), window, cx);
+    state.set_placeholder(ask.map_or(QUERY_HINT, Ask::placeholder), window, cx);
+    state.set_value("", window, cx);
+}
+
+const QUERY_HINT: &str = "type to filter";
 
 /// The host being connected to while the bar collects what it needs. Dropped
 /// the moment the connect is emitted, which is as long as any of it lives.
@@ -150,7 +171,7 @@ pub struct CommandBar {
 
 impl CommandBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("type to filter"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(QUERY_HINT));
 
         let subscriptions = vec![cx.subscribe_in(
             &query,
@@ -380,10 +401,7 @@ impl CommandBar {
         let ask = pending.ask;
         self.pending = Some(pending);
         self.error = None;
-        self.query.update(cx, |state, cx| {
-            state.set_masked(ask.masked(), window, cx);
-            state.set_value("", window, cx);
-        });
+        self.query.update(cx, |state, cx| set_mode(state, Some(ask), window, cx));
         cx.notify();
     }
 
@@ -409,10 +427,7 @@ impl CommandBar {
                 }
                 pending.key_path = path;
                 pending.ask = Ask::Passphrase;
-                self.query.update(cx, |state, cx| {
-                    state.set_masked(true, window, cx);
-                    state.set_value("", window, cx);
-                });
+                self.query.update(cx, |state, cx| set_mode(state, Some(Ask::Passphrase), window, cx));
                 cx.notify();
             }
             Ask::Passphrase => {
@@ -441,10 +456,7 @@ impl CommandBar {
         // Cleared before the event goes out, not after: `auth` already owns
         // the secret, and the field it came from should not still be holding
         // a copy while the connect runs.
-        self.query.update(cx, |state, cx| {
-            state.set_masked(false, window, cx);
-            state.set_value("", window, cx);
-        });
+        self.query.update(cx, |state, cx| set_mode(state, None, window, cx));
         self.pending = None;
         self.error = None;
         cx.emit(CommandEvent::Connect(ConnectParams { host, port, username, auth }));
@@ -473,10 +485,7 @@ impl CommandBar {
     /// the whole overlay.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending.take().is_some() {
-            self.query.update(cx, |state, cx| {
-                state.set_masked(false, window, cx);
-                state.set_value("", window, cx);
-            });
+            self.query.update(cx, |state, cx| set_mode(state, None, window, cx));
             cx.notify();
             return;
         }
@@ -531,6 +540,14 @@ impl Render for CommandBar {
         let sections = self.rows(cx);
         let total: usize = sections.iter().map(|(_, rows)| rows.len()).sum();
         let prompt = self.pending.as_ref().map(|pending| pending.ask);
+        // While a prompt is up the footer names who it is for -- the prompt
+        // itself says only what it wants -- instead of "type to filter",
+        // which there is nothing to filter at that point.
+        let footer = match &self.pending {
+            Some(pending) if pending.port == 22 => format!("{}@{}", pending.username, pending.host),
+            Some(pending) => format!("{}@{}:{}", pending.username, pending.host, pending.port),
+            None => QUERY_HINT.to_string(),
+        };
         let forgettable = prompt.is_none()
             && matches!(self.flat(cx).get(self.selected), Some(Act::Profile(_)));
 
@@ -643,11 +660,8 @@ impl Render for CommandBar {
                             Ask::Password => Ask::KeyPath,
                             _ => Ask::Password,
                         };
-                        let masked = pending.ask.masked();
-                        this.query.update(cx, |state, cx| {
-                            state.set_masked(masked, window, cx);
-                            state.set_value("", window, cx);
-                        });
+                        let ask = pending.ask;
+                        this.query.update(cx, |state, cx| set_mode(state, Some(ask), window, cx));
                         cx.stop_propagation();
                         cx.notify();
                     }))
@@ -724,7 +738,7 @@ impl Render for CommandBar {
                             .text_size(micro)
                             .text_color(fg_subtle)
                             .gap_2()
-                            .child(kit::label("type to filter"))
+                            .child(kit::label(&footer))
                             // `del` is only mentioned while it would do
                             // something. Tracked-out micro type is twice the
                             // characters it looks like, and three hints

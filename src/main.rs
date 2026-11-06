@@ -13,6 +13,7 @@ mod pty;
 mod remote;
 mod runtime;
 mod session;
+mod shell_menu;
 mod ssh;
 mod store;
 mod terminal;
@@ -48,7 +49,8 @@ fn main() {
             println!("PulseTerm {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        Ok(launch::Launch::Local(program)) => Some(program),
+        Ok(launch::Launch::Local(program)) => Some(launch::Start::Program(program)),
+        Ok(launch::Launch::OpenFile(path)) => Some(launch::Start::File(path)),
         Ok(launch::Launch::Default) => None,
         Err(e) => {
             eprintln!("pulseterm: {e}\n\n{}", launch::USAGE);

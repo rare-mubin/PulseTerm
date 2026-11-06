@@ -568,6 +568,22 @@ impl SettingsView {
                 ),
             ),
             row(
+                "Navigation bar",
+                "Auto-hide slides it in over the windows while the pointer is at its edge. Hidden or not, that edge still moves the window.",
+                segmented(
+                    "nav-mode",
+                    &[("show", "show"), ("auto", "auto-hide"), ("hide", "hide")],
+                    &s.nav_mode,
+                    |s, v| s.nav_mode = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Window buttons",
+                "Minimise, maximise and close in the bar. Off, Alt+F4 and the taskbar still close the window.",
+                toggle("window-buttons", s.window_buttons, |s, v| s.window_buttons = v, ink),
+            ),
+            row(
                 "Font family",
                 "Any monospace font installed here. One family for chrome and grid.",
                 self.font_picker(cx, ink),
@@ -611,6 +627,18 @@ impl SettingsView {
                             .child(format!("{:.0}%", s.opacity)),
                     ),
             ),
+            // Directly under opacity, because it only means something below
+            // 100%. It was on Appearance, a page away from the one setting it
+            // depends on, and read as missing.
+            row(
+                "Blur behind",
+                if s.opacity < 100. {
+                    "Frosted glass behind the translucent window, where the desktop supports it."
+                } else {
+                    "Frosted glass behind the window -- shows once opacity is below 100%."
+                },
+                toggle("blur", s.blur, |s, v| s.blur = v, ink),
+            ),
             row(
                 "On launch",
                 "Home asks for nothing. Last session reopens the layout you left -- a remote one still needs its password, which is never stored. Local goes straight to a shell here.",
@@ -625,39 +653,52 @@ impl SettingsView {
             row(
                 "Plugins folder",
                 "Where file-type support is read from. Only the index is read at launch.",
+                // The path on a line of its own, the count and the button
+                // under it. All three on one 300px line left a normal
+                // `C:\Users\...` path a few characters, which ran into the
+                // count. Shortened from the left, because the end of a path is
+                // the part that says which folder it is.
                 div()
                     .w(px(300.))
                     .flex()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
                             .text_color(ink.fg_muted)
-                            .child(plugins_dir.to_string_lossy().to_string()),
+                            .child(tail_to_fit(
+                                &plugins_dir.to_string_lossy(),
+                                // Monospace: an advance is ~0.6 of the size.
+                                (300. / (s.font_size * 0.62)) as usize,
+                            )),
                     )
                     .child(
                         div()
-                            .flex_none()
-                            .text_size(ink.micro)
-                            .text_color(ink.fg_subtle)
-                            .child(kit::label(&format!("{plugins} installed"))),
-                    )
-                    .child(
-                        div()
-                            .id("plugins-choose")
-                            .flex_none()
-                            .px_2()
-                            .py(px(4.))
-                            .border_1()
-                            .border_color(ink.border)
-                            .text_size(ink.micro)
-                            .text_color(ink.fg_muted)
-                            .hover(move |this| this.text_color(ink.fg))
-                            .child(kit::label("choose"))
-                            .on_click(|_: &ClickEvent, _, cx| choose_plugins_folder(cx)),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(ink.micro)
+                                    .text_color(ink.fg_subtle)
+                                    .child(kit::label(&format!("{plugins} installed"))),
+                            )
+                            .child(
+                                div()
+                                    .id("plugins-choose")
+                                    .flex_none()
+                                    .px_2()
+                                    .py(px(4.))
+                                    .border_1()
+                                    .border_color(ink.border)
+                                    .text_size(ink.micro)
+                                    .text_color(ink.fg_muted)
+                                    .hover(move |this| this.text_color(ink.fg))
+                                    .child(kit::label("choose"))
+                                    .on_click(|_: &ClickEvent, _, cx| choose_plugins_folder(cx)),
+                            ),
                     ),
             ),
         ]
@@ -733,11 +774,6 @@ impl SettingsView {
                 "Focus ring",
                 "Outline the focused field in the accent. Off, it keeps the ordinary hairline.",
                 toggle("focus-ring", s.focus_ring, |s, v| s.focus_ring = v, ink),
-            ),
-            row(
-                "Blur behind",
-                "Frosted glass behind a translucent window, where the desktop supports it.",
-                toggle("blur", s.blur, |s, v| s.blur = v, ink),
             ),
             wide("Preview", "", font_preview(cx)),
         ]
@@ -836,6 +872,28 @@ impl SettingsView {
                     ink,
                 ),
             ),
+            row(
+                "Window headers",
+                "Each window's number, title and close button, above or below what it shows.",
+                segmented(
+                    "header-position",
+                    &[("top", "top"), ("bottom", "bottom")],
+                    &s.header_position,
+                    |s, v| s.header_position = v.into(),
+                    ink,
+                ),
+            ),
+            row(
+                "Header visibility",
+                "Auto-hide draws a header over its window while the pointer is on it, so nothing resizes. Hidden, a window is moved and closed from the keyboard.",
+                segmented(
+                    "header-mode",
+                    &[("show", "show"), ("auto", "auto-hide"), ("hide", "hide")],
+                    &s.header_mode,
+                    |s, v| s.header_mode = v.into(),
+                    ink,
+                ),
+            ),
         ]
     }
 
@@ -853,6 +911,24 @@ impl SettingsView {
                 toggle("open-on-connect", s.explorer_on_connect, |s, v| s.explorer_on_connect = v, ink),
             ),
         ]
+        .into_iter()
+        // Windows only. The switch shows what the registry says, not what
+        // was last saved, so a menu removed by hand reads truthfully; a
+        // failed write leaves it off.
+        .chain(crate::shell_menu::SUPPORTED.then(|| {
+            row(
+                "File Explorer menu",
+                "\"Open with PulseTerm\" on files and folders: a file opens in the editor, a folder in a shell there. For this user only; on Windows 11 under Show more options.",
+                toggle(
+                    "explorer-menu",
+                    crate::shell_menu::is_registered(),
+                    // `set` first: it has to run for off too.
+                    |s, v| s.explorer_menu = crate::shell_menu::set(v).is_ok() && v,
+                    ink,
+                ),
+            )
+        }))
+        .collect()
     }
 
     fn editor_rows(cx: &App, ink: Ink) -> Vec<Row> {
@@ -1241,8 +1317,14 @@ impl Render for SettingsView {
                     .child(kit::label("config"))
                     .child(
                         div()
-                            .truncate()
-                            .child(crate::store::data_dir().to_string_lossy().to_string()),
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            // From the left, like the plugins folder: the end
+                            // of the path is the part that names it.
+                            .child(tail_to_fit(
+                                &crate::store::data_dir().to_string_lossy(),
+                                ((SIDEBAR - 44.) / (f32::from(ink.micro) * 0.62)) as usize,
+                            )),
                     ),
             ));
 
@@ -1362,6 +1444,18 @@ impl Render for SettingsView {
 
 /// Picks a plugins folder and switches to it. The catalogue is reinstalled on
 /// the spot, so a folder chosen here is in force without a restart.
+/// The end of a path, kept within `chars` characters: `…\PulseTerm\plugins`.
+/// gpui truncates only from the right, which keeps the drive and drops the
+/// folder's own name -- the one part worth seeing.
+fn tail_to_fit(path: &str, chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= chars || chars < 2 {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(count - (chars - 1)).collect();
+    format!("…{tail}")
+}
+
 fn choose_plugins_folder(cx: &mut App) {
     let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
         files: false,
@@ -1688,27 +1782,34 @@ fn chords(list: &[String], ink: Ink, strong: bool) -> AnyElement {
             .text_color(if strong { ink.fg } else { ink.fg_muted })
             .child(text)
     };
-    let mut row = div().flex().flex_wrap().items_center().gap_1();
+    // Whole chords wrap, never the keys inside one: wrapping chip by chip
+    // broke `CTRL SHIFT TAB` across two lines at a larger font. Each chord is
+    // a group that does not wrap, and the `/` rides with the chord after it so
+    // it never dangles at the end of a line.
+    let mut row = div().flex().flex_wrap().items_center().justify_end().gap_1();
     for (ix, chord) in list.iter().enumerate() {
+        let mut group = div().flex().flex_none().items_center().gap_1();
         if ix > 0 {
-            row = row.child(div().px_1().text_color(ink.fg_subtle).child("/"));
+            group = group.child(div().px_1().text_color(ink.fg_subtle).child("/"));
         }
-        let Ok(keystroke) = gpui::Keystroke::parse(chord) else {
-            row = row.child(cap(chord.to_uppercase()));
-            continue;
-        };
-        let m = keystroke.modifiers;
-        for (on, name) in [
-            (m.control, "CTRL"),
-            (m.alt, "ALT"),
-            (m.shift, "SHIFT"),
-            (m.platform, "SUPER"),
-        ] {
-            if on {
-                row = row.child(cap(name.into()));
+        match gpui::Keystroke::parse(chord) {
+            Err(_) => group = group.child(cap(chord.to_uppercase())),
+            Ok(keystroke) => {
+                let m = keystroke.modifiers;
+                for (on, name) in [
+                    (m.control, "CTRL"),
+                    (m.alt, "ALT"),
+                    (m.shift, "SHIFT"),
+                    (m.platform, "SUPER"),
+                ] {
+                    if on {
+                        group = group.child(cap(name.into()));
+                    }
+                }
+                group = group.child(cap(keystroke.key.to_uppercase()));
             }
         }
-        row = row.child(cap(keystroke.key.to_uppercase()));
+        row = row.child(group);
     }
     row.into_any_element()
 }

@@ -18,8 +18,12 @@ use crate::theme::Theme;
 
 pub enum ExplorerEvent {
     /// Double-clicked a file; the workspace opens it in an editor tab -- or, if
-    /// it's an image, in a preview tab, since the editor can't show one.
+    /// it's an image, in a preview tab, since the editor can't show one --
+    /// replacing the file window already open, if there is one.
     OpenFile(String),
+    /// The same, but always in a window of its own: a middle-click on the
+    /// row, or "Open in New Window" in the menu.
+    OpenFileNew(String),
     /// Asked for the rendered version from the context menu: Markdown drawn as
     /// Markdown, an image as a picture.
     PreviewFile(String),
@@ -220,6 +224,10 @@ impl ExplorerView {
         if path.is_empty() {
             return;
         }
+        let path = match &self.host {
+            Some(host) => host.files.normalize(&path),
+            None => path,
+        };
         self.root = Some(path.clone());
         self.expanded.clear();
         self.nodes.clear();
@@ -870,6 +878,7 @@ impl Render for ExplorerView {
 
                         let for_chevron = row.path.clone();
                         let for_row = row.path.clone();
+                        let for_middle = row.path.clone();
                         let for_menu = Target {
                             path: row.path.clone(),
                             name: row.name.clone(),
@@ -951,6 +960,19 @@ impl Render for ExplorerView {
                                     cx.notify();
                                 }),
                             )
+                            // Middle-click: a file opens in a window of its
+                            // own, leaving the one open where it is.
+                            .when(!is_dir, |this| {
+                                this.on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        this.selected = Some(for_middle.clone());
+                                        this.menu = None;
+                                        cx.emit(ExplorerEvent::OpenFileNew(for_middle.clone()));
+                                        cx.notify();
+                                    }),
+                                )
+                            })
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1361,6 +1383,29 @@ impl ExplorerView {
                                 .truncate()
                                 .child(crate::ui::kit::label(&heading)),
                         )
+                        // A file opens first: the reason most right-clicks
+                        // on one happen. Open follows the double-click rule
+                        // (replace the file window open); the second keeps it.
+                        .when_some(target.clone().filter(|t| !t.is_dir), |this, file| {
+                            let for_open = file.path.clone();
+                            let for_new = file.path.clone();
+                            this.child(item("menu-open", "Open", Icon::File, fg_muted).on_click(
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.menu = None;
+                                    cx.emit(ExplorerEvent::OpenFile(for_open.clone()));
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                item("menu-open-new", "Open in New Window", Icon::SquarePlus, fg_muted)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.menu = None;
+                                        cx.emit(ExplorerEvent::OpenFileNew(for_new.clone()));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().my_1().h(px(1.)).bg(border))
+                        })
                         .child({
                             let directory = directory.clone();
                             item("menu-new-file", "New File", Icon::FilePlus, fg_muted).on_click(

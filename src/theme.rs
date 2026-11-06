@@ -653,6 +653,24 @@ fn resolve_font(requested: &str, cx: &App) -> SharedString {
 /// There is no "is monospace" flag to ask for, so it is measured: a family is
 /// kept when a narrow glyph and a wide one advance by the same amount. A
 /// proportional font in a terminal breaks the cell grid, so it isn't offered.
+/// Fonts whose "letters" are symbols. Windows ships these; a Linux box has
+/// few, and none that pass the monospace test.
+const SYMBOL_FONTS: &[&str] = &[
+    "Marlett",
+    "Webdings",
+    "Wingdings",
+    "Wingdings 2",
+    "Wingdings 3",
+    "Symbol",
+    "MT Extra",
+    "Bookshelf Symbol 7",
+    "MS Reference Specialty",
+    "MS Outlook",
+    "Segoe MDL2 Assets",
+    "Segoe Fluent Icons",
+    "HoloLens MDL2 Assets",
+];
+
 pub fn monospace_fonts(cx: &App) -> Vec<SharedString> {
     let text = cx.text_system();
     let mut names = text.all_font_names();
@@ -662,6 +680,10 @@ pub fn monospace_fonts(cx: &App) -> Vec<SharedString> {
         .into_iter()
         // Windows lists a vertical-writing twin of each CJK family as "@Name".
         .filter(|name| !name.starts_with('@'))
+        // Symbol fonts map their letters to pictures, often all one width, so
+        // they pass the measurement below -- and the list, which draws each
+        // family in itself, showed a row of icons nobody could read.
+        .filter(|name| !SYMBOL_FONTS.iter().any(|symbol| name.eq_ignore_ascii_case(symbol)))
         .filter(|name| {
             let id = text.resolve_font(&gpui::font(name.clone()));
             match (text.advance(id, px(16.), 'i'), text.advance(id, px(16.), 'W')) {

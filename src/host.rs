@@ -116,6 +116,15 @@ impl Files {
         }
     }
 
+    /// A typed path as the tree should hold it: a bare `D:` becomes `D:\` on
+    /// Windows (see `local::fs::normalize`). Remote paths are left alone.
+    pub fn normalize(&self, path: &str) -> String {
+        match self {
+            Files::Remote(_) => path.to_string(),
+            Files::Local(_) => crate::local::fs::normalize(path),
+        }
+    }
+
     pub async fn read_dir(&self, path: String) -> Result<Vec<FileEntry>, String> {
         match self {
             Files::Remote(fs) => fs.read_dir(path).await,

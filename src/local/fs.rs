@@ -48,6 +48,11 @@ impl LocalFs {
     /// Folders first, then case-insensitively by name: the order a file
     /// explorer is expected to show, and the same one `Sftp::read_dir` applies.
     pub async fn read_dir(&self, path: String) -> Result<Vec<FileEntry>, String> {
+        #[cfg(windows)]
+        if path == THIS_PC {
+            return Ok(drives());
+        }
+        let path = normalize(&path);
         run(async move {
             let mut dir = tokio::fs::read_dir(&path)
                 .await
@@ -88,6 +93,7 @@ impl LocalFs {
     }
 
     pub async fn create_dir(&self, path: String) -> Result<(), String> {
+        refuse_roots(&path)?;
         run(async move {
             tokio::fs::create_dir(&path)
                 .await
@@ -100,6 +106,7 @@ impl LocalFs {
     /// reason the tree offers it at all: deleting a folder one entry at a time
     /// from the UI is not a feature.
     pub async fn remove(&self, path: String, is_dir: bool) -> Result<(), String> {
+        refuse_roots(&path)?;
         run(async move {
             if is_dir {
                 tokio::fs::remove_dir_all(&path).await
@@ -115,6 +122,7 @@ impl LocalFs {
     /// reached from "New file" in the explorer, where hitting an existing name
     /// must not silently empty it.
     pub async fn create_file(&self, path: String) -> Result<(), String> {
+        refuse_roots(&path)?;
         run(async move {
             tokio::fs::OpenOptions::new()
                 .write(true)
@@ -203,6 +211,7 @@ impl LocalFs {
     }
 
     pub async fn copy(&self, from: String, to: String, is_dir: bool) -> Result<(), String> {
+        refuse_roots(&to)?;
         run(async move {
             if is_dir {
                 copy_dir(PathBuf::from(from), PathBuf::from(to)).await
@@ -217,6 +226,8 @@ impl LocalFs {
     }
 
     pub async fn rename(&self, from: String, to: String) -> Result<(), String> {
+        refuse_roots(&from)?;
+        refuse_roots(&to)?;
         run(async move {
             tokio::fs::rename(&from, &to)
                 .await
@@ -315,9 +326,118 @@ async fn copy_dir(from: PathBuf, to: PathBuf) -> Result<(), String> {
 /// reason it is wrong there: this side really does want the platform's
 /// separator, and on Windows that is a backslash.
 pub fn join(parent: &str, name: &str) -> String {
-    Path::new(parent).join(name).to_string_lossy().to_string()
+    #[cfg(windows)]
+    if parent == THIS_PC {
+        // The drives list's entries are drive names, and each is its own root.
+        return normalize(name);
+    }
+    Path::new(&normalize(parent)).join(name).to_string_lossy().to_string()
 }
 
 pub fn parent(path: &str) -> Option<&str> {
+    #[cfg(windows)]
+    {
+        // Above a drive root is the list of drives, the way Explorer has
+        // "This PC" above C:\ -- without it the tree could never leave the
+        // drive it started on except by typing a whole path.
+        if path == THIS_PC {
+            return None;
+        }
+        if is_drive_root(path) {
+            return Some(THIS_PC);
+        }
+    }
     Path::new(path).parent().and_then(|p| p.to_str())
+}
+
+/// A path as the tree should hold it. On Windows a bare `D:` is *not* the
+/// root of D but "the current folder on D", so typing it into the path bar
+/// listed whatever folder this process last used there, and joined names on
+/// as `D:name`. It means `D:\`.
+pub fn normalize(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let bytes = path.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return format!("{}\\", path.to_ascii_uppercase());
+        }
+    }
+    path.to_string()
+}
+
+/// The virtual folder above every drive root: its entries are the drives.
+#[cfg(windows)]
+pub const THIS_PC: &str = "This PC";
+
+/// `C:\`, `D:` and the like -- the top of a drive, which has no parent folder
+/// and must never be deleted or renamed from the tree.
+#[cfg(windows)]
+fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (2..=3).contains(&bytes.len())
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|&c| c == b'\\' || c == b'/')
+}
+
+/// Refuses a change that would land on the drives list or on a drive root.
+/// The drives are listed as folders, so the context menu offers Delete and
+/// Rename on them like any other row -- and a recursive delete of `C:\` must
+/// not be one confirmation away.
+fn refuse_roots(path: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if path == THIS_PC || path.starts_with(&format!("{THIS_PC}\\")) {
+            return Err(format!("{THIS_PC} is the list of drives; open a drive first"));
+        }
+        if is_drive_root(path) {
+            return Err(format!("{path} is a drive, and cannot be deleted or renamed here"));
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// The drives this machine has, as the entries of `THIS_PC`.
+#[cfg(windows)]
+fn drives() -> Vec<FileEntry> {
+    // A bit per letter; asking for the list touches no drive, so an empty
+    // card reader or a sleeping network drive cannot stall the tree.
+    let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| FileEntry {
+            name: format!("{}:\\", (b'A' + i) as char),
+            is_dir: true,
+            is_symlink: false,
+            size: 0,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_roots_lead_to_the_drives_list() {
+        assert_eq!(normalize("d:"), "D:\\");
+        assert_eq!(normalize("D:\\Projects"), "D:\\Projects");
+        assert_eq!(parent("C:\\"), Some(THIS_PC));
+        assert_eq!(parent("C:\\Users"), Some("C:\\"));
+        assert_eq!(parent(THIS_PC), None);
+        assert_eq!(join(THIS_PC, "D:\\"), "D:\\");
+        assert_eq!(join("D:", "Projects"), "D:\\Projects");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drives_and_the_list_cannot_be_changed() {
+        assert!(refuse_roots("C:\\").is_err());
+        assert!(refuse_roots("D:").is_err());
+        assert!(refuse_roots(THIS_PC).is_err());
+        assert!(refuse_roots(&format!("{THIS_PC}\\New folder")).is_err());
+        assert!(refuse_roots("C:\\Users\\rare\\notes.txt").is_ok());
+    }
 }
