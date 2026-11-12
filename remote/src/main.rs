@@ -24,6 +24,7 @@ mod app;
 mod bridge;
 mod chrome;
 mod config;
+mod monitor;
 mod pairing;
 mod probe;
 mod stream;

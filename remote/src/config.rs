@@ -58,6 +58,15 @@ pub struct StreamConfig {
     /// Which edge the sidebar lives on: `left` or `right`. In a window it docks
     /// there beside the picture; in full screen it slides over from there.
     pub sidebar: String,
+    /// The fake monitor (monitor.rs): wanted on, and at what mode. On/off
+    /// mirrors the host when this window opens -- it may have been switched
+    /// there -- except after a reboot under the kernel's override, which this
+    /// window turns back on.
+    pub fake_monitor: bool,
+    /// `WxH`, one of `monitor::RESOLUTIONS`.
+    pub fake_resolution: String,
+    /// Hz, one of `monitor::REFRESH`, at most `monitor::max_refresh`.
+    pub fake_refresh: u32,
     // No "keep Sunshine running": PulseTerm's instance is started with `-1`
     // and forgets its pairings on exit, so one left running would be paired
     // with nothing. It lives exactly as long as this window (sunshine.rs).
@@ -85,12 +94,33 @@ impl Default for StreamConfig {
             fec: 20,
             display: String::new(),
             sidebar: "right".into(),
+            fake_monitor: false,
+            fake_resolution: "1920x1080".into(),
+            fake_refresh: 60,
         }
     }
 }
 
 impl StreamConfig {
+    /// The fake monitor's mode.
+    pub fn fake_mode(&self) -> (u32, u32, u32) {
+        let (_, _, w, h) = crate::monitor::RESOLUTIONS
+            .iter()
+            .find(|r| r.0 == self.fake_resolution)
+            .copied()
+            .unwrap_or(crate::monitor::RESOLUTIONS[1]);
+        (w, h, self.fake_refresh.min(crate::monitor::max_refresh(h)))
+    }
+
     fn clamp(&mut self) {
+        if !crate::monitor::RESOLUTIONS.iter().any(|r| r.0 == self.fake_resolution) {
+            self.fake_resolution = "1920x1080".into();
+        }
+        if !crate::monitor::REFRESH.contains(&self.fake_refresh) {
+            self.fake_refresh = 60;
+        }
+        let (_, _, r) = self.fake_mode();
+        self.fake_refresh = r;
         // A file from before `sound` has only the on/off switch: on meant
         // here, off meant the host kept its sound.
         if !["here", "host", "both"].contains(&self.sound.as_str()) {

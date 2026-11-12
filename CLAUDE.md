@@ -1626,6 +1626,15 @@ on the host. Things to know before touching it:
   SDL3, libva, OpenSSL and Opus development packages -- on Fedora RPM
   Fusion's FFmpeg; `REMOTE_DESKTOP.md` has the list and a `dnf swap` trap
   that removes the graphics driver.
+* **A host with no monitor gets a fake one** (`remote/src/monitor.rs`): an
+  EDID offering every mode, the chosen one preferred, handed to NVIDIA's X
+  driver (`ConnectedMonitor` + `CustomEDID`; on/off restart the login) or to
+  the kernel's debugfs `edid_override` on a free port (AMD, Intel; live).
+  Root goes through `pulseterm-monitor`, installed once with a sudoers rule
+  for that file only -- the helper has no text field to ask for a password.
+  It is the user's own desktop that streams, not a second one: a separate
+  virtual screen (sway, Xvfb) was built and dropped. `REMOTE_DESKTOP.md`,
+  *Fake monitor*.
 * **Nothing secret is stored.** Pairing is redone every launch with a PIN
   written to Sunshine's stdin over SSH (`-0`), against an instance started
   with `-1` and its own config/`XDG_CONFIG_HOME`, so the user's Sunshine is

@@ -114,6 +114,8 @@ enum Msg {
     Paired(Instance, Result<Paired, String>),
     Launched(Result<Session, String>),
     Stopped,
+    /// A fake-monitor change came back: what the tool said, or its error.
+    Monitor(Result<String, String>),
 }
 
 pub struct App {
@@ -127,6 +129,11 @@ pub struct App {
     config: StreamConfig,
     sun: Sun,
     notice: Option<String>,
+    /// A fake-monitor change is on its way to the host.
+    monitor_busy: bool,
+    /// The host's fake-monitor state has been squared with the setting
+    /// (once, on the first probe).
+    monitor_synced: bool,
     stream: Option<Stream>,
     /// Asked for, not yet answered: Connect is pressed and a launch is out.
     launching: bool,
@@ -206,6 +213,8 @@ impl App {
             config,
             sun: Sun::Stopped,
             notice: None,
+            monitor_busy: false,
+            monitor_synced: false,
             stream: None,
             launching: false,
             sidebar: false,
@@ -259,7 +268,69 @@ impl App {
         self.notice = None;
         let bridge = self.bridge.clone();
         self.task(move || {
-            Msg::Probed(block_on(bridge.exec(probe::SCRIPT)).map(|out| Facts::parse(&out.stdout)))
+            // The fake monitor's tool is staged with every probe, so the
+            // one-time setup always installs this build's.
+            let script = format!("{}{}", crate::monitor::stage(), probe::SCRIPT);
+            Msg::Probed(block_on(bridge.exec(&script)).map(|out| Facts::parse(&out.stdout)))
+        });
+    }
+
+    /// A probe that keeps the notice on screen -- after a fake-monitor
+    /// change, which is what the notice is about.
+    fn recheck_keep_notice(&mut self) {
+        let notice = self.notice.take();
+        self.recheck();
+        self.notice = notice;
+    }
+
+    /// Once per window: the host's fake monitor and the setting agree.
+    /// Under NVIDIA the host wins -- switching there restarts the login, so
+    /// it is never done unasked. Under the kernel's override a reboot has
+    /// simply forgotten it, so a wanted one is turned back on.
+    fn sync_monitor(&mut self) {
+        if self.monitor_synced {
+            return;
+        }
+        let Probe::Done(f) = &self.probe else { return };
+        self.monitor_synced = true;
+        let (on, method, ready) = (f.monitor_on(), f.monitor_method(), f.monitor_ready());
+        if on && !self.config.fake_monitor {
+            self.set(|c| c.fake_monitor = true);
+        } else if !on && self.config.fake_monitor {
+            if method == crate::monitor::Method::Kms && ready {
+                self.apply_monitor();
+            } else {
+                self.set(|c| c.fake_monitor = false);
+            }
+        }
+    }
+
+    /// Puts the fake-monitor setting into effect on the host.
+    fn apply_monitor(&mut self) {
+        let Probe::Done(f) = &self.probe else { return };
+        if !f.monitor_ready() {
+            self.notice = Some("The fake monitor needs its one-time setup first: run the Fake monitor check's command on the host, then Recheck.".into());
+            return;
+        }
+        let command = if self.config.fake_monitor {
+            let (w, h, r) = self.config.fake_mode();
+            crate::monitor::on_command(f.monitor_method(), w, h, r, f.monitor_on())
+        } else {
+            crate::monitor::off_command()
+        };
+        self.monitor_busy = true;
+        self.notice = Some("Applying the fake monitor on the host…".into());
+        let bridge = self.bridge.clone();
+        self.task(move || {
+            let r = match block_on(bridge.exec(&command)) {
+                Ok(out) if out.status == Some(0) => Ok(out.stdout),
+                Ok(out) => Err(if out.stderr.trim().is_empty() { out.stdout.trim().to_string() } else { out.stderr.trim().to_string() }),
+                Err(e) => Err(e),
+            };
+            // Long enough for the desktop to take the new monitor before the
+            // recheck counts it.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Msg::Monitor(r)
         });
     }
 
@@ -525,7 +596,21 @@ impl App {
                 self.probe = match r {
                     Ok(f) => Probe::Done(f),
                     Err(e) => Probe::Failed(e),
-                }
+                };
+                self.sync_monitor();
+            }
+            Msg::Monitor(r) => {
+                self.monitor_busy = false;
+                let (w, h, hz) = self.config.fake_mode();
+                let reconnect = if self.stream.is_some() { " Reconnect to stream it." } else { "" };
+                self.notice = Some(match r {
+                    Ok(out) if out.contains("restarted") => "The host's login screen restarted to apply the fake monitor: log in there again (or set up automatic login), then Recheck.".into(),
+                    Ok(out) if out.contains("live") => format!("Fake monitor now {w}x{h} at {hz} Hz."),
+                    Ok(_) if self.config.fake_monitor => format!("Fake monitor on: {w}x{h} at {hz} Hz.{reconnect}"),
+                    Ok(_) => format!("Fake monitor off.{reconnect}"),
+                    Err(e) => format!("Fake monitor: {e}"),
+                });
+                self.recheck_keep_notice();
             }
             Msg::Started(Ok((instance, displays))) => {
                 self.displays = displays;
@@ -1233,6 +1318,54 @@ impl App {
         y += self.ui.paragraph(x, y - 8.0, 330.0, lat, t.fg_subtle) + 6.0;
         let mouse = "Desktop: the pointer moves freely and the host follows. Game: a click in the picture captures it for relative motion. Pointer: the host's cursor (in the picture) shows hand, text and busy shapes; \"both\" adds a small dot here that moves without network delay.";
         y += self.ui.paragraph(x, y - 8.0, 330.0, mouse, t.fg_subtle) + 6.0;
+
+        // The fake monitor: a monitor the host's driver believes is plugged
+        // in, so a desktop with nothing attached has a screen to draw on.
+        y += 6.0;
+        self.ui.micro(x, y, "fake monitor", t.fg_subtle);
+        y += self.ui.line(t.micro()) + 6.0;
+        let method = match &self.probe {
+            Probe::Done(f) => Some((f.monitor_method(), f.monitor_ready())),
+            _ => None,
+        };
+        let note = match method {
+            Some((crate::monitor::Method::Nvidia, _)) => "For a host with no monitor attached. NVIDIA: turning it on or off restarts the host's login screen, so the desktop logs out once; resolution and refresh then change live.",
+            Some((crate::monitor::Method::Kms, _)) => "For a host with no monitor attached. It appears on a free DisplayPort or HDMI port at once; a reboot forgets it, and this window turns it back on.",
+            None => "For a host with no monitor attached: the host's driver is told one is plugged in.",
+        };
+        y += self.ui.paragraph(x, y, 330.0, note, t.fg_subtle) + 12.0;
+        if matches!(method, Some((_, false))) {
+            y += self.ui.paragraph(x, y - 6.0, 330.0, "One-time setup first: the Fake monitor check, on the left.", t.warning) + 6.0;
+        }
+        if self.monitor_busy {
+            y += self.ui.paragraph(x, y - 6.0, 330.0, "applying…", t.fg_muted) + 6.0;
+        }
+        let on = if c.fake_monitor { "on" } else { "off" };
+        let mut changed = false;
+        if let Some(v) = row(self, "Fake monitor", &mut y, &[("off", "off"), ("on", "on")], on) {
+            self.set(|c| c.fake_monitor = v == "on");
+            changed = true;
+        }
+        let labels: Vec<(&'static str, &str)> = crate::monitor::RESOLUTIONS.iter().map(|r| (r.0, r.1)).collect();
+        if let Some(v) = row(self, "Monitor resolution", &mut y, &labels, &c.fake_resolution) {
+            self.set(|c| {
+                c.fake_resolution = v.into();
+                c.fake_refresh = c.fake_mode().2;
+            });
+            changed = self.config.fake_monitor;
+        }
+        let (_, h, _) = c.fake_mode();
+        let rates: Vec<(&'static str, &str)> = [("30", "30"), ("60", "60"), ("120", "120"), ("144", "144")]
+            .into_iter()
+            .filter(|(v, _)| v.parse::<u32>().unwrap_or(0) <= crate::monitor::max_refresh(h))
+            .collect();
+        if let Some(v) = row(self, "Monitor refresh", &mut y, &rates, &c.fake_refresh.to_string()) {
+            self.set(|c| c.fake_refresh = v.parse().unwrap_or(60));
+            changed = self.config.fake_monitor;
+        }
+        if changed && !self.monitor_busy {
+            self.apply_monitor();
+        }
 
         // What the host spends on the stream. Written into its Sunshine's
         // config at start; Connect restarts Sunshine when one changed.

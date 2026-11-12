@@ -48,6 +48,7 @@ for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); d
   us=$(loginctl show-session "$s" -p Name --value 2>/dev/null)
   if [ "$us" = "$(id -un)" ] && { [ "$ty" = wayland ] || [ "$ty" = x11 ]; }; then
     echo "session=$ty"
+    sess=$ty
     echo "desktop=$(loginctl show-session "$s" -p Desktop --value 2>/dev/null)"
     break
   fi
@@ -64,6 +65,24 @@ else
   modinfo uinput >/dev/null 2>&1 && echo "uinput=unloaded" || echo "uinput=missing"
 fi
 echo "outputs=$(cat /sys/class/drm/card*-*/status 2>/dev/null | grep -c '^connected')"
+# An X11 desktop counts its own monitors: NVIDIA's X driver can have one
+# sysfs never sees (the fake monitor, on a Jetson). On the session's own
+# display; `t` first, because `env` cannot run a shell function.
+if [ "${sess:-}" = x11 ] && command -v xrandr >/dev/null; then
+  xenv=$(systemctl --user show-environment 2>/dev/null | grep -E '^(DISPLAY|XAUTHORITY)=')
+  [ -n "$xenv" ] && echo "x_outputs=$(t env $xenv xrandr --query 2>/dev/null | grep -c ' connected')"
+fi
+if grep -qs 'Driver *"nvidia"' /etc/X11/xorg.conf /etc/X11/xorg.conf.d/*.conf || [ -e /proc/driver/nvidia ] || [ -e /dev/nvhost-ctrl-gpu ]; then
+  echo "x_nvidia=yes"
+fi
+# The fake monitor's tool (monitor.rs): its version, whether this account may
+# run it without a password, and whether it is on.
+m=/usr/local/sbin/pulseterm-monitor
+if [ -x "$m" ]; then
+  echo "monitor_tool=$(sed -n 's/^# pulseterm-monitor v//p' "$m" | head -n1)"
+  sudo -n -l "$m" >/dev/null 2>&1 && echo "monitor_sudo=yes"
+  echo "monitor_state=$("$m" status 2>/dev/null)"
+fi
 [ "$ours" = no ] && command -v ss >/dev/null && echo "port_busy=$(ss -ltn 2>/dev/null | grep -c ':47989 ')"
 true
 "#;
@@ -103,6 +122,17 @@ pub struct Facts {
     /// `yes`, `no` (not writable), `unloaded`, or `missing` from the kernel.
     pub uinput_state: String,
     pub outputs: u32,
+    /// Monitors an X11 desktop's own display reports (`xrandr`); overrides
+    /// `outputs` for one (`monitors`).
+    pub x_outputs: Option<u32>,
+    /// The host's GPU is NVIDIA's (desktop driver or a Jetson).
+    pub x_nvidia: bool,
+    /// The installed `pulseterm-monitor`'s version, if any.
+    pub monitor_tool: Option<u32>,
+    /// This account may run it without a password.
+    pub monitor_sudo: bool,
+    /// What it says: `off`, `on nvidia`, `on kms card1-DP-1`.
+    pub monitor_state: String,
     /// Something other than PulseTerm's instance holds Moonlight's base port.
     pub port_busy: bool,
     /// Sunshine may capture through KMS: no screen-sharing dialog on the host.
@@ -113,6 +143,34 @@ pub struct Facts {
 }
 
 impl Facts {
+    /// Monitors the desktop can draw on: an X11 desktop's own count when it
+    /// gave one.
+    pub fn monitors(&self) -> u32 {
+        match (self.session.as_deref(), self.x_outputs) {
+            (Some("x11"), Some(n)) => n,
+            _ => self.outputs,
+        }
+    }
+
+    /// How this host fakes a monitor: NVIDIA's X driver through xorg.conf,
+    /// anything else through the kernel's EDID override.
+    pub fn monitor_method(&self) -> crate::monitor::Method {
+        if self.x_nvidia && self.session.as_deref() == Some("x11") {
+            crate::monitor::Method::Nvidia
+        } else {
+            crate::monitor::Method::Kms
+        }
+    }
+
+    /// The tool is this build's and runs without a password.
+    pub fn monitor_ready(&self) -> bool {
+        self.monitor_tool == Some(crate::monitor::TOOL_VERSION) && self.monitor_sudo
+    }
+
+    pub fn monitor_on(&self) -> bool {
+        self.monitor_state.starts_with("on")
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut f = Facts::default();
         for line in text.lines() {
@@ -142,6 +200,8 @@ impl Facts {
                 "encode" if !f.encode.iter().any(|e| e == value) => f.encode.push(value.into()),
                 "nvidia" if value.contains("version mismatch") => f.nvidia_mismatch = true,
                 "nvidia" if value.contains("Failed to initialize NVML") => {}
+                // A Jetson's nvidia-smi over SSH: "NvRmGpuLibOpen failed".
+                "nvidia" if value.contains("NvRmGpuLibOpen") || value.contains("failed") => {}
                 "nvidia" if !value.is_empty() => f.nvidia = Some(value.into()),
                 "distro_id" => f.distro_id = value.into(),
                 "distro_like" => f.distro_like = value.trim_matches('"').into(),
@@ -154,6 +214,11 @@ impl Facts {
                     f.uinput_state = value.into();
                 }
                 "outputs" => f.outputs = value.parse().unwrap_or(0),
+                "x_outputs" => f.x_outputs = value.parse().ok(),
+                "x_nvidia" => f.x_nvidia = value == "yes",
+                "monitor_tool" => f.monitor_tool = value.parse().ok(),
+                "monitor_sudo" => f.monitor_sudo = value == "yes",
+                "monitor_state" => f.monitor_state = value.into(),
                 "port_busy" => f.port_busy = value.parse::<u32>().unwrap_or(0) > 0,
                 "ours" => f.ours = value == "yes",
                 "kms" => f.kms = value == "yes",
@@ -232,21 +297,31 @@ pub fn checks(f: &Facts) -> Vec<Check> {
             fix: None,
         },
     });
-    out.push(if f.outputs > 0 {
+    out.push(if f.monitors() > 0 {
         Check {
             label: "Display",
             state: State::Ok,
-            detail: format!("{} connected", f.outputs),
+            detail: if f.monitor_on() {
+                format!("{} connected, the fake monitor among them", f.monitors())
+            } else {
+                format!("{} connected", f.monitors())
+            },
             fix: None,
         }
     } else {
+        // A desktop with no monitor draws nothing: GNOME lists none and
+        // paints nothing, and the stream is a blank 640x480. It still
+        // connects, so a warning.
         Check {
             label: "Display",
             state: State::Warn,
-            detail: "no monitor connected -- attach one, or an HDMI dummy plug; a headless host needs a virtual output".into(),
+            detail: "no monitor -- the desktop has no screen to draw on, so the stream is blank. Turn on Fake monitor in the settings".into(),
             fix: None,
         }
     });
+    if let Some(check) = monitor_check(f) {
+        out.push(check);
+    }
     out.push(capture_check(f));
     let codecs = f.codecs();
     out.push(if f.nvidia_mismatch {
@@ -405,6 +480,20 @@ pub fn capture(f: &Facts) -> Option<&'static str> {
         _ if f.kms && !f.jetson => Some("kms"),
         _ => None,
     }
+}
+
+/// The fake monitor's one-time setup, while it is wanted (no monitor, or
+/// already on) and not done -- or done by an older build.
+fn monitor_check(f: &Facts) -> Option<Check> {
+    if f.monitor_ready() || (f.monitors() > 0 && !f.monitor_on()) {
+        return None;
+    }
+    let detail = match f.monitor_tool {
+        None => "one-time setup for the fake monitor: installs PulseTerm's small root script and lets this account run it -- and only it -- without a password, so the settings can turn it on and off",
+        Some(v) if v != crate::monitor::TOOL_VERSION => "the fake monitor's script on the host is from another version of PulseTerm -- this updates it",
+        Some(_) => "the fake monitor's script is installed, but this account may not run it without a password -- this adds the sudoers rule",
+    };
+    Some(Check { label: "Fake monitor", state: State::Warn, detail: detail.into(), fix: Some(crate::monitor::setup_command()) })
 }
 
 /// How the screen will be captured, and whether that needs someone at the
@@ -577,6 +666,35 @@ mod tests {
         let jetson = fix("uinput=missing\nsession=x11\n");
         assert!(jetson.detail.contains("keyboard and mouse still work"), "{}", jetson.detail);
         assert!(fix("uinput=missing\nsession=wayland\n").detail.contains("cannot receive keyboard"));
+    }
+
+    /// orion: a Jetson, GNOME on X11, nothing attached. Before the setup
+    /// the check offers it (one line); after, it is quiet; once on, X counts
+    /// the fake monitor although sysfs never sees it.
+    #[test]
+    fn the_fake_monitor_is_offered_where_there_is_no_monitor() {
+        let orion = "outputs=0\nsession=x11\nx_outputs=0\nx_nvidia=yes\nnvidia=libnvrm_gpu.so: NvRmGpuLibOpen failed, error=4";
+        let f = Facts::parse(orion);
+        assert_eq!(f.nvidia, None, "nvidia-smi's error is not a GPU name");
+        assert_eq!(f.monitor_method(), crate::monitor::Method::Nvidia);
+        let c = checks(&f);
+        assert_eq!(c.iter().find(|c| c.label == "Display").unwrap().state, State::Warn, "still connects");
+        let setup = c.iter().find(|c| c.label == "Fake monitor").unwrap();
+        assert_eq!(setup.fix.as_deref(), Some(crate::monitor::setup_command().as_str()));
+        assert!(c.iter().filter(|c| c.label == "Display" || c.label == "Fake monitor").all(|c| c.state != State::Fail), "neither blocks Connect");
+        // Set up, then on: X counts it, the setup line goes.
+        let on = format!("{}\nmonitor_tool={}\nmonitor_sudo=yes\nmonitor_state=on nvidia", orion.replace("x_outputs=0", "x_outputs=1"), crate::monitor::TOOL_VERSION);
+        let f = Facts::parse(&on);
+        assert!(f.monitor_ready() && f.monitor_on() && f.monitors() == 1);
+        let c = checks(&f);
+        assert!(c.iter().all(|c| c.label != "Fake monitor"));
+        assert!(c.iter().find(|c| c.label == "Display").unwrap().detail.contains("fake monitor"));
+        // An older tool, or no sudoers rule: the same command fixes both.
+        let f = Facts::parse("outputs=0\nsession=wayland\nmonitor_tool=0\nmonitor_sudo=yes");
+        assert!(checks(&f).iter().find(|c| c.label == "Fake monitor").unwrap().detail.contains("another version"));
+        assert_eq!(f.monitor_method(), crate::monitor::Method::Kms, "not NVIDIA on X11: the kernel's override");
+        // A host with a real monitor and no fake one hears nothing about it.
+        assert!(checks(&Facts::parse("outputs=1\nsession=wayland")).iter().all(|c| c.label != "Fake monitor"));
     }
 
     #[test]

@@ -931,6 +931,61 @@ pinned. Then `/serverinfo` over TLS must say `PairStatus` 1.
 * Still untested: GNOME, KDE and X11 hosts for the pointer lock; 4K; the
   zero-copy dmabuf → EGL path.
 
+**Fake monitor (2026-11-12).** A host with nobody's monitor attached still
+has its desktop logged in, and that desktop is what to stream -- but with no
+monitor it has no screen: on orion (Jetson, Ubuntu 24.04, GNOME on X11) X
+fell back to a 640x480 screen, GNOME's `DisplayConfig.GetCurrentState`
+listed no monitors at all and painted nothing, and the stream showed the X
+driver's own picture. `xrandr --fb` does not help (mutter puts 640x480 back
+at once). What does is the driver believing a monitor is plugged in, which
+is what a dummy plug does in hardware. `monitor.rs`:
+
+* **The EDID** (`monitor::edid`): 256 bytes, a 24-inch "PulseTerm" monitor
+  offering every mode in the settings -- 720p, 1080p and 1440p at 30, 60,
+  120 and 144 Hz, 4K at 30 and 60 (past that a mode no longer fits a
+  detailed timing's 655.35 MHz) -- with the chosen one preferred. Eight are
+  CTA-861 video codes (a byte each), six are detailed timings in the CTA
+  extension, and the clock is set so each lands on its nominal rate rather
+  than CVT's 59.94-style one. The serial number changes with the chosen
+  mode, so a desktop that remembers per monitor (GNOME) takes the new
+  preferred mode instead of the old one.
+* **Two ways in**, picked by the probe (`Facts::monitor_method`):
+  - NVIDIA on X11: `Option "ConnectedMonitor" "DFP-0"` and
+    `Option "CustomEDID" "DFP-0:/etc/X11/pulseterm-edid.bin"` in xorg.conf's
+    Device section (or a file in xorg.conf.d), read when X starts -- so on and
+    off restart the login screen (the desktop logs out once). A mode change
+    after that is `xrandr --mode --rate` on the logged-in desktop, no root
+    and no restart, since the EDID lists every mode; root only if that fails.
+    Verified on orion: GNOME came back on a 1920x1080 monitor and streamed
+    whole. Monitors there are counted with `xrandr` on the session's display
+    (`x_outputs`) -- sysfs still says none.
+  - Everything else (AMD, Intel): the kernel's EDID override, debugfs
+    `edid_override` on a free DisplayPort or HDMI connector, then `on` into
+    its sysfs `status` (after `detect`, so the desktop sees a new monitor).
+    Live, Wayland or X11, gone at the next boot; the window turns a wanted
+    one back on when it opens. Not yet tried on real hardware.
+* **Root, once.** Every way of faking a monitor is a driver setting.
+  `pulseterm-monitor` (`monitor::TOOL`) is a fixed script that validates
+  what it is handed (a method, 256 bytes of base64) and does only this; the
+  probe stages it in `~/.config/pulseterm/` and the *Fake monitor* check's
+  one-line command installs it to `/usr/local/sbin` with a sudoers rule for
+  this account and this file only. The settings then drive it over SSH with
+  `sudo -n`. A helper with no text field could not ask for a password
+  each time, and a pasted multi-line command was cut short on orion.
+  `pulseterm-monitor off`, then removing it and
+  `/etc/sudoers.d/pulseterm-monitor`, undoes it all.
+* **On/off follows the host** when the window opens (`sync_monitor`): under
+  NVIDIA the host's state is adopted -- switching there logs the desktop out,
+  so it is never done unasked; under the kernel's override a wanted one is
+  turned back on. "No monitor" is a warning, not a blocker: the stream
+  connects, only blank.
+* An earlier attempt, a *separate* virtual screen (a headless sway, or
+  Xvfb) beside the host's desktop, was dropped: what was wanted is the
+  user's own desktop on a screen of chosen size. Two findings from it:
+  Sunshine's wlroots capture takes GPU buffers only ("SHM capture not
+  implemented"), and Ubuntu's GNOME 46 cannot be started a second time
+  outside systemd (`--builtin` is gone).
+
 **Not yet:** see *Where it stands* at the top -- that list is kept current.
 (The gpui launcher's GNOME-decorations gap went with the gpui launcher.)
 

@@ -127,6 +127,14 @@ a fresh install opens on.
   Settings change live in a sidebar on the side you choose (right by
   default): in a window it opens beside the picture from a strip on that
   edge; in full screen it slides over the picture from that edge.
+- **A host with no monitor attached** gets a fake one: the host's driver is
+  told a monitor is plugged in, at the resolution and refresh rate you pick
+  (720p to 4K, 30 to 144 Hz), so the desktop logged in there has a screen to
+  stream. On and off from the settings. NVIDIA on X11 does it in xorg.conf
+  (on and off restart the login screen once; mode changes are live), AMD
+  and Intel through the kernel's EDID override (live, re-applied after a
+  reboot). A one-time setup on the host -- one command, which the setup
+  screen gives -- installs the small root script it uses.
 - It is a **separate program** (`pulseterm-remote`, GPL-3.0) that PulseTerm
   finds at run time; built without it, PulseTerm simply has no remote icon. See
   [REMOTE_DESKTOP.md](./REMOTE_DESKTOP.md) for the design, the host
